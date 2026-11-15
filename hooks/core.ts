@@ -418,6 +418,16 @@ export const fmtResetIn = (resetsAt: number | null | undefined, now: number) => 
   return h > 0 ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${m}m`
 }
 
+/** A feed quota's name cut to the 3 cells of the main card's meters: `gem` → `gem`, `gem pro` → `pro`, `agy claude weekly` → `cl`. */
+export const feedLabel = (label: string) => {
+  const s = label.trim().toLowerCase()
+  if (/claude/.test(s)) return 'cl'
+  const gem = /^gem(?:ini)?\s+(\S+)/.exec(s)
+  if (gem?.[1]) return gem[1].slice(0, 3)
+  if (/^gem/.test(s)) return 'gem'
+  return s.slice(0, 3)
+}
+
 /** A rate-limit window's short name: `five_hour` → `5h`, `seven_day_opus` → `7d opus`. */
 export const limitLabel = (kind: string) =>
   kind

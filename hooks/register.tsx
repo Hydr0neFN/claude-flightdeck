@@ -50,6 +50,7 @@ import {
   limitLabel,
   limitOf,
   fmtResetIn,
+  feedLabel,
   fmtSpeed,
   listOf,
   logRows,
@@ -851,6 +852,30 @@ export const register: Register = (on, options) => {
     const showFeed = cfg.feedCommand.length > 0 && f !== null
     const hasFeedA = showFeed && (f.dsCny !== null || f.gem.length > 0)
     const hasFeedB = showFeed && (f.task !== '' || f.cwd !== '')
+    // The main card: a fixed label column, then the row's pieces, so gauges line up from row to row.
+    const LABEL_W = 7
+    const row = (w: number, label: string, pieces: (Piece | null)[], gap = 1) => (
+      <Box>
+        <Box width={LABEL_W} flexShrink={0}>
+          <Text dimColor>{label}</Text>
+        </Box>
+        {line(pieces, w - 4 - LABEL_W, gap)}
+      </Box>
+    )
+    // One quota window: a 3-cell name, a 5-cell gauge, the percent used, and the time to its reset where it fits.
+    const meter = (name: string, pct: number, resetsAt: number | null, w: number, lead: number): Piece => {
+      const lg = gauge(pct, 5)
+      const resetIn = w >= 58 ? fmtResetIn(resetsAt, now) : ''
+      return {
+        lead,
+        spans: [
+          { text: `${name.padEnd(3)} `, dim: true },
+          { text: lg.on, color: pct >= 80 ? C.warn : C.main },
+          { text: lg.off, color: C.faint },
+          { text: ` ${String(Math.round(pct)).padStart(3)}%${resetIn ? ` ↻ ${resetIn.padEnd(5)}` : ''}`, ...(pct >= 80 ? { color: C.warn } : {}) },
+        ],
+      }
+    }
     const mainPanel = (w: number) => (
       <Box flexDirection="column" borderStyle="round" borderColor={C.main} paddingX={1} width={w}>
         <Box justifyContent="space-between">
@@ -861,94 +886,64 @@ export const register: Register = (on, options) => {
             <Text color={m.isRunning ? C.main : C.dim}>{m.isRunning ? '● working' : '○ idle'}</Text>
           </Box>
         </Box>
-        {line(
-          [
-            {
-              spans: [
-                { text: 'effort ', dim: true },
-                { text: `${'▮'.repeat(effortN) + '▯'.repeat(4 - effortN)} `, color: C.main },
-                { text: m.effort || '—', color: C.main, bold: true },
-              ],
-            },
-            m.mode ? { spans: [{ text: `mode ${m.mode}`, dim: true }] } : null,
-            { spans: [{ text: `${m.steps} req`, dim: true }] },
-          ],
-          w - 4,
-          3,
-        )}
+        {row(w, 'effort', [
+          {
+            spans: [
+              { text: `${'▮'.repeat(effortN) + '▯'.repeat(4 - effortN)} `, color: C.main },
+              { text: m.effort || '—', color: C.main, bold: true },
+            ],
+          },
+          m.mode ? { lead: 2, spans: [{ text: m.mode, dim: true }] } : null,
+          { lead: 2, spans: [{ text: `${m.steps} req`, dim: true }] },
+        ])}
         {ctxGauge
-          ? line(
-              [
-                {
-                  spans: [
-                    { text: 'ctx ', dim: true },
-                    { text: ctxGauge.on, color: ctxFill.pct !== null && ctxFill.pct >= 80 ? C.warn : C.main },
-                    { text: ctxGauge.off, color: C.faint },
-                    { text: ` ${Math.round(ctxFill.pct ?? 0)}%`, bold: true },
-                  ],
-                },
-                u.tokens !== null ? { spans: [{ text: `${kTokens(u.tokens)}/${kTokens(ctxFill.window)}`, dim: true }] } : null,
-                u.compactions > 0 ? { spans: [{ text: compactMark(u), color: C.amber }], lead: 1 } : null,
-                // Left out first when the line is short; the ~ in the mark still says it.
-                u.compactions > 0 && u.isCompactEstimate ? { spans: [{ text: '(estimated)', color: C.faint }] } : null,
-              ],
-              w - 4,
+          ? row(w, 'ctx', [
+              {
+                spans: [
+                  { text: ctxGauge.on, color: ctxFill.pct !== null && ctxFill.pct >= 80 ? C.warn : C.main },
+                  { text: ctxGauge.off, color: C.faint },
+                  { text: ` ${String(Math.round(ctxFill.pct ?? 0)).padStart(3)}%`, bold: true },
+                ],
+              },
+              u.tokens !== null ? { lead: 1, spans: [{ text: `${kTokens(u.tokens)}/${kTokens(ctxFill.window)}`, dim: true }] } : null,
+              u.compactions > 0 ? { spans: [{ text: compactMark(u), color: C.amber }], lead: 1 } : null,
+              // Left out first when the line is short; the ~ in the mark still says it.
+              u.compactions > 0 && u.isCompactEstimate ? { spans: [{ text: '(estimated)', color: C.faint }] } : null,
+            ])
+          : null}
+        {u.limits.length > 0
+          ? row(
+              w,
+              'claude',
+              // Both windows with their reset times fit from 58 columns; narrower, the times are left out.
+              u.limits.slice(0, 2).map((l, i) => meter(limitLabel(l.kind), l.pct, l.resetsAt, w, i > 0 ? 2 : 0)),
             )
           : null}
-        {u.costUsd !== null || u.limits.length > 0
-          ? line(
-              [
-                u.costUsd !== null ? { spans: [{ text: fmtUsd(u.costUsd), color: C.text }] } : null,
-                ...u.limits.slice(0, 2).map((l, i): Piece => {
-                  const lg = gauge(l.pct, 5)
-                  // The time to each reset where the line has room for it: both windows fit from 58 columns,
-                  // so a wide pane's half column (59 at 120) has them; a window that doesn't fit is left out.
-                  const resetIn = w >= 58 ? fmtResetIn(l.resetsAt, now) : ''
-                  return {
-                    lead: i > 0 ? 1 : u.costUsd !== null ? 2 : 0,
-                    spans: [
-                      { text: `${limitLabel(l.kind)} `, dim: true },
-                      { text: lg.on, color: l.pct >= 80 ? C.warn : C.main },
-                      { text: lg.off, color: C.faint },
-                      { text: ` ${Math.round(l.pct)}%${resetIn ? ` ↻ ${resetIn}` : ''}`, dim: true },
-                    ],
-                  }
-                }),
-              ],
-              w - 4,
+        {hasFeedA && f && f.gem.length > 0
+          ? row(
+              w,
+              'agy',
+              f.gem.slice(0, 2).map((gm, i) => meter(feedLabel(gm.label), gm.pct, gm.resetsAt, w, i > 0 ? 2 : 0)),
             )
           : null}
-        {hasFeedA && f
-          ? line(
-              [
-                f.dsCny !== null ? { spans: [{ text: `DS ${fmtCny(f.dsCny)}`, color: C.text }] } : null,
-                ...f.gem.slice(0, 2).map((gm, i): Piece => {
-                  const lg = gauge(gm.pct, 5)
-                  const resetIn = w >= 58 ? fmtResetIn(gm.resetsAt, now) : ''
-                  return {
-                    lead: i > 0 ? 1 : f.dsCny !== null ? 2 : 0,
-                    spans: [
-                      { text: `${gm.label} `, dim: true },
-                      { text: lg.on, color: gm.pct >= 80 ? C.warn : C.main },
-                      { text: lg.off, color: C.faint },
-                      { text: ` ${Math.round(gm.pct)}%${resetIn ? ` ↻ ${resetIn}` : ''}`, dim: true },
-                    ],
-                  }
-                }),
-              ],
-              w - 4,
-            )
+        {u.costUsd !== null || (hasFeedA && f && f.dsCny !== null)
+          ? row(w, 'spend', [
+              u.costUsd !== null
+                ? { spans: [{ text: fmtUsd(u.costUsd), color: C.text, bold: true }, { text: ' session', dim: true }] }
+                : null,
+              hasFeedA && f && f.dsCny !== null
+                ? { lead: 2, spans: [{ text: 'DS ', dim: true }, { text: fmtCny(f.dsCny), color: C.text, bold: true }] }
+                : null,
+            ])
           : null}
-        {hasFeedB && f
-          ? line(
-              [
-                f.task ? { spans: [{ text: f.task, dim: true }] } : null,
-                f.cwd ? { spans: [{ text: f.branch ? `${f.cwd} [${f.branch}]` : f.cwd, dim: true }] } : null,
-              ],
-              w - 4,
-            )
+        {hasFeedB && f && f.task ? row(w, 'task', [{ fill: true, spans: [{ text: f.task, color: C.text }] }]) : null}
+        {hasFeedB && f && f.cwd
+          ? row(w, 'cwd', [
+              { spans: [{ text: f.cwd, dim: true }] },
+              f.branch ? { spans: [{ text: f.branch, color: C.main }] } : null,
+            ])
           : null}
-        {m.speed ? <Text dimColor wrap="truncate">{`last req  ${fmtSpeed(m.speed)}`}</Text> : null}
+        {m.speed ? row(w, 'last', [{ spans: [{ text: fmtSpeed(m.speed), dim: true }] }]) : null}
       </Box>
     )
 

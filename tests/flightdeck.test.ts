@@ -1530,7 +1530,10 @@ test('external feed polls on start and every 30s, keeps last good on error, skip
   const gauges = await ui.findAll({ type: 'Text', text: /^▰+$/ })
   expect(gauges.map(g => g.props.color)).toEqual(['error', 'claude'])
   expect(await ui.find({ text: /step 2\/4 build feed/ })).toBeDefined()
-  expect(await ui.find({ text: /~\/Claude \[yu\*\]/ })).toBeDefined()
+  expect(await ui.find({ text: /^~\/Claude$/ })).toBeDefined()
+  expect(await ui.find({ text: /^yu\*$/, color: 'claude' })).toBeDefined()
+  expect(await ui.find({ text: /^pro / })).toBeDefined() // `gem pro` cut to the meter's 3-cell name
+  expect(await ui.find({ text: /^agy$/ })).toBeDefined()
   await ui.unmount()
 
   // Below 58 columns, gem keeps its gauge and percent without the reset marker.
