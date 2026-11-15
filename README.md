@@ -144,6 +144,30 @@ In `/config`, or under `pluginConfigs[<id>].options` in your user `settings.json
 | `openOnStart` | `true` | ask to open the pane when a session starts |
 | `statusLine` | `true` | context, running agents, consults and denials in the status line |
 
+## External feed
+
+Set `feedCommand` to a JSON string array (e.g. `["node", "/path/to/feed.mjs"]`) to poll a local command at session start and every 30 seconds (`""` leaves it off).
+
+Flightdeck writes JSON to the command's `stdin`:
+
+```json
+{ "session_id": "...", "cwd": "...", "model": { "display_name": "Opus 5.5" } }
+```
+
+The command writes JSON to `stdout` (every field optional; unknown fields ignored):
+
+```json
+{
+  "task": "step 2/4 build feed",
+  "cwd": "~/Claude",
+  "branch": "yu*",
+  "ds_cny": 57.7,
+  "gem": [
+    { "label": "gem pro", "pct": 38, "resets_at": "2026-11-15T20:00:00Z" }
+  ]
+}
+```
+
 ## Troubleshooting
 
 **The pane doesn't appear.**

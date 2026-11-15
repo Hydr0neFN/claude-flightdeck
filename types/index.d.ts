@@ -116,6 +116,21 @@ export type View = { expanded: string | null; gateOpen: Bucket | null; layout: L
 
 export type Roster = { architectTypes: string[] }
 
+export type GemLimit = {
+  label: string
+  pct: number
+  resetsAt: number | null
+}
+
+export type Feed = {
+  task: string
+  cwd: string
+  branch: string
+  dsCny: number | null
+  gem: GemLimit[]
+  at: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'flightdeck': {
@@ -131,6 +146,7 @@ declare module 'claude-code' {
       receipt: Receipt | null
       view: View
       roster: Roster
+      feed: Feed | null
     }
   }
 }

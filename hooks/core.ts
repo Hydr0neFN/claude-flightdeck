@@ -6,7 +6,9 @@ import type {
   Architect,
   Bucket,
   Check,
+  Feed,
   Gate,
+  GemLimit,
   Layout,
   LogLine,
   Loop,
@@ -114,6 +116,7 @@ export type Config = {
   palette: Palette
   openOnStart: boolean
   statusLine: boolean
+  feedCommand: string[]
 }
 
 const safeRegExp = (source: string, fallback: string) => {
@@ -121,6 +124,18 @@ const safeRegExp = (source: string, fallback: string) => {
     return new RegExp(source || fallback, 'i')
   } catch {
     return new RegExp(fallback, 'i')
+  }
+}
+
+export const parseFeedCommand = (raw: unknown): string[] => {
+  if (typeof raw !== 'string' || raw.trim() === '') return []
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed) || parsed.length === 0) return []
+    if (!parsed.every((x): x is string => typeof x === 'string') || parsed[0] === '') return []
+    return parsed
+  } catch {
+    return []
   }
 }
 
@@ -150,6 +165,7 @@ export const parseConfig = (o: Readonly<Record<string, unknown>>): Config => {
     palette: str('palette', 'theme') === 'pastel' ? 'pastel' : 'theme',
     openOnStart: bool('openOnStart', true),
     statusLine: bool('statusLine', true),
+    feedCommand: parseFeedCommand(o.feedCommand),
   }
 }
 
@@ -239,6 +255,60 @@ export const fmtClock = (ms: number) => (ms > 0 ? new Date(ms).toTimeString().sl
 export const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 export const fmtUsd = (n: number) => (n >= 100 ? `$${Math.round(n)}` : `$${n.toFixed(2)}`)
+
+export const fmtCny = (n: number) => `¥${Number(n.toFixed(2)) + 0}`
+
+/** Parse external feed stdout JSON; returns null if invalid JSON or not an object. */
+export const parseFeed = (stdout: string, at = 0): Feed | null => {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    return null
+  }
+  if (!isObject(raw)) return null
+  const task = typeof raw.task === 'string' ? raw.task.trim() : ''
+  const cwd = typeof raw.cwd === 'string' ? raw.cwd.trim() : ''
+  const branch = typeof raw.branch === 'string' ? raw.branch.trim() : ''
+  const dsCny = typeof raw.ds_cny === 'number' && Number.isFinite(raw.ds_cny) ? raw.ds_cny : null
+  const gem: GemLimit[] = []
+  if (Array.isArray(raw.gem)) {
+    for (const item of raw.gem) {
+      if (!isObject(item)) continue
+      if (typeof item.label !== 'string' || item.label.trim() === '') continue
+      if (typeof item.pct !== 'number' || !Number.isFinite(item.pct)) continue
+      const parsedAt = typeof item.resets_at === 'string' ? Date.parse(item.resets_at) : NaN
+      gem.push({
+        label: item.label.trim(),
+        pct: Math.max(0, Math.min(100, item.pct)),
+        resetsAt: Number.isFinite(parsedAt) ? parsedAt : null,
+      })
+      if (gem.length >= 2) break
+    }
+  }
+  return { task, cwd, branch, dsCny, gem, at }
+}
+
+/** Stored feed state normalized safely over defaults, or null if not yet read. */
+export const normalizeFeed = (stored: unknown): Feed | null => {
+  if (!isObject(stored)) return null
+  const gem = listOf<unknown>(stored.gem)
+    .filter((g): g is Record<string, unknown> => isObject(g) && typeof g.label === 'string' && g.label.trim() !== '' && typeof g.pct === 'number' && Number.isFinite(g.pct))
+    .slice(0, 2)
+    .map(g => ({
+      label: (g.label as string).trim(),
+      pct: Math.max(0, Math.min(100, g.pct as number)),
+      resetsAt: typeof g.resetsAt === 'number' && Number.isFinite(g.resetsAt) ? g.resetsAt : null,
+    }))
+  return {
+    task: typeof stored.task === 'string' ? stored.task.trim() : '',
+    cwd: typeof stored.cwd === 'string' ? stored.cwd.trim() : '',
+    branch: typeof stored.branch === 'string' ? stored.branch.trim() : '',
+    dsCny: typeof stored.dsCny === 'number' && Number.isFinite(stored.dsCny) ? stored.dsCny : null,
+    gem,
+    at: typeof stored.at === 'number' && Number.isFinite(stored.at) ? stored.at : 0,
+  }
+}
 
 /**
  * How soon a request began to answer: from when it was sent to its first piece of response; null when

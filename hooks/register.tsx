@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AgentCard, Architect, Bucket, Check, Gate, Layout, LogLine, Loop, Main, Roster, Turn, Usage, View } from '../types'
+import type { AgentCard, Architect, Bucket, Check, Feed, Gate, Layout, LogLine, Loop, Main, Roster, Turn, Usage, View } from '../types'
 import {
   DEFAULT_ARCHITECT,
   addCard,
@@ -36,6 +36,7 @@ import {
   endConsult,
   fitLegend,
   fmtClock,
+  fmtCny,
   fmtDuration,
   fmtTimer,
   fmtUsd,
@@ -56,12 +57,14 @@ import {
   momentOf,
   normalize,
   normalizeCard,
+  normalizeFeed,
   normalizeGate,
   normalizeLog,
   noteTool,
   PALETTES,
   SVG_COLORS,
   parseConfig,
+  parseFeed,
   prettyModel,
   promptLine,
   handbackOf,
@@ -94,6 +97,7 @@ const turn = atom({ plugin: 'flightdeck', key: 'turn' } as const, DEFAULT_TURN)
 const receipt = atom({ plugin: 'flightdeck', key: 'receipt' } as const, null)
 const view = atom({ plugin: 'flightdeck', key: 'view' } as const, DEFAULT_VIEW)
 const roster = atom({ plugin: 'flightdeck', key: 'roster' } as const, DEFAULT_ROSTER)
+const feed = atom({ plugin: 'flightdeck', key: 'feed' } as const, null)
 
 type ServerBlock = { type: string; id?: string; name?: string; tool_use_id?: string }
 
@@ -137,6 +141,9 @@ async function getView($: EngineInterface): Promise<View> {
 async function getRoster($: EngineInterface): Promise<Roster> {
   const r = normalize(DEFAULT_ROSTER, await read($, roster))
   return { architectTypes: listOf(r.architectTypes) }
+}
+async function getFeed($: EngineInterface): Promise<Feed | null> {
+  return normalizeFeed(await read($, feed))
 }
 
 /** A stored shape older than this build's: drop what cannot be read, keep the rest. */
@@ -246,11 +253,54 @@ async function noteMode($: EngineInterface, mode: string | undefined) {
 
 // ---------------------------------------------------------------- hooks
 
+const FEED_INTERVAL_MS = 30_000
+const FEED_TIMEOUT_MS = 20_000
+
+function modelDisplayName(raw: unknown): string {
+  if (typeof raw === 'string') return raw ? prettyModel(raw) : ''
+  if (typeof raw === 'object' && raw !== null) {
+    const o = raw as Record<string, unknown>
+    if (typeof o.display_name === 'string') return o.display_name
+    if (typeof o.displayName === 'string') return o.displayName
+    if (typeof o.name === 'string') return o.name
+    if (typeof o.id === 'string') return o.id ? prettyModel(o.id) : ''
+  }
+  return ''
+}
+
+async function pollFeed($: EngineInterface, argv: string[], lock: { inFlight: boolean }) {
+  if (argv.length === 0 || lock.inFlight) return
+  lock.inFlight = true
+  try {
+    const [sid, cwd, rawModel] = await Promise.all([
+      $.session.id().catch(() => ''),
+      $.session.cwd().catch(() => ''),
+      $.session.model().catch(() => ''),
+    ])
+    const stdin = JSON.stringify({
+      session_id: typeof sid === 'string' ? sid : '',
+      cwd: typeof cwd === 'string' ? cwd : '',
+      model: { display_name: modelDisplayName(rawModel) },
+    })
+    const res = await $.process.run(argv, { stdin, timeoutMs: FEED_TIMEOUT_MS })
+    if (res.exitCode !== 0) return
+    const now = await $.clock.now()
+    const parsed = parseFeed(res.stdout, now)
+    if (parsed) await update($, feed, () => parsed)
+  } catch {
+    // Silent: keep the last good feed value.
+  } finally {
+    lock.inFlight = false
+  }
+}
+
 export const register: Register = (on, options) => {
   const cfg = parseConfig(options)
   const C = PALETTES[cfg.palette]
   // tool.check carries no loop id; the tool.call around it does, keyed by the call's id.
   const callLoop = new Map<string, string | null>()
+  const feedLock = { inFlight: false }
+  let stopFeedTimer: (() => void) | undefined
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -284,6 +334,14 @@ export const register: Register = (on, options) => {
       await readCompactWindow($, resumedWindow)
       await refreshStatus($, cfg)
     }
+    if (cfg.feedCommand.length > 0) {
+      stopFeedTimer?.()
+      const stop: unknown = $.clock.every(FEED_INTERVAL_MS, () => {
+        void pollFeed($, cfg.feedCommand, feedLock)
+      })
+      stopFeedTimer = typeof stop === 'function' ? (stop as () => void) : undefined
+      await pollFeed($, cfg.feedCommand, feedLock)
+    }
     return done
   })
 
@@ -291,6 +349,9 @@ export const register: Register = (on, options) => {
     if (e.reason === 'clear') {
       await resetAll($)
       await refreshStatus($, cfg)
+    } else if (e.reason !== 'resume') {
+      stopFeedTimer?.()
+      stopFeedTimer = undefined
     }
     // The process goes on in another conversation, whose first request may find no fill: no compaction.
     if (e.reason === 'clear' || e.reason === 'resume') await update($, usage, x => ({ ...normalize(DEFAULT_USAGE, x), hasFill: false }))
@@ -673,7 +734,7 @@ export const register: Register = (on, options) => {
     const hasClient = 'Client' in els
     const hasRail = hasClient && !faulted.has(faultKey(e.surface, 'rail.tsx'))
     const hasClock = hasClient && !faulted.has(faultKey(e.surface, 'elapsed.tsx'))
-    const [m, u, a, g, cards, lp, lines, t, r, v, now, mono] = await Promise.all([
+    const [m, u, a, g, cards, lp, lines, t, r, v, f, now, mono] = await Promise.all([
       getMain($),
       getUsage($),
       getArchitect($),
@@ -684,6 +745,7 @@ export const register: Register = (on, options) => {
       getTurn($),
       read($, receipt),
       getView($),
+      cfg.feedCommand.length > 0 ? getFeed($) : null,
       $.clock.now(),
       (monoRead ??= readMono($)),
     ])
@@ -786,6 +848,9 @@ export const register: Register = (on, options) => {
     const effortN = { low: 1, medium: 2, high: 3, xhigh: 4, max: 4 }[m.effort] ?? 0
     const ctxFill = contextFill(u)
     const ctxGauge = ctxFill.pct !== null ? gauge(ctxFill.pct, 10) : null
+    const showFeed = cfg.feedCommand.length > 0 && f !== null
+    const hasFeedA = showFeed && (f.dsCny !== null || f.gem.length > 0)
+    const hasFeedB = showFeed && (f.task !== '' || f.cwd !== '')
     const mainPanel = (w: number) => (
       <Box flexDirection="column" borderStyle="round" borderColor={C.main} paddingX={1} width={w}>
         <Box justifyContent="space-between">
@@ -836,19 +901,49 @@ export const register: Register = (on, options) => {
                 u.costUsd !== null ? { spans: [{ text: fmtUsd(u.costUsd), color: C.text }] } : null,
                 ...u.limits.slice(0, 2).map((l, i): Piece => {
                   const lg = gauge(l.pct, 5)
-                  // The time to each reset where the line has room for it: both windows fit from 56 columns,
+                  // The time to each reset where the line has room for it: both windows fit from 58 columns,
                   // so a wide pane's half column (59 at 120) has them; a window that doesn't fit is left out.
-                  const resetIn = w >= 56 ? fmtResetIn(l.resetsAt, now) : ''
+                  const resetIn = w >= 58 ? fmtResetIn(l.resetsAt, now) : ''
                   return {
                     lead: i > 0 ? 1 : u.costUsd !== null ? 2 : 0,
                     spans: [
                       { text: `${limitLabel(l.kind)} `, dim: true },
                       { text: lg.on, color: l.pct >= 80 ? C.warn : C.main },
                       { text: lg.off, color: C.faint },
-                      { text: ` ${Math.round(l.pct)}%${resetIn ? ` ↻${resetIn}` : ''}`, dim: true },
+                      { text: ` ${Math.round(l.pct)}%${resetIn ? ` ↻ ${resetIn}` : ''}`, dim: true },
                     ],
                   }
                 }),
+              ],
+              w - 4,
+            )
+          : null}
+        {hasFeedA && f
+          ? line(
+              [
+                f.dsCny !== null ? { spans: [{ text: `DS ${fmtCny(f.dsCny)}`, color: C.text }] } : null,
+                ...f.gem.slice(0, 2).map((gm, i): Piece => {
+                  const lg = gauge(gm.pct, 5)
+                  const resetIn = w >= 58 ? fmtResetIn(gm.resetsAt, now) : ''
+                  return {
+                    lead: i > 0 ? 1 : f.dsCny !== null ? 2 : 0,
+                    spans: [
+                      { text: `${gm.label} `, dim: true },
+                      { text: lg.on, color: gm.pct >= 80 ? C.warn : C.main },
+                      { text: lg.off, color: C.faint },
+                      { text: ` ${Math.round(gm.pct)}%${resetIn ? ` ↻ ${resetIn}` : ''}`, dim: true },
+                    ],
+                  }
+                }),
+              ],
+              w - 4,
+            )
+          : null}
+        {hasFeedB && f
+          ? line(
+              [
+                f.task ? { spans: [{ text: f.task, dim: true }] } : null,
+                f.cwd ? { spans: [{ text: f.branch ? `${f.cwd} [${f.branch}]` : f.cwd, dim: true }] } : null,
               ],
               w - 4,
             )
@@ -1146,7 +1241,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column" borderStyle="round" borderColor={C.main} borderDimColor={!m.isRunning && !isReview} paddingX={1} width={w}>
           {m.isRunning ? (
             <Box width={w - 4} columnGap={1} overflow="hidden">
-              <Text color={C.main} wrap="truncate">{`◐ back to ${modelName.toLowerCase()} · turn`}</Text>
+              <Text color={C.main} wrap="truncate">{'◐ turn'}</Text>
               <Box flexShrink={0}>{clock('turn-clock', t.startedAt, null, C.main)}</Box>
               {w >= 60 ? <Text dimColor wrap="truncate">{`· ${plural(t.edits, 'edit')} · ${plural(t.errors, 'error')}`}</Text> : null}
             </Box>
@@ -1176,7 +1271,7 @@ export const register: Register = (on, options) => {
 
     // ---- log: whatever rows the other panels leave, 4 to 8
     // The main box's speed line, the legend's gap and the gap above the log are a row each.
-    const used = 2 + legendGap + 5 + (m.speed ? 1 : 0) + 1 + (showArchitect ? 6 : 0) + 6 + (v.gateOpen ? 5 : 0) + (cards.length > cfg.maxCards ? 3 + Math.min(6, cards.length) : 8) + (expandedCard ? 8 : 0) + (lp.length ? 1 : 0) + 3
+    const used = 2 + legendGap + 5 + (m.speed ? 1 : 0) + (hasFeedA ? 1 : 0) + (hasFeedB ? 1 : 0) + 1 + (showArchitect ? 6 : 0) + 6 + (v.gateOpen ? 5 : 0) + (cards.length > cfg.maxCards ? 3 + Math.min(6, cards.length) : 8) + (expandedCard ? 8 : 0) + (lp.length ? 1 : 0) + 3
     const bodyRows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
     const nLog = logRows(bodyRows, used)
     const shownLines = (viewed ? lines.filter(l => l.agentId === viewed) : lines).slice(-nLog)

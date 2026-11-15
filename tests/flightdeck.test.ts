@@ -39,6 +39,8 @@ import {
   normalizeLog,
   titleLines,
   parseConfig,
+  parseFeed,
+  parseFeedCommand,
   prettyModel,
   promptLine,
   handbackOf,
@@ -509,10 +511,14 @@ test('each rate-limit window shows the time to its reset where the main panel ha
   })
   for (const cols of [64, 120]) {
     const ui = await $.ui.mount({ ...pane(cols), surface: 'terminal' })
-    expect(await ui.find({ text: /19% ↻3h10m/ })).toBeDefined()
-    expect(await ui.find({ text: /3% ↻4d2h/ })).toBeDefined()
+    expect(await ui.find({ text: /19% ↻ 3h10m/ })).toBeDefined()
+    expect(await ui.find({ text: /3% ↻ 4d2h/ })).toBeDefined()
     await ui.unmount()
   }
+  const justBelow = await $.ui.mount({ ...pane(57), surface: 'terminal' })
+  expect(await justBelow.find({ text: /19%/ })).toBeDefined()
+  expect(await justBelow.find({ text: /↻/ })).toBeUndefined()
+  await justBelow.unmount()
   const narrow = await $.ui.mount({ ...pane(40), surface: 'terminal' })
   expect(await narrow.find({ text: /19%/ })).toBeDefined()
   expect(await narrow.find({ text: /↻/ })).toBeUndefined() // no room: the gauges stay whole
@@ -1402,4 +1408,199 @@ test('with motion off, the still connector keeps the face from 2.1.299', { plugi
   const { named, lines, hasMono } = await facesAt($, on, kit => (kit ? '2.1.299' : '2.1.295'))
   expect(lines.length).toBe(2 * 2 * 3)
   expect(named.length).toBe(hasMono ? lines.length : 0)
+})
+
+// ---------------------------------------------------------------- external feed
+
+test('parseFeed validates types, caps gem at 2, clamps pct 0-100, and rejects bad JSON', () => {
+  const good = parseFeed(
+    JSON.stringify({
+      task: 'step 2/4 build feed',
+      cwd: '~/Claude',
+      branch: 'yu*',
+      ds_cny: 57.7,
+      extra: 'ignored',
+      gem: [
+        { label: 'gem pro', pct: 38, resets_at: '1970-01-01T03:10:00.000Z' },
+        { label: 'gem flash', pct: 120, resets_at: 'bad-date' },
+        { label: 'gem third', pct: 50 },
+      ],
+    }),
+    1234,
+  )
+  expect(good).toEqual({
+    task: 'step 2/4 build feed',
+    cwd: '~/Claude',
+    branch: 'yu*',
+    dsCny: 57.7,
+    gem: [
+      { label: 'gem pro', pct: 38, resetsAt: 11_400_000 },
+      { label: 'gem flash', pct: 100, resetsAt: null },
+    ],
+    at: 1234,
+  })
+  expect(parseFeed('not json')).toBeNull()
+  expect(parseFeed('[]')).toBeNull()
+  expect(parseFeed('null')).toBeNull()
+  expect(
+    parseFeed(
+      JSON.stringify({
+        task: 42,
+        cwd: null,
+        branch: {},
+        ds_cny: '57.7',
+        gem: ['bad', { label: '', pct: 10 }, { label: 'ok', pct: 'x' }, { label: 'neg', pct: -5 }],
+      }),
+    ),
+  ).toEqual({
+    task: '',
+    cwd: '',
+    branch: '',
+    dsCny: null,
+    gem: [{ label: 'neg', pct: 0, resetsAt: null }],
+    at: 0,
+  })
+  expect([
+    parseFeedCommand(''),
+    parseFeedCommand('not json'),
+    parseFeedCommand('{}'),
+    parseFeedCommand('[]'),
+    parseFeedCommand('["", "a"]'),
+    parseFeedCommand('[123]'),
+    parseFeedCommand('["node", "feed.mjs"]'),
+  ]).toEqual([[], [], [], [], [], [], ['node', 'feed.mjs']])
+})
+
+test('external feed polls on start and every 30s, keeps last good on error, skips overlap, and renders in main panel', { options: { feedCommand: '["feed-cmd","--json"]' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.cwd', () => ({ value: '/work/proj' }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+
+  const calls: { argv: string[]; stdin?: string; timeoutMs?: number }[] = []
+  let mode: 'good' | 'fail' | 'bad-json' | 'empty-fields' | 'hang' = 'good'
+  let releaseHang: () => void = () => {}
+  on('process.run', async (_$, e) => {
+    calls.push({ argv: [...e.argv], stdin: e.init?.stdin, timeoutMs: e.init?.timeoutMs })
+    if (mode === 'fail') return { value: { exitCode: 1, stdout: '', stderr: 'err' } } as never
+    if (mode === 'bad-json') return { value: { exitCode: 0, stdout: '{oops', stderr: '' } } as never
+    if (mode === 'empty-fields') return { value: { exitCode: 0, stdout: '{}', stderr: '' } } as never
+    if (mode === 'hang') {
+      await new Promise<void>(resolve => {
+        releaseHang = resolve
+      })
+      return { value: { exitCode: 0, stdout: JSON.stringify({ ds_cny: 12.5 }), stderr: '' } } as never
+    }
+    return {
+      value: {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          task: 'step 2/4 build feed',
+          cwd: '~/Claude',
+          branch: 'yu*',
+          ds_cny: 57.7,
+          gem: [
+            { label: 'gem pro', pct: 85, resets_at: new Date(109 * 60_000).toISOString() },
+            { label: 'gem fl', pct: 38, resets_at: new Date(65 * 60_000).toISOString() },
+          ],
+        }),
+        stderr: '',
+      },
+    } as never
+  })
+
+  await $.session.start({ cwd: '/work/proj', surface: 'terminal', isInteractive: true })
+  expect(calls.length).toBe(1)
+  expect(calls[0]?.argv).toEqual(['feed-cmd', '--json'])
+  expect(calls[0]?.timeoutMs).toBe(20_000)
+  expect(JSON.parse(calls[0]?.stdin ?? '{}')).toEqual({
+    session_id: 'sess-1',
+    cwd: '/work/proj',
+    model: { display_name: 'Opus 5.5' },
+  })
+
+  // Renders line A and line B at >= 58 with `↻ 1h49m`; narrow omits reset time and drops pieces cleanly.
+  const ui = await $.ui.mount({ ...pane(70), surface: 'terminal' })
+  expect(await ui.find({ text: /DS ¥57\.7/ })).toBeDefined()
+  expect(await ui.find({ text: /85% ↻ 1h49m/ })).toBeDefined()
+  expect(await ui.find({ text: /38% ↻ 1h05m/ })).toBeDefined()
+  const gauges = await ui.findAll({ type: 'Text', text: /^▰+$/ })
+  expect(gauges.map(g => g.props.color)).toEqual(['error', 'claude'])
+  expect(await ui.find({ text: /step 2\/4 build feed/ })).toBeDefined()
+  expect(await ui.find({ text: /~\/Claude \[yu\*\]/ })).toBeDefined()
+  await ui.unmount()
+
+  // Below 58 columns, gem keeps its gauge and percent without the reset marker.
+  const narrow = await $.ui.mount({ ...pane(57), surface: 'terminal' })
+  expect(await narrow.find({ text: /85%/ })).toBeDefined()
+  expect(await narrow.find({ text: /↻/ })).toBeUndefined()
+  await narrow.unmount()
+
+  // Width check across surfaces and placements (mini remains unchanged).
+  const failures: string[] = []
+  for (const surface of ['terminal', 'desktop'] as const) {
+    for (const cols of [24, 32, 40, 64, 120]) {
+      for (const placement of ['dock', 'inline'] as const) {
+        const checkUi = await $.ui.mount({ ...pane(cols), props: { ...pane(cols).props, placement }, surface })
+        for (const s of spillsOf(await checkUi.drawn(), cols)) failures.push(`${surface} ${placement} ${cols}: ${s}`)
+        for (const f of desktopFaults(await checkUi.drawn(), [])) failures.push(`${surface} ${placement} ${cols}: ${f}`)
+        if (placement === 'inline') expect(await checkUi.find({ text: /DS ¥57\.7/ })).toBeUndefined()
+        await checkUi.unmount()
+      }
+    }
+  }
+  expect(failures).toEqual([])
+
+  // Failure and bad JSON keep the last good value.
+  mode = 'fail'
+  await clock.advance(30_000)
+  expect(calls.length).toBe(2)
+  mode = 'bad-json'
+  await clock.advance(30_000)
+  expect(calls.length).toBe(3)
+  const kept = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await kept.find({ text: /DS ¥57\.7/ })).toBeDefined()
+  await kept.unmount()
+
+  // Never run two at once: a tick while one is in flight is skipped.
+  mode = 'hang'
+  await clock.advance(30_000)
+  expect(calls.length).toBe(4)
+  await clock.advance(30_000)
+  expect(calls.length).toBe(4) // skipped while in flight
+  releaseHang()
+  await Promise.resolve()
+  await Promise.resolve()
+
+  const updated = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await updated.find({ text: /DS ¥12\.5/ })).toBeDefined()
+  await updated.unmount()
+
+  // Empty fields omit both feed lines.
+  mode = 'empty-fields'
+  await clock.advance(30_000)
+  const emptyUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await emptyUi.find({ text: /DS ¥/ })).toBeUndefined()
+  await emptyUi.unmount()
+})
+
+test('when feedCommand is empty, no process is run and no feed lines render', async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  let ran = 0
+  on('process.run', () => {
+    ran += 1
+    return { value: { exitCode: 0, stdout: '{"ds_cny":10}', stderr: '' } } as never
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await clock.advance(60_000)
+  expect(ran).toBe(0)
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui.find({ text: /DS ¥/ })).toBeUndefined()
+  await ui.unmount()
 })

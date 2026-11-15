@@ -112,6 +112,12 @@
       "description": "Show context, agents, consults and denials in the status line",
       "type": "boolean",
       "default": true
+    },
+    "feedCommand": {
+      "title": "Feed command",
+      "description": "JSON array of strings (argv) for an external status feed command. Leave empty to disable.",
+      "type": "string",
+      "default": ""
     }
   }
 }
