@@ -1,8 +1,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AgentCard, Architect, Bucket, Check, ConsultState, Feed, Gate, Layout, LogLine, Loop, Main, Roster, Turn, Usage, View } from '../types'
+import type { AgentCard, Architect, Bucket, Check, ConsultState, Feed, Gate, Issued, Job, Layout, LogLine, Loop, Main, MeshTask, Roster, Turn, Usage, View } from '../types'
 import {
+  AGY_SHOW_MS,
+  PYTHON_CANDIDATES,
   DEFAULT_ARCHITECT,
   addCard,
   resumeCard,
@@ -28,9 +30,30 @@ import {
   cardTitle,
   afterCompactHooked,
   afterCompactRead,
+  agyProbe,
+  applyAgyLive,
+  bindConsultRun,
+  bindResult,
   isConsultLive,
   isConsultShown,
+  isJobLive,
   isObject,
+  issueCall,
+  jobLeaves,
+  jobsProbe,
+  meshProbe,
+  normalizeIssued,
+  parseAgyLive,
+  parseJobs,
+  parseMeshTasks,
+  parseRunnerCall,
+  receiptJobParts,
+  receiptPanelRow,
+  receiptSummary,
+  taskAtIssue,
+  taskOfBrief,
+  turnConsults,
+  turnJobs,
   afterFillRead,
   afterResponse,
   claimCompactRead,
@@ -70,6 +93,7 @@ import {
   normalizeConsult,
   normalizeFeed,
   normalizeGate,
+  normalizeJob,
   normalizeLog,
   fmtWorkerCost,
   jobsCost,
@@ -96,7 +120,7 @@ import {
   stepSpeed,
   stepLoop,
 } from './core'
-import type { Config, Panel, RingGridRun } from './core'
+import type { Config, JobLeaf, Panel, RingGridRun } from './core'
 
 const PANE = 'flightdeck'
 const TITLE = 'Flightdeck'
@@ -110,6 +134,8 @@ const usage = atom({ plugin: 'flightdeck', key: 'usage' } as const, DEFAULT_USAG
 const architect = atom({ plugin: 'flightdeck', key: 'architect' } as const, DEFAULT_ARCHITECT)
 const gate = atom({ plugin: 'flightdeck', key: 'gate' } as const, DEFAULT_GATE)
 const agents = atom({ plugin: 'flightdeck', key: 'agents' } as const, [])
+const jobs = atom({ plugin: 'flightdeck', key: 'jobs' } as const, [])
+const issued = atom({ plugin: 'flightdeck', key: 'issued' } as const, [])
 const loops = atom({ plugin: 'flightdeck', key: 'loops' } as const, [])
 const log = atom({ plugin: 'flightdeck', key: 'log' } as const, [])
 const turn = atom({ plugin: 'flightdeck', key: 'turn' } as const, DEFAULT_TURN)
@@ -146,6 +172,12 @@ async function getGate($: EngineInterface): Promise<Gate> {
 async function getCards($: EngineInterface): Promise<AgentCard[]> {
   return listOf<unknown>(await read($, agents)).map(normalizeCard)
 }
+async function getJobs($: EngineInterface): Promise<Job[]> {
+  return listOf<unknown>(await read($, jobs)).map(normalizeJob)
+}
+async function getIssued($: EngineInterface): Promise<Issued[]> {
+  return normalizeIssued(await read($, issued))
+}
 async function getLoops($: EngineInterface): Promise<Loop[]> {
   return listOf<Loop>(await read($, loops))
 }
@@ -175,6 +207,8 @@ async function migrate($: EngineInterface) {
   if ((m?.schemaVersion ?? 0) >= SCHEMA_VERSION) return
   await update($, log, list => normalizeLog(list))
   await update($, agents, list => listOf<unknown>(list).map(normalizeCard))
+  await update($, jobs, list => listOf<unknown>(list).map(normalizeJob))
+  await update($, issued, list => normalizeIssued(list))
   await update($, gate, g => normalizeGate(g))
   await update($, meta, () => ({ schemaVersion: SCHEMA_VERSION }))
 }
@@ -246,6 +280,8 @@ async function resetAll($: EngineInterface) {
   await update($, architect, () => DEFAULT_ARCHITECT)
   await update($, gate, () => DEFAULT_GATE)
   await update($, agents, () => [])
+  await update($, jobs, () => [])
+  await update($, issued, () => [])
   await update($, loops, () => [])
   await update($, log, () => [])
   await update($, turn, () => DEFAULT_TURN)
@@ -363,8 +399,9 @@ const CONSULT_TIMEOUT_MS = 5_000
 
 type ConsultLock = {
   inFlight: boolean
-  python: string
+  python: readonly string[]
   lastJson: string
+  boundRun: string
   isLive: boolean
   ticks: number
   started: boolean
@@ -381,7 +418,7 @@ async function pollConsult($: EngineInterface, dir: string, lock: ConsultLock): 
   lock.inFlight = true
   try {
     let res: { exitCode: number; stdout: string } | null = null
-    for (const py of lock.python ? [lock.python] : ['python3', 'python']) {
+    for (const py of lock.python.length > 0 ? [lock.python] : PYTHON_CANDIDATES) {
       res = await $.process.run(consultProbe(py, dir), { timeoutMs: CONSULT_TIMEOUT_MS }).catch(() => null)
       if (res && res.exitCode === 0) {
         lock.python = py
@@ -394,6 +431,10 @@ async function pollConsult($: EngineInterface, dir: string, lock: ConsultLock): 
     if (res.stdout !== lock.lastJson) {
       lock.lastJson = res.stdout
       await update($, consult, () => parsed)
+    }
+    if (parsed.run && parsed.run.id !== lock.boundRun) {
+      lock.boundRun = parsed.run.id
+      await update($, issued, list => bindConsultRun(normalizeIssued(list), parsed.run))
     }
     const live = isConsultLive(parsed)
     lock.isLive = live
@@ -409,7 +450,7 @@ async function pollConsult($: EngineInterface, dir: string, lock: ConsultLock): 
  * Asks each running card's job dir which model works on it now (a job runner falls back from model to
  * model, so this can change mid-run). Runs nothing when no running card has a job dir.
  */
-async function pollWorkers($: EngineInterface, lock: { inFlight: boolean; python: string }) {
+async function pollWorkers($: EngineInterface, lock: { inFlight: boolean; python: readonly string[] }) {
   if (lock.inFlight) return
   lock.inFlight = true
   try {
@@ -417,7 +458,7 @@ async function pollWorkers($: EngineInterface, lock: { inFlight: boolean; python
     const todo = (await getCards($)).filter(c => c.jobdir && (c.status === 'running' || (c.endedAt !== null && now - c.endedAt < 3 * WORKER_INTERVAL_MS)))
     for (const c of todo) {
       let res: { exitCode: number; stdout: string } | null = null
-      for (const py of lock.python ? [lock.python] : ['python3', 'python']) {
+      for (const py of lock.python.length > 0 ? [lock.python] : PYTHON_CANDIDATES) {
         res = await $.process.run(workerProbe(py, c.jobdir), { timeoutMs: WORKER_TIMEOUT_MS }).catch(() => null)
         if (res && res.exitCode === 0) {
           lock.python = py
@@ -436,16 +477,122 @@ async function pollWorkers($: EngineInterface, lock: { inFlight: boolean; python
   }
 }
 
+const JOBS_TICK_MS = 1_000
+const JOBS_LIVE_TICKS = 3
+const JOBS_IDLE_TICKS = 20
+const JOBS_TIMEOUT_MS = 5_000
+
+type JobsLock = {
+  inFlight: boolean
+  python: readonly string[]
+  ticks: number
+  isLive: boolean
+  started: boolean
+  stopped: boolean
+  stopTimer: (() => void) | undefined
+  lastJobs: string
+  lastAgy: string
+  /** jobid (or `agy:<callId>`) → the conversation db already matched to it. */
+  dbCache: Record<string, string>
+}
+
+/**
+ * Reads the job dirs (`jobsProbe`) and the live agy-job calls (`agyProbe`) into their atoms. Every 3 s while
+ * one is live, every 20 s otherwise; one probe in flight; silent on errors, keeping the last good rows.
+ */
+async function pollJobs($: EngineInterface, root: string, lock: JobsLock) {
+  if (lock.inFlight || lock.stopped) return
+  lock.inFlight = true
+  try {
+    const now = await $.clock.now()
+    const list = await getIssued($)
+    const agy = list.filter(i => i.kind === 'agy' && (i.endedAt === null || now - i.endedAt < AGY_SHOW_MS))
+    let stdout = ''
+    for (const py of lock.python.length > 0 ? [lock.python] : PYTHON_CANDIDATES) {
+      const res = await $.process.run(jobsProbe(py, root, lock.dbCache), { timeoutMs: JOBS_TIMEOUT_MS }).catch(() => null)
+      if (res && res.exitCode === 0) {
+        lock.python = py
+        stdout = res.stdout
+        break
+      }
+    }
+    const parsed = stdout ? parseJobs(stdout, now) : null
+    if (parsed) {
+      for (const j of parsed) if (j.db) lock.dbCache[j.jobid] = j.db
+      if (stdout !== lock.lastJobs) {
+        lock.lastJobs = stdout
+        await update($, jobs, () => parsed)
+      }
+    }
+    if (agy.length > 0) {
+      let agyOut = ''
+      const calls = agy.map(i => ({ callId: i.callId, name: i.name, repo: i.repo, since: i.at, handoff: i.handoff }))
+      for (const py of lock.python.length > 0 ? [lock.python] : PYTHON_CANDIDATES) {
+        const res = await $.process.run(agyProbe(py, calls, lock.dbCache), { timeoutMs: JOBS_TIMEOUT_MS }).catch(() => null)
+        if (res && res.exitCode === 0) {
+          lock.python = py
+          agyOut = res.stdout
+          break
+        }
+      }
+      const live = agyOut ? parseAgyLive(agyOut) : null
+      if (live) {
+        for (const l of live) if (l.db) lock.dbCache[`agy:${l.callId}`] = l.db
+        if (agyOut !== lock.lastAgy) {
+          lock.lastAgy = agyOut
+          await update($, issued, current => applyAgyLive(normalizeIssued(current), live))
+        }
+      }
+    }
+    lock.isLive = (await getJobs($)).some(isJobLive) || agy.some(i => i.endedAt === null)
+  } catch {
+    // Silent: the pane keeps the last rows it read.
+  } finally {
+    lock.inFlight = false
+  }
+}
+
+const MESH_TIMEOUT_MS = 2_000
+
+/**
+ * A session's mesh task items, read-only. Main's direct workers hang under the item that was `doing`
+ * when they were issued, so they are read at issue time; '' when the cache cannot be read.
+ */
+async function readMeshTasks($: EngineInterface, python: readonly string[]): Promise<{ tasks: MeshTask[]; python: readonly string[] }> {
+  const sid = await $.session.id().catch(() => '')
+  if (typeof sid !== 'string' || !sid) return { tasks: [], python }
+  for (const py of python.length > 0 ? [python] : PYTHON_CANDIDATES) {
+    const res = await $.process.run(meshProbe(py, sid), { timeoutMs: MESH_TIMEOUT_MS }).catch(() => null)
+    if (res && res.exitCode === 0) return { tasks: parseMeshTasks(res.stdout), python: py }
+  }
+  return { tasks: [], python }
+}
+
 export const register: Register = (on, options) => {
   const cfg = parseConfig(options)
   const C = PALETTES[cfg.palette]
   // tool.check carries no loop id; the tool.call around it does, keyed by the call's id.
   const callLoop = new Map<string, string | null>()
+  // An `Agent` tool call's brief, by description, for the card its `agent.spawn` makes: the `task:` line lives there.
+  const briefs = new Map<string, string>()
+  let meshPython: readonly string[] = []
   const feedLock = { inFlight: false }
   let stopFeedTimer: (() => void) | undefined
-  const workerLock = { inFlight: false, python: '' }
+  const workerLock: { inFlight: boolean; python: readonly string[] } = { inFlight: false, python: [] }
   let stopWorkerTimer: (() => void) | undefined
-  const consultLock: ConsultLock = { inFlight: false, python: '', lastJson: '', isLive: false, ticks: 0, started: false, stopped: false, stopTimer: undefined }
+  const consultLock: ConsultLock = { inFlight: false, python: [], lastJson: '', boundRun: '', isLive: false, ticks: 0, started: false, stopped: false, stopTimer: undefined }
+  const jobsLock: JobsLock = {
+    inFlight: false,
+    python: [],
+    ticks: 0,
+    isLive: false,
+    started: false,
+    stopped: false,
+    stopTimer: undefined,
+    lastJobs: '',
+    lastAgy: '',
+    dbCache: {},
+  }
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -511,6 +658,23 @@ export const register: Register = (on, options) => {
         consultLock.stopTimer = typeof stopC === 'function' ? (stopC as () => void) : undefined
       }
     }
+    if (cfg.panels.includes('agents') || cfg.panels.includes('receipt')) {
+      jobsLock.stopped = false
+      jobsLock.ticks = 0
+      await pollJobs($, cfg.jobsDir, jobsLock)
+      if (!jobsLock.started) {
+        jobsLock.started = true
+        const stopJ: unknown = $.clock.every(JOBS_TICK_MS, () => {
+          if (jobsLock.stopped || jobsLock.inFlight) return
+          jobsLock.ticks += 1
+          const target = jobsLock.isLive ? JOBS_LIVE_TICKS : JOBS_IDLE_TICKS
+          if (jobsLock.ticks < target) return
+          jobsLock.ticks = 0
+          void pollJobs($, cfg.jobsDir, jobsLock)
+        })
+        jobsLock.stopTimer = typeof stopJ === 'function' ? (stopJ as () => void) : undefined
+      }
+    }
     return done
   })
 
@@ -524,6 +688,10 @@ export const register: Register = (on, options) => {
       consultLock.stopped = true
       consultLock.stopTimer?.()
       consultLock.stopTimer = undefined
+      jobsLock.stopped = true
+      jobsLock.stopTimer?.()
+      jobsLock.stopTimer = undefined
+      jobsLock.started = false
     }
     // The process goes on in another conversation, whose first request may find no fill: no compaction.
     if (e.reason === 'clear' || e.reason === 'resume') await update($, usage, x => ({ ...normalize(DEFAULT_USAGE, x), hasFill: false }))
@@ -744,8 +912,30 @@ export const register: Register = (on, options) => {
 
   on('tool.call', async ($, e, next) => {
     callLoop.set(e.tool_use_id, e.agentId ?? null)
+    // A tool.call carries its input's fields on the event itself; some engines nest them under `input`.
+    const ev = e as unknown as Record<string, unknown>
+    const input = isObject(ev.input) ? ev.input : ev
+    if (e.tool === 'Agent' && typeof input.prompt === 'string') {
+      briefs.set(String(input.description ?? ''), input.prompt)
+      if (briefs.size > 20) briefs.delete(briefs.keys().next().value as string)
+    }
+    const runner = e.tool === 'Bash' && typeof input.command === 'string' ? parseRunnerCall(input.command) : null
+    if (runner && e.tool_use_id) {
+      const at = await $.clock.now()
+      const cardTask = e.agentId ? ((await getCards($)).find(c => c.id === e.agentId)?.task ?? '') : ''
+      const mesh = e.agentId ? { tasks: [] as MeshTask[], python: meshPython } : await readMeshTasks($, meshPython)
+      meshPython = mesh.python
+      const task = taskAtIssue(e.agentId ?? '', cardTask, mesh.tasks)
+      await update($, issued, list => issueCall(normalizeIssued(list), { ...runner, callId: e.tool_use_id!, agentId: e.agentId ?? '', at, task }))
+      if (!jobsLock.stopped) void pollJobs($, cfg.jobsDir, jobsLock)
+    }
     const ran = await next(e).finally(() => callLoop.delete(e.tool_use_id))
     const didRun = ran.deny === undefined
+    if (runner && e.tool_use_id) {
+      const at = await $.clock.now()
+      await update($, issued, list => bindResult(normalizeIssued(list), e.tool_use_id!, didRun ? ran.text : '', at, didRun && ran.isError !== true))
+      if (!jobsLock.stopped) void pollJobs($, cfg.jobsDir, jobsLock)
+    }
     // Settle this call's pending ask, if it had one; skip the write (and the redraw) otherwise.
     const g0 = await getGate($)
     const isSettled = settleCheck(g0, e.tool_use_id, didRun) !== g0
@@ -828,6 +1018,7 @@ export const register: Register = (on, options) => {
       await consultStarted($, cfg, id, e.subagentType.split(':').pop() ?? 'agent')
       return started
     }
+    const spawnPrompt = typeof (e as unknown as { prompt?: unknown }).prompt === 'string' ? (e as unknown as { prompt: string }).prompt : ''
     const card: AgentCard = {
       ...normalizeCard({}),
       id,
@@ -835,6 +1026,8 @@ export const register: Register = (on, options) => {
       model: started.model,
       description: e.description,
       spawnedAt: await $.clock.now(),
+      parentId: e.parentAgentId ?? '',
+      task: taskOfBrief(spawnPrompt || briefs.get(e.description) || ''),
     }
     // Decided in the write: a resume whose first step already put its card back to running is not logged again.
     let isNew = true
@@ -857,10 +1050,12 @@ export const register: Register = (on, options) => {
     const id = e.agentId
     const now = await $.clock.now()
     if (!id) {
-      const [t, cards, cost] = await Promise.all([getTurn($), getCards($), costNow($)])
+      const [t, cards, cost, probed, issuedNow, cs] = await Promise.all([getTurn($), getCards($), costNow($), getJobs($), getIssued($), getConsult($)])
       const r = receiptOf(t, {
         durationMs: e.durationMs,
         agentsSince: cards.filter(c => c.spawnedAt >= t.startedAt).length,
+        jobsSince: turnJobs(probed, issuedNow, t.startedAt, now).length,
+        panelsSince: turnConsults(cs?.run ?? null, t.startedAt, now).length,
         costNow: cost,
         reason: e.reason,
       })
@@ -921,13 +1116,15 @@ export const register: Register = (on, options) => {
     const hasRail = hasClient && !faulted.has(faultKey(e.surface, 'rail.tsx'))
     const hasRing = hasClient && !faulted.has(faultKey(e.surface, 'ring.tsx'))
     const hasClock = hasClient && !faulted.has(faultKey(e.surface, 'elapsed.tsx'))
-    const [m, u, a, cs, g, cards, lp, lines, t, r, v, f, now, mono] = await Promise.all([
+    const [m, u, a, cs, g, cards, jobsNow, issuedNow, lp, lines, t, r, v, f, now, mono] = await Promise.all([
       getMain($),
       getUsage($),
       getArchitect($),
-      cfg.panels.includes('consult') ? getConsult($) : null,
+      getConsult($),
       getGate($),
       getCards($),
+      getJobs($),
+      getIssued($),
       getLoops($),
       getLog($),
       getTurn($),
@@ -954,13 +1151,15 @@ export const register: Register = (on, options) => {
     const showArchitect = a.consults.length > 0 || a.ids.length > 0
     const showConsult = isConsultShown(cs, now)
     const motion = cfg.motion && hasRail
+    // Until the work tree lands, the agents panel carries the farmer and agy-job leaves too.
+    const leaves = jobLeaves(jobsNow, issuedNow, now)
     // A panel with nothing to show yet takes no room: most sessions never spawn an agent.
     const isEmpty: Record<Panel, boolean> = {
       main: false,
       architect: !showArchitect,
       consult: !showConsult,
       gate: g.recent.length === 0 && gateSummary(g).total === 0,
-      agents: cards.length === 0,
+      agents: cards.length === 0 && leaves.length === 0,
       loops: lp.length === 0,
       receipt: !m.isRunning && !r,
       log: false,
@@ -1277,6 +1476,32 @@ export const register: Register = (on, options) => {
     const expandOnPress = (id: string) => () =>
       update($, view, x => ({ ...normalize(DEFAULT_VIEW, x), expanded: normalize(DEFAULT_VIEW, x).expanded === id ? null : id }))
 
+    // The farmer and agy-job leaves the agents panel carries until the work tree lands: one line each,
+    // `now · work` under a running one, and never more than four.
+    const leafColor = (l: JobLeaf) =>
+      l.status === 'failed' || l.status === 'refused' ? C.warn : l.status === 'partial' ? C.amber : l.isLive ? C.agent : C.gate
+    const leafLines = (w: number) => {
+      const shown = leaves.slice(0, 4)
+      return (
+        <Box flexDirection="column">
+          {shown.map(l => (
+            <Box key={l.id} flexDirection="column">
+              <Box width={w} columnGap={1} overflow="hidden">
+                <Text color={leafColor(l)}>{l.glyph}</Text>
+                <Box flexShrink={1}>
+                  <Text wrap="truncate">{`${l.isRealRepo ? '◇' : ''}${l.name}${l.worker ? ` ▸ ${l.worker}` : ''}`}</Text>
+                </Box>
+                {l.verifyPending ? <Text color={C.amber}>verify pending</Text> : null}
+                <Box flexShrink={0}>{clock(`job-clock-${l.id}`, l.startedAt, l.endedAt, C.dim)}</Box>
+              </Box>
+              {w >= 56 && l.detail ? <Text dimColor wrap="truncate">{`  ${l.detail}`}</Text> : null}
+            </Box>
+          ))}
+          {leaves.length > shown.length ? <Text color={C.faint}>{`+${leaves.length - shown.length} more`}</Text> : null}
+        </Box>
+      )
+    }
+
     const agentsPanel = (w: number) => {
       // Cards need 20 columns each; when the pane can't hold the limit, lanes take over.
       const fit = Math.max(1, Math.min(cfg.maxCards, Math.floor((w + 1) / 21)))
@@ -1298,7 +1523,7 @@ export const register: Register = (on, options) => {
         return (
           <Box flexDirection="column" width={w}>
             {header}
-            <Text color={C.faint}>no subagents yet</Text>
+            {leaves.length === 0 ? <Text color={C.faint}>no subagents yet</Text> : leafLines(w)}
           </Box>
         )
       }
@@ -1335,6 +1560,7 @@ export const register: Register = (on, options) => {
                 </Box>
               )
             })}
+            {leaves.length > 0 ? leafLines(w) : null}
           </Box>
         )
       }
@@ -1381,6 +1607,7 @@ export const register: Register = (on, options) => {
             })}
           </Box>
           {rail('merge', running.length > 0, C.agent, w, centers, true)}
+          {leaves.length > 0 ? leafLines(w) : null}
         </Box>
       )
     }
@@ -1427,9 +1654,11 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // ---- receipt: the turn now, or the last one
+    // ---- receipt: the turn now, or the last one, with the jobs and consult runs it started
     const receiptPanel = (w: number) => {
       const isReview = t.isReviewing
+      const turnJobList = r ? turnJobs(jobsNow, issuedNow, r.since, r.since + r.durationMs) : []
+      const turnPanelList = r ? turnConsults(cs?.run ?? null, r.since, r.since + r.durationMs) : []
       return (
         <Box flexDirection="column" borderStyle="round" borderColor={C.main} borderDimColor={!m.isRunning && !isReview} paddingX={1} width={w}>
           {m.isRunning ? (
@@ -1439,18 +1668,43 @@ export const register: Register = (on, options) => {
               {w >= 60 ? <Text dimColor wrap="truncate">{`· ${plural(t.edits, 'edit')} · ${plural(t.errors, 'error')}`}</Text> : null}
             </Box>
           ) : r ? (
-            line(
-              [
-                { spans: [{ text: r.reason === 'answer' ? '✓' : '✗', color: r.reason === 'answer' ? C.gate : C.warn }] },
-                {
-                  spans: [{ text: `last turn ${fmtDuration(r.durationMs)} · ${plural(r.agents, 'agent')} · ${plural(r.edits, 'edit')} · ${plural(r.errors, 'error')}` }],
-                  fill: true,
-                },
-                r.costDelta !== null ? { spans: [{ text: `· +${fmtUsd(r.costDelta)}`, color: C.main }] } : null,
-                jobsLabel(r) ? { spans: [{ text: jobsLabel(r), color: C.agent }] } : null,
-              ],
-              w - 4,
-            )
+            <Box flexDirection="column">
+              {line(
+                [
+                  { spans: [{ text: r.reason === 'answer' ? '✓' : '✗', color: r.reason === 'answer' ? C.gate : C.warn }] },
+                  { spans: [{ text: receiptSummary(r) }], fill: true },
+                  r.costDelta !== null ? { spans: [{ text: `· +${fmtUsd(r.costDelta)}`, color: C.main }] } : null,
+                  jobsLabel(r) ? { spans: [{ text: jobsLabel(r), color: C.agent }] } : null,
+                ],
+                w - 4,
+              )}
+              {w >= 40 && turnJobList.length > 0 ? (
+                <Box flexDirection="column">
+                  {turnJobList.slice(0, 4).map(j => {
+                    const p = receiptJobParts(j, now)
+                    const color = p.isLive ? C.agent : j.status === 'failed' || j.status === 'refused' ? C.warn : C.gate
+                    return (
+                      <Box key={j.id} width={w - 4} columnGap={2} overflow="hidden">
+                        <Text color={color}>{p.glyph}</Text>
+                        <Text wrap="truncate">{p.name}</Text>
+                        {p.worker ? <Text color={C.dim} wrap="truncate">{`▸ ${p.worker}`}</Text> : null}
+                        {p.isLive ? <Box flexShrink={0}>{clock(`receipt-clock-${j.id}`, p.startedAt, null, C.dim)}</Box> : <Text dimColor>{p.duration}</Text>}
+                        {p.tokens ? <Text dimColor>{p.tokens}</Text> : null}
+                        {p.cost ? <Text color={j.cost === 0 ? C.dim : C.agent}>{p.cost}</Text> : null}
+                      </Box>
+                    )
+                  })}
+                  {turnJobList.length > 4 ? <Text color={C.faint}>{`+${turnJobList.length - 4} more`}</Text> : null}
+                </Box>
+              ) : null}
+              {w >= 40
+                ? turnPanelList.slice(0, 2).map(run => (
+                    <Text key={`panel-${run.id}`} dimColor wrap="truncate">
+                      {receiptPanelRow(run, now)}
+                    </Text>
+                  ))
+                : null}
+            </Box>
           ) : (
             <Text color={C.faint}>no turn finished yet</Text>
           )}
@@ -1790,7 +2044,7 @@ export const register: Register = (on, options) => {
           {lp.length > 0 ? <Text dimColor wrap="truncate">{`other loops ${lp.length} · ${lp.filter(l => isLoopActive(l, now)).length} active`}</Text> : null}
           {!m.isRunning && r ? (
             <Text dimColor wrap="truncate">
-              {`last turn ${fmtDuration(r.durationMs)} · ${plural(r.agents, 'agent')} · ${plural(r.edits, 'edit')} · ${plural(r.errors, 'error')}${r.costDelta !== null ? ` · +${fmtUsd(r.costDelta)}` : ''}${jobsLabel(r)}`}
+              {`${receiptSummary(r)}${r.costDelta !== null ? ` · +${fmtUsd(r.costDelta)}` : ''}${jobsLabel(r)}`}
             </Text>
           ) : null}
         </Box>

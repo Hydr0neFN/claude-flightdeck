@@ -1,6 +1,6 @@
 {
   "name": "flightdeck",
-  "version": "0.7.0",
+  "version": "0.8.0-a",
   "description": "Flightdeck: a live agent dashboard for Claude Code. Main model vitals, an on-call architect, every permission check, subagent cards and swimlanes, a turn receipt and a session log, all from real session events",
   "author": {
     "name": "Stephen Casella",
@@ -128,6 +128,12 @@
     "consultDir": {
       "title": "Consult runs directory",
       "description": "Directory holding external consult run JSON files. Leave empty for ~/.claude/state/consult-runs.",
+      "type": "string",
+      "default": ""
+    },
+    "jobsDir": {
+      "title": "Jobs directory",
+      "description": "Directory holding one folder per farmer job. Leave empty for ~/.claude/state/ds-jobs.",
       "type": "string",
       "default": ""
     }

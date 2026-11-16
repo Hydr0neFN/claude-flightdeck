@@ -65,7 +65,7 @@ https://github.com/user-attachments/assets/9ad0fcc3-c81c-427a-a743-f7b6c49f5885
 | **architect** | consults on a timeline, whether one is running, how long the last took; optionally the moment of each consult; the first line of a subagent architect's advice | a spawn of a matching agent type, or a matching server tool in the assistant's rows |
 | **consult** | external multi-engine consults and debates in a ring around `MAIN`, with live spinners, travelling packets, question, legend, failure reasons, active locks and summary | `~/.claude/state/consult-runs/` (or `consultDir`) and `~/.claude/state/consult-locks.json` |
 | **gate** | one cell per permission check: green allowed without asking, blue decided by the auto-mode classifier or you and then run, amber pending, red ✗ denied, dim if made inside a subagent. Totals, and a drill-down per tool family with credentials masked | `tool.check`, settled by the `tool.call` around it |
-| **agents** | cards side by side while they fit: the task, type, live context and output tokens, steps, a running clock, `max_tokens` in red. Beyond that, swimlanes on one time axis | `agent.spawn`, `turn.step`, `tool.call`, `turn.complete` |
+| **agents** | cards side by side while they fit: the task, type, live context and output tokens, steps, a running clock, `max_tokens` in red. Beyond that, swimlanes on one time axis. Until the `work` tree lands, one line per farmer job or agy-job call, with a live `now · work` detail line while it runs | `agent.spawn`, `turn.step`, `tool.call`, `turn.complete`; `jobsDir` for the jobs |
 | **loops** | model loops that match no card: workflow agents, compactions, memory forks | `turn.step` ids no card claims |
 | **receipt** | the running turn, or the last one: duration, agents, edits, errors, cost added | `turn.start`, `turn.complete` |
 | **log** | prompts, spawns, completions, consults, edits, errors and denials; filtered to one agent while you view its transcript | all of the above |
@@ -112,7 +112,7 @@ Flightdeck only watches. Every hook passes its event on unchanged: it never deni
 | the context breakdown `/context` shows (its categories, memory-file paths, MCP tools, agents and skills), estimated locally once per model; it keeps only the compaction window from it | `$.session.usage({ breakdown: 'summary' })` |
 | advisor tool calls in the assistant's responses (their content is encrypted) | `session.append` |
 
-What it keeps: short summaries (a tool name plus a path or command, with credentials masked) in session state, which ends with the session. It makes **no** network requests, runs no processes, reads and writes no files, stores nothing across sessions, and calls no model. `claude plugin validate .` prints exactly what it hooks and calls.
+What it keeps: short summaries (a tool name plus a path or command, with credentials masked) in session state, which ends with the session. It makes **no** network requests and calls no model. Its only processes are local read-only python probes: they read the consult run files and locks, the farmer job dirs and handoffs, and the agy conversation store, and write nothing. It stores nothing across sessions. `claude plugin validate .` prints exactly what it hooks and calls.
 
 ## What is inferred, not measured
 
@@ -145,6 +145,7 @@ In `/config`, or under `pluginConfigs[<id>].options` in your user `settings.json
 | `openOnStart` | `true` | ask to open the pane when a session starts |
 | `statusLine` | `true` | context, running agents, consults and denials in the status line |
 | `consultDir` | `""` | directory holding external consult run JSON files (`""` uses `~/.claude/state/consult-runs`) |
+| `jobsDir` | `""` | directory holding one folder per farmer job (`""` uses `~/.claude/state/ds-jobs`) |
 
 ## External feed
 
@@ -216,6 +217,23 @@ Debate (round 2+, answers circulate clockwise around the ring):
 │ ● done  ◐ running  ○ queued  ✗ failed  ⊘ locked              │
 ╰──────────────────────────────────────────────────────────────╯
 ```
+
+## Farmer jobs
+
+A farmer job (`ds-job.py run`, `agy-job.py run`) is not a Claude subagent, so the agent cards never saw it. Flightdeck now reads `jobsDir` (default `~/.claude/state/ds-jobs`) with a local python probe every 3 s while a job is live and every 20 s otherwise: live jobs, and jobs that ended in the last 30 minutes, newest first, at most 8. A live job whose recorded pid is gone is marked `⊘`.
+
+Until the `work` tree lands, the `agents` panel lists each job and each agy-job call as one line under the agents, with one detail line under a running one:
+
+```
+◐ ring-panel ▸ Hydrogen xhigh          2:04
+  edit hooks/register.tsx · 4 files · 83 st
+● receipt ▸ sol                       4:06
+◐ ◇verify ▸ agy Sonnet high            0:41  verify pending
+```
+
+The detail line is left out below 56 columns. `◇` marks an agy-job: it runs on your real repo, with no scrubbed copy. `verify pending` shows while `~/.claude/state/agy-verify-pending/<job>.json` exists, and its thought is never read: those jobs are private.
+
+No model is called. For an agy worker the pane opens that conversation's SQLite store read-only and reads the latest tool call (`edit hooks/register.tsx`, `run npm test`), the edited files and the step count; a locked, missing or unreadable store leaves those rows out. Other workers fall back to the newest file in the job's work tree against `<jobdir>/base`. The turn receipt counts a job the turn started (`2 jobs`) and gives each one a row with its worker, duration, tokens from the handoff `ds:` line and cost, or `free`.
 
 ## Troubleshooting
 

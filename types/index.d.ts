@@ -73,6 +73,10 @@ export type AgentCard = {
   status: string
   spawnedAt: number
   endedAt: number | null
+  /** The agent that spawned this one (`agent.spawn` `parentAgentId`); '' when main did. */
+  parentId: string
+  /** The mesh task a sub-main's brief names (`task: t4`); '' when the brief has none. */
+  task: string
   /** The agent's context now: input + cache read + cache write of its latest step. */
   ctx: number
   /** Output tokens summed over its steps. */
@@ -112,6 +116,10 @@ export type Turn = {
 export type Receipt = {
   durationMs: number
   agents: number
+  /** Farmer jobs started inside the turn window. */
+  jobs: number
+  /** External consult panel runs started inside the turn window. */
+  panels: number
   edits: number
   errors: number
   costDelta: number | null
@@ -179,6 +187,100 @@ export type ConsultState = {
   locks: Record<string, ConsultLock>
 }
 
+/** A job runner's token counts, from the handoff's `ds:` line. */
+export type JobTokens = { in: number; cache: number; out: number; think: number }
+
+/** One row of a job directory's `state.json`, with what the probe read beside it. */
+export type Job = {
+  jobid: string
+  /** The `--job` name the runner was given. */
+  job: string
+  /** `running` `parked` `need_tool` `done` `partial` `failed` `refused` `dry`, as the runner wrote it. */
+  status: string
+  /** Epoch seconds the job started. */
+  ts: number
+  pid: number | null
+  backend: string
+  tier: string
+  profile: string
+  phase: string
+  rc: number | null
+  /** The job directory. */
+  dir: string
+  /** The work tree the job runs in. */
+  tree: string
+  /** A live status (running, parked, need_tool) whose pid is gone. */
+  stale: boolean
+  /** The mtime of `state.json` in ms: an ended job's end. */
+  endedAt: number | null
+  /** The backend now being tried (the `trying` file). */
+  trying: string
+  /** copy / toolbox / model / apply / check / handoff, from `job.log` and `state.json`. */
+  stage: string
+  /** Backends tried so far: a switch draws `model ×2`. */
+  attempts: number
+  /** Live: the latest tool call. */
+  now: string
+  /** Live: edited files, steps and commands. */
+  work: string
+  /** Live: the latest model text, first line. */
+  think: string
+  /** Ended: the handoff's `backend:`. */
+  handoffBackend: string
+  /** Ended: tokens from the handoff's `ds:` line. */
+  tokens: JobTokens | null
+  /** Ended: cost in USD from the handoff's `ds:` line (0 = free). */
+  cost: number | null
+  /** Ended: wall seconds from `ds:`. */
+  wall: number | null
+  filesChanged: number
+  notVerified: string
+  /** The agy conversation db the live rows came from, '' when none. */
+  db: string
+}
+
+export type IssuedKind = 'job' | 'agy' | 'consult'
+
+/** A Bash call that started a job runner or a consult, and what it was bound to. */
+export type Issued = {
+  callId: string
+  /** The agent whose Bash call it was; '' when main's. */
+  agentId: string
+  kind: IssuedKind
+  /** `--job` (job and agy). */
+  name: string
+  /** `--repo` (agy). */
+  repo: string
+  /** `--model` (agy). */
+  model: string
+  /** `--effort` (agy). */
+  effort: string
+  /** `--handoff` path (agy). */
+  handoff: string
+  /** When the call started, ms. */
+  at: number
+  /** The mesh task it serves: a sub-main's `task:` line, or main's `doing` item at issue time. */
+  task: string
+  /** The job id the result's `jobid:` line named. */
+  jobid: string
+  /** The consult run a run file started after the call was bound to. */
+  runId: string
+  /** When the call returned, ms; null while it runs. */
+  endedAt: number | null
+  /** The call failed, when the engine says. */
+  ok: boolean | null
+  /** The worker the result or handoff named (`backend:`). */
+  worker: string
+  /** Live agy rows. */
+  now: string
+  work: string
+  /** A `~/.claude/state/agy-verify-pending/<job>.json` file exists. */
+  verifyPending: boolean
+}
+
+/** A mesh task item, as the work panel's strip and issue-time attribution read it. */
+export type MeshTask = { id: string; status: string; subject?: string }
+
 declare module 'claude-code' {
   interface PluginState {
     'flightdeck': {
@@ -189,6 +291,8 @@ declare module 'claude-code' {
       consult: ConsultState | null
       gate: Gate
       agents: AgentCard[]
+      jobs: Job[]
+      issued: Issued[]
       loops: Loop[]
       log: LogLine[]
       turn: Turn

@@ -14,10 +14,15 @@ import type {
   Feed,
   Gate,
   GemLimit,
+  Issued,
+  IssuedKind,
+  Job,
+  JobTokens,
   Layout,
   LogLine,
   Loop,
   Main,
+  MeshTask,
   Moment,
   Receipt,
   Roster,
@@ -83,6 +88,8 @@ export const normalizeCard = (stored: unknown): AgentCard =>
       status: 'running',
       spawnedAt: 0,
       endedAt: null,
+      parentId: '',
+      task: '',
       ctx: 0,
       out: 0,
       steps: 0,
@@ -129,6 +136,8 @@ export type Config = {
   ctxBudget: number
   /** Directory holding external consult run files; '' = ~/.claude/state/consult-runs. */
   consultDir: string
+  /** Directory holding one folder per farmer job; '' = ~/.claude/state/ds-jobs. */
+  jobsDir: string
 }
 
 const safeRegExp = (source: string, fallback: string) => {
@@ -180,6 +189,7 @@ export const parseConfig = (o: Readonly<Record<string, unknown>>): Config => {
     feedCommand: parseFeedCommand(o.feedCommand),
     ctxBudget: typeof o.ctxBudget === 'number' && Number.isFinite(o.ctxBudget) && o.ctxBudget > 0 ? Math.round(o.ctxBudget) : 0,
     consultDir: typeof o.consultDir === 'string' ? o.consultDir.trim() : '',
+    jobsDir: typeof o.jobsDir === 'string' ? o.jobsDir.trim() : '',
   }
 }
 
@@ -270,6 +280,48 @@ export const shortWorker = (backend: string): string => {
   return shorten(id.replace(/[:-]free$/, ''), 12)
 }
 
+const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1)
+
+const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/
+
+/**
+ * A worker as a job line says it, naming the effort too: `agy:gemini-4-hydrogen-xhigh` →
+ * `Hydrogen xhigh`, `agy:claude-sonnet-5-5-high` → `agy Sonnet high`, `azure:gpt-6.1-sol` → `sol`.
+ * Anything else is `shortWorker`'s name.
+ */
+export const workerDisplay = (backend: string): string => {
+  const b = backend.trim()
+  if (!b) return ''
+  const i = b.indexOf(':')
+  const prov = i >= 0 ? b.slice(0, i).toLowerCase() : ''
+  const model = i >= 0 ? b.slice(i + 1) : b
+  const id = (model.split('/').pop() ?? model).toLowerCase()
+  const effort = EFFORT_SUFFIX.exec(id)?.[1] ?? ''
+  if (prov === 'agy') {
+    const gem = /^gemini-[\d.]+-([a-z]+)(?:-(?:low|medium|high|xhigh|max))?$/.exec(id)
+    if (gem?.[1] && !/^(pro|flash|lite|low|medium|high|xhigh|max)$/.test(gem[1])) return `${cap(gem[1])}${effort ? ` ${effort}` : ''}`
+    const fam = /^claude-([a-z]+)-/.exec(id)?.[1]
+    if (fam) return `agy ${cap(fam)}${effort ? ` ${effort}` : ''}`
+    const num = /^gemini-(\d+(?:\.\d+)?)/.exec(id)?.[1]
+    if (num) return `agy Gemini ${num}${effort ? ` ${effort}` : ''}`
+  }
+  if (prov === 'azure') {
+    const code = /-([a-z]+)$/.exec(id)?.[1]
+    if (code && !/^(low|medium|high|xhigh|max|free)$/.test(code)) return code
+  }
+  return shortWorker(b)
+}
+
+/** An agy-job leaf's worker: the ended handoff's `backend:` first, else its model (with `--effort`), else `agy`. */
+export const agyWorker = (backend: string, model: string, effort = ''): string => {
+  if (backend.trim()) return workerDisplay(backend)
+  const m = model.trim().toLowerCase()
+  if (!m) return 'agy'
+  const fam = /^(opus|sonnet|haiku|fable|gemini|gpt)$/.exec(m)
+  if (fam?.[1]) return `agy ${cap(fam[1])}${effort.trim() ? ` ${effort.trim()}` : ''}`
+  return workerDisplay(`agy:${m}`)
+}
+
 /** The last `key: value` of `key` in a job runner's printed block, '' when none. */
 const lastField = (text: string, key: string) => {
   let found = ''
@@ -304,6 +356,35 @@ export const parseJobCost = (text: unknown): number | null => {
   return found
 }
 
+/** A handoff `ds:` line's `tokens=in=<n> cache=<n> out=<n> think=<n>`, or null when it names none. */
+export const parseHandoffTokens = (text: unknown): JobTokens | null => {
+  const t = typeof text === 'string' ? text : ''
+  const m = /tokens=in=(\d+)\s+cache=(\d+)\s+out=(\d+)\s+think=(\d+)/.exec(t)
+  if (!m) return null
+  return { in: Number(m[1]), cache: Number(m[2]), out: Number(m[3]), think: Number(m[4]) }
+}
+
+/** A handoff `ds:` line's `wall=246s`, in seconds, or null. */
+export const parseJobWall = (text: unknown): number | null => {
+  const t = typeof text === 'string' ? text : ''
+  const m = /\bwall=(\d+(?:\.\d+)?)\s*s?\b/.exec(t)
+  return m?.[1] !== undefined && Number.isFinite(Number(m[1])) ? Number(m[1]) : null
+}
+
+/** The first count in a handoff's `files_changed:` value (`4`, `4 files`), or 0. */
+export const parseFilesChanged = (text: unknown): number => {
+  const t = typeof text === 'string' ? text : ''
+  const m = /\d+/.exec(t)
+  return m ? Number(m[0]) : 0
+}
+
+/** The `jobid:` a job runner printed, '' when none. */
+export const parseJobId = (text: unknown): string => {
+  const t = typeof text === 'string' ? text : ''
+  const id = lastField(t, 'jobid')
+  return /^[\w.-]{1,160}$/.test(id) ? id : ''
+}
+
 /** A card after one of its tool calls printed job runner output: the newest worker, job dir and cost win. */
 export const noteJob = (c: AgentCard, text: unknown): AgentCard => {
   const j = parseJobText(text)
@@ -324,18 +405,110 @@ export const jobsCost = (cards: AgentCard[], since: number): number | null => {
   return known.length === 0 ? null : known.reduce((s, c) => s + (c.workerCost ?? 0), 0)
 }
 
+/** An agy-job leaf stays on the agents panel this long after its Bash call returns. */
+export const AGY_SHOW_MS = 10 * 60_000
+
+/** A farmer job or agy-job call, as the interim agents lines draw it. */
+export type JobLeaf = {
+  id: string
+  name: string
+  /** The worker's display name (`Hydrogen xhigh`, `agy Sonnet high`), '' when unknown. */
+  worker: string
+  glyph: string
+  /** `now · work`, for a running leaf only. */
+  detail: string
+  startedAt: number
+  endedAt: number | null
+  isLive: boolean
+  /** An agy-job runs on the real repo: no scrubbed copy, so the line is marked ◇. */
+  isRealRepo: boolean
+  verifyPending: boolean
+  status: string
+  cost: number | null
+}
+
+/** The leaves the agents panel lists until the `work` tree lands: every probed job and every agy-job call, running first, newest first. */
+export const jobLeaves = (jobs: readonly Job[], issued: readonly Issued[], now: number): JobLeaf[] => {
+  const out: JobLeaf[] = []
+  for (const j of jobs) {
+    if (!showJob(j, now)) continue
+    const live = isJobLive(j)
+    const worker = live ? j.trying || j.backend : j.handoffBackend || j.backend || j.trying
+    out.push({
+      id: `job:${j.jobid}`,
+      name: j.job || j.jobid,
+      worker: workerDisplay(worker),
+      glyph: jobGlyph(j),
+      detail: live && j.status === 'running' ? [j.now, j.work].filter(Boolean).join(' · ') : '',
+      startedAt: j.ts * 1000,
+      endedAt: live ? null : j.endedAt,
+      isLive: live,
+      isRealRepo: false,
+      verifyPending: false,
+      status: j.status,
+      cost: j.cost,
+    })
+  }
+  for (const i of issued) {
+    if (i.kind !== 'agy') continue
+    if (i.endedAt !== null && now - i.endedAt > AGY_SHOW_MS) continue
+    const live = i.endedAt === null
+    out.push({
+      id: `agy:${i.callId}`,
+      name: i.name || 'agy job',
+      worker: agyWorker(i.worker, i.model, i.effort),
+      glyph: live ? '◐' : i.ok === false ? '✗' : '●',
+      detail: live ? [i.now, i.work].filter(Boolean).join(' · ') : '',
+      startedAt: i.at,
+      endedAt: i.endedAt,
+      isLive: live,
+      isRealRepo: true,
+      verifyPending: i.verifyPending,
+      status: live ? 'running' : i.ok === false ? 'failed' : 'done',
+      cost: live ? null : 0,
+    })
+  }
+  return out.sort((a, b) => Number(b.isLive) - Number(a.isLive) || (b.endedAt ?? now) - (a.endedAt ?? now) || b.startedAt - a.startedAt)
+}
+
 /**
  * The argv that prints a job's worker: a finished job's `backend` from its `state.json` (the model whose
  * work was kept), else the `trying` file (the attempt now running), else `backend`. Prints nothing when none says.
  */
-export const workerProbe = (python: string, jobdir: string): string[] => [
-  python,
+export const workerProbe = (python: string | readonly string[], jobdir: string): string[] => [
+  ...(typeof python === 'string' ? [python] : python),
   '-c',
-  'import json,os,sys\nd=sys.argv[1]\ntry:\n s=json.load(open(os.path.join(d,"state.json")))\nexcept Exception:\n s={}\n'
+  'import json,os,sys\nd=sys.argv[1]\ntry:\n s=json.load(open(os.path.join(d,"state.json"),"r",encoding="utf-8",errors="replace"))\nexcept Exception:\n s={}\n'
     + 'if s.get("backend") and s.get("status") not in ("running","parked",None):\n print(s["backend"])\nelse:\n'
-    + ' try:\n  print(open(os.path.join(d,"trying")).read().strip())\n except Exception:\n  print(s.get("backend") or "")',
+    + ' try:\n  print(open(os.path.join(d,"trying"),"r",encoding="utf-8",errors="replace").read().strip())\n except Exception:\n  print(s.get("backend") or "")',
   jobdir,
 ]
+
+/** The Python commands a probe tries, in order, until one runs; `py -3` is the Windows launcher. */
+export const PYTHON_CANDIDATES: readonly (readonly string[])[] = [['python3'], ['python'], ['py', '-3']]
+
+/**
+ * A pid liveness test that is right on both systems: `os.kill(pid, 0)` is not a liveness test on Windows,
+ * where `OpenProcess` + `GetExitCodeProcess` (259 = still active) is. The caller supplies `os`.
+ */
+export const PID_ALIVE_PY = String.raw`def alive(pid):
+ try:
+  if os.name == "nt":
+   import ctypes
+   k = ctypes.windll.kernel32
+   h = k.OpenProcess(0x1000, False, int(pid))
+   if not h:
+    return False
+   code = ctypes.c_ulong()
+   ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+   k.CloseHandle(h)
+   return bool(ok) and code.value == 259
+  os.kill(int(pid), 0)
+  return True
+ except PermissionError:
+  return True
+ except Exception:
+  return False`
 
 export const kTokens = (n: number) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
@@ -673,15 +846,124 @@ export const consultTimeline = (a: Architect, now: number, width: number) => {
   return cells.join('')
 }
 
-export const receiptOf = (t: Turn, o: { durationMs: number; agentsSince: number; costNow: number | null; reason: string }): Receipt => ({
+export const receiptOf = (t: Turn, o: { durationMs: number; agentsSince: number; jobsSince?: number; panelsSince?: number; costNow: number | null; reason: string }): Receipt => ({
   durationMs: o.durationMs,
   agents: o.agentsSince,
+  jobs: o.jobsSince ?? 0,
+  panels: o.panelsSince ?? 0,
   edits: t.edits,
   errors: t.errors,
   costDelta: o.costNow !== null && t.costAtStart !== null && o.costNow - t.costAtStart >= 0.005 ? o.costNow - t.costAtStart : null,
   reason: o.reason,
   since: t.startedAt,
 })
+
+/** A receipt's summary line: jobs and panels only when there were any; edits and errors always. */
+export const receiptSummary = (r: Receipt): string =>
+  [
+    `last turn ${fmtDuration(r.durationMs)}`,
+    plural(r.agents, 'agent'),
+    (r.jobs ?? 0) > 0 ? plural(r.jobs, 'job') : '',
+    (r.panels ?? 0) > 0 ? plural(r.panels, 'panel') : '',
+    plural(r.edits, 'edit'),
+    plural(r.errors, 'error'),
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
+export type ReceiptJobParts = {
+  glyph: string
+  name: string
+  worker: string
+  duration: string
+  tokens: string
+  cost: string
+  isLive: boolean
+  startedAt: number
+}
+
+/** One turn job's row pieces: a running one keeps its clock (`isLive`) and no tokens. */
+export const receiptJobParts = (j: TurnJob, now: number): ReceiptJobParts => ({
+  glyph: j.glyph,
+  name: j.name,
+  worker: j.worker,
+  duration: fmtDuration((j.endedAt ?? now) - j.startedAt),
+  tokens: j.tokens && j.tokens.in + j.tokens.out + j.tokens.think > 0 ? `${kTokens(j.tokens.in)}→${kTokens(j.tokens.out + j.tokens.think)}` : '',
+  cost: j.cost === null ? '' : j.cost === 0 ? 'free' : fmtWorkerCost(j.cost),
+  isLive: j.isLive,
+  startedAt: j.startedAt,
+})
+
+/** A receipt row for one job: glyph, name, worker, duration, tokens, cost; a running job keeps its clock and no tokens. */
+export const receiptJobRow = (j: TurnJob, now: number): string => {
+  const p = receiptJobParts(j, now)
+  return [`${p.glyph} ${p.name}`, p.worker ? `▸ ${p.worker}` : '', p.duration, p.tokens, p.cost].filter(Boolean).join('  ')
+}
+
+/** A receipt row for one consult panel run: the engines that answered, failed, and how long it took. */
+export const receiptPanelRow = (run: ConsultRun, now: number): string => {
+  const total = run.engines.length
+  const answered = run.engines.filter(e => e.state === 'ok').length
+  const failed = run.engines.filter(e => e.state === 'failed').length
+  return `◎ panel ${consultKindLabel(run.kind)} R${run.round}  ${answered}/${total} answered · ${failed} failed · ${fmtDuration((run.endedAt ?? now) - run.startedAt)}`
+}
+
+/** A job the turn started, from either a job dir (`ts`) or an agy-job call (`at`). */
+export type TurnJob = {
+  id: string
+  name: string
+  worker: string
+  glyph: string
+  status: string
+  startedAt: number
+  endedAt: number | null
+  isLive: boolean
+  tokens: JobTokens | null
+  cost: number | null
+}
+
+/** The jobs whose start falls inside a turn window (`since` .. `end`, ms), oldest first. */
+export const turnJobs = (jobs: readonly Job[], issued: readonly Issued[], since: number, end: number): TurnJob[] => {
+  const out: TurnJob[] = []
+  for (const j of jobs) {
+    const startedAt = j.ts * 1000
+    if (startedAt < since || startedAt > end) continue
+    const live = isJobLive(j)
+    out.push({
+      id: `job:${j.jobid}`,
+      name: j.job || j.jobid,
+      worker: workerDisplay(live ? j.trying || j.backend : j.handoffBackend || j.backend || j.trying),
+      glyph: jobGlyph(j),
+      status: j.status,
+      startedAt,
+      endedAt: live ? null : j.endedAt,
+      isLive: live,
+      tokens: j.tokens,
+      cost: j.cost,
+    })
+  }
+  for (const i of issued) {
+    if (i.kind !== 'agy' || i.at < since || i.at > end) continue
+    const live = i.endedAt === null
+    out.push({
+      id: `agy:${i.callId}`,
+      name: i.name || 'agy job',
+      worker: agyWorker(i.worker, i.model, i.effort),
+      glyph: live ? '◐' : i.ok === false ? '✗' : '●',
+      status: live ? 'running' : i.ok === false ? 'failed' : 'done',
+      startedAt: i.at,
+      endedAt: i.endedAt,
+      isLive: live,
+      tokens: null,
+      cost: 0,
+    })
+  }
+  return out.sort((a, b) => a.startedAt - b.startedAt)
+}
+
+/** The consult runs started inside a turn window (the probe holds the newest run only). */
+export const turnConsults = (run: ConsultRun | null, since: number, end: number): ConsultRun[] =>
+  run && run.startedAt >= since && run.startedAt <= end ? [run] : []
 
 // ---------------------------------------------------------------- agents and loops
 
@@ -853,16 +1135,908 @@ export const elapsedOf = (c: AgentCard, now: number) => (c.endedAt ?? now) - c.s
 
 export const CONSULT_HIDE_AFTER_MS = 10 * 60_000
 
+const CONSULT_PY = String.raw`import json, os, sys
+
+HOME = os.path.expanduser("~")
+
+` + PID_ALIVE_PY + String.raw`
+
+d = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else os.path.join(HOME, ".claude", "state", "consult-runs")
+lp = os.path.join(HOME, ".claude", "state", "consult-locks.json")
+run = None
+try:
+ files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json") and not f.startswith(".")]
+ files = [f for f in files if os.path.isfile(f)]
+ if files:
+  files.sort(key=lambda p: (os.stat(p).st_mtime_ns, os.path.basename(p)), reverse=True)
+  with open(files[0], "r", encoding="utf-8", errors="replace") as fh:
+   data = json.load(fh)
+  if isinstance(data, dict):
+   run = data
+except Exception:
+ run = None
+if isinstance(run, dict) and run.get("endedAt") is None:
+ pid = run.get("pid")
+ if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+  if not alive(pid):
+   run["stale"] = True
+ else:
+  run["stale"] = True
+locks = {}
+try:
+ with open(lp, "r", encoding="utf-8", errors="replace") as fh:
+  ld = json.load(fh)
+ if isinstance(ld, dict):
+  locks = ld
+except Exception:
+ locks = {}
+print(json.dumps({"run": run, "locks": locks}))`
+
 /**
  * The argv that prints `{ run, locks }` from `dir` (or `~/.claude/state/consult-runs` when empty) and
- * `~/.claude/state/consult-locks.json`. Marks `run.stale = true` when `endedAt` is null and `os.kill(pid, 0)` fails.
+ * `~/.claude/state/consult-locks.json`. Marks `run.stale = true` when `endedAt` is null and the pid is gone.
  */
-export const consultProbe = (python: string, dir: string): string[] => [
-  python,
+export const consultProbe = (python: string | readonly string[], dir: string): string[] => [
+  ...(typeof python === 'string' ? [python] : python),
   '-c',
-  'import json,os,sys\nhome=os.path.expanduser("~")\nd=os.path.expanduser(sys.argv[1]) if len(sys.argv)>1 and sys.argv[1] else os.path.join(home,".claude","state","consult-runs")\nlp=os.path.join(home,".claude","state","consult-locks.json")\nrun=None\ntry:\n files=[os.path.join(d,f) for f in os.listdir(d) if f.endswith(".json") and not f.startswith(".")]\n files=[f for f in files if os.path.isfile(f)]\n if files:\n  files.sort(key=lambda p:(os.stat(p).st_mtime_ns,os.path.basename(p)),reverse=True)\n  with open(files[0],"r",encoding="utf-8") as fh:\n   data=json.load(fh)\n  if isinstance(data,dict): run=data\nexcept Exception:\n run=None\nif isinstance(run,dict) and run.get("endedAt") is None:\n pid=run.get("pid")\n if isinstance(pid,int) and not isinstance(pid,bool) and pid>0:\n  try:\n   os.kill(pid,0)\n  except PermissionError:\n   pass\n  except OSError:\n   run["stale"]=True\n else:\n  run["stale"]=True\nlocks={}\ntry:\n with open(lp,"r",encoding="utf-8") as fh:\n  ld=json.load(fh)\n if isinstance(ld,dict): locks=ld\nexcept Exception:\n locks={}\nprint(json.dumps({"run":run,"locks":locks}))',
+  CONSULT_PY,
   dir,
 ]
+
+// ---------------------------------------------------------------- farmer jobs
+
+/** Job statuses that are still live-ish (`need_tool` waits on a person). */
+export const LIVE_JOB_STATUSES: readonly string[] = ['running', 'parked', 'need_tool']
+
+/** A job's status is live-ish and its pid, when one was recorded, still runs. */
+export const isJobLive = (j: Pick<Job, 'status' | 'stale'>) => LIVE_JOB_STATUSES.includes(j.status) && !j.stale
+
+/** A job whose `state.json` is older than this is no longer listed. */
+export const JOB_CUTOFF_MS = 30 * 60_000
+
+/** The pane shows at most this many jobs. */
+export const JOB_LIMIT = 8
+
+/** A job the pane lists: one with a live-ish status (the probe drops one whose runner is gone and whose state is older than 30 minutes; a newer one stays, marked stale), or one ended within the last 30 minutes. */
+export const showJob = (j: Pick<Job, 'status' | 'endedAt'>, now: number) =>
+  LIVE_JOB_STATUSES.includes(j.status) || (j.endedAt !== null && now - j.endedAt <= JOB_CUTOFF_MS)
+
+/** The jobs the pane lists, newest first: open ones by their start, ended ones by their end; at most 8. */
+export const orderJobs = (jobs: readonly Job[], now: number): Job[] =>
+  jobs
+    .filter(j => showJob(j, now))
+    .sort((a, b) => {
+      const openA = LIVE_JOB_STATUSES.includes(a.status)
+      const openB = LIVE_JOB_STATUSES.includes(b.status)
+      return Number(openB) - Number(openA) || (openA ? b.ts - a.ts : (b.endedAt ?? 0) - (a.endedAt ?? 0))
+    })
+    .slice(0, JOB_LIMIT)
+
+const STAGE_OF_PHASE: Record<string, string> = {
+  copy: 'copy',
+  copied: 'copy',
+  snapshot: 'copy',
+  toolbox: 'toolbox',
+  tools: 'toolbox',
+  model: 'model',
+  models: 'model',
+  run: 'model',
+  running: 'model',
+  generate: 'model',
+  apply: 'apply',
+  applying: 'apply',
+  patch: 'apply',
+  check: 'check',
+  checking: 'check',
+  verify: 'check',
+  test: 'check',
+  handoff: 'handoff',
+  report: 'handoff',
+  done: 'handoff',
+}
+
+export type JobStage = { stage: string; attempts: number }
+
+/**
+ * A job's stage from the `job.log` lines that name one and `state.json`'s `phase`: copy (`copied N
+ * files`), toolbox (`toolbox:`), model (a `trying` file, until a result line), then apply, check and
+ * handoff as their lines or `handoff.txt` appear. `attempts` counts the distinct backends tried.
+ */
+export const jobStage = (lines: readonly string[], phase: string, hasTrying: boolean, hasHandoff: boolean): JobStage => {
+  let stage = ''
+  let hasResult = false
+  const seen = new Set<string>()
+  for (const line of lines) {
+    const low = line.trim().toLowerCase()
+    if (/copied\s+\d+\s+files?/.test(low)) stage = 'copy'
+    if (/(?:^|[\s|])toolbox:/.test(low)) stage = 'toolbox'
+    const tried = /(?:^|[\s|])trying\s*[:=]\s*(\S+)/.exec(low)
+    if (tried?.[1]) seen.add(tried[1])
+    if (/(?:^|[\s|])result\s*:/.test(low)) hasResult = true
+    if (/^apply(?:\b|:)/.test(low) || /[|\s]apply:/.test(low)) stage = 'apply'
+    if (/^check(?:\b|:)/.test(low) || /[|\s](?:check|verify):/.test(low)) stage = 'check'
+    if (/^handoff(?:\b|:)/.test(low) || /[|\s]handoff:/.test(low)) stage = 'handoff'
+  }
+  const fromPhase = STAGE_OF_PHASE[phase.trim().toLowerCase()] ?? ''
+  if (fromPhase) stage = fromPhase
+  if (hasTrying && !hasResult && (stage === '' || stage === 'copy' || stage === 'toolbox')) stage = 'model'
+  if (hasHandoff) stage = 'handoff'
+  return { stage, attempts: Math.max(1, seen.size) }
+}
+
+/** The two spellings a work tree takes in an agy blob: `/` separators, and JSON-escaped `\\`. */
+export const pathNeedles = (tree: string): string[] => {
+  const p = tree.replace(/\\/g, '/')
+  return [p, p.replace(/\//g, '\\\\')]
+}
+
+/** Whether a step blob mentions a tree path, in either separator; case-insensitive on Windows. */
+export const mentionsTree = (text: string, tree: string, isWindows = false): boolean => {
+  const hay = isWindows ? text.toLowerCase() : text
+  return pathNeedles(tree).some(n => hay.includes(isWindows ? n.toLowerCase() : n))
+}
+
+export type AgyDbCandidate = { path: string; mtime: number; matched: boolean }
+
+/** The newest db among the candidates that mentions the tree (and changed at or after `since`), '' when none. */
+export const pickAgyDb = (dbs: readonly AgyDbCandidate[], since = 0): string => {
+  let best = ''
+  let bestMtime = -Infinity
+  for (const d of dbs) {
+    if (!d.matched || !d.path || d.mtime < since) continue
+    if (d.mtime >= bestMtime) {
+      best = d.path
+      bestMtime = d.mtime
+    }
+  }
+  return best
+}
+
+/** A job's mark: ◐ running, ● done, ◑ partial, ✗ failed/refused, ○ dry, ⊘ stale. */
+export const jobGlyph = (j: Pick<Job, 'status' | 'stale'>) =>
+  j.stale ? '⊘' : j.status === 'running' || j.status === 'parked' || j.status === 'need_tool' ? '◐' : j.status === 'done' ? '●' : j.status === 'partial' ? '◑' : j.status === 'dry' ? '○' : '✗'
+
+/**
+ * The Python every job read shares: utf-8 text with a byte cap, handoff `key: value` lines, printable
+ * runs of a blob, the agy `steps` table, and the conversation db whose rows mention a tree path.
+ */
+const JOB_READERS_PY = String.raw`def read_text(path, limit=0):
+ try:
+  with open(path, "r", encoding="utf-8", errors="replace") as fh:
+   if limit > 0:
+    try:
+     fh.seek(0, os.SEEK_END)
+     size = fh.tell()
+     fh.seek(max(0, size - limit))
+    except Exception:
+     pass
+   return fh.read()
+ except Exception:
+  return ""
+
+def handoff_of(text):
+ out = {}
+ for line in text.splitlines():
+  m = re.match(r"^\s*([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+  if m:
+   out[m.group(1).lower()] = m.group(2).strip()
+ return out
+
+def printable(blob):
+ try:
+  s = blob.decode("latin-1") if isinstance(blob, (bytes, bytearray)) else str(blob)
+ except Exception:
+  return []
+ return re.findall(r"[\x20-\x7e]{3,}", s)
+
+def safe_runs(blob, typ):
+ # Only what the row needs: the tool id and name, a path, a command, and a model text line.
+ # Prompts and file contents stay in the store.
+ s = blob.decode("latin-1")
+ runs = printable(blob)
+ out = []
+ for i in range(len(runs) - 1):
+  if re.fullmatch(r"call_\d+", runs[i]):
+   out.append(runs[i][:40])
+   out.append(runs[i + 1][:80])
+   break
+ for key in ("Path", "CommandLine", "Command", "command", "Cmd", "model", "model_id", "modelId"):
+  m = re.search(r'"' + key + r'"\s*:\s*"((?:[^"\\]|\\.)*)"', s)
+  if m:
+   out.append('"' + key + '":"' + m.group(1)[:400] + '"')
+ if typ == 15 and runs:
+  out.append(runs[0][:200])
+ return out
+
+def agy_steps(path):
+ try:
+  con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=0.05)
+ except Exception:
+  return 0, []
+ try:
+  cur = con.cursor()
+  cur.execute("select * from steps order by idx")
+  names = [d[0] for d in cur.description]
+  rows = []
+  for row in cur.fetchall():
+   rec = dict(zip(names, row))
+   try:
+    typ = int(rec.get("step_type"))
+   except Exception:
+    continue
+   parts = []
+   for key in ("metadata", "step_payload"):
+    v = rec.get(key)
+    if isinstance(v, (bytes, bytearray)):
+     parts.append(bytes(v))
+    elif isinstance(v, str):
+     parts.append(v.encode("utf-8", "replace"))
+   rows.append({"type": typ, "runs": safe_runs(b"\x00".join(parts), typ)})
+  return len(rows), rows[-600:]
+ except Exception:
+  return 0, []
+ finally:
+  try:
+   con.close()
+  except Exception:
+   pass
+
+def db_mtime(path):
+ try:
+  mt = os.stat(path).st_mtime
+ except Exception:
+  mt = 0.0
+ try:
+  mt = max(mt, os.stat(path + "-wal").st_mtime)
+ except Exception:
+  pass
+ return mt
+
+def path_needles(path):
+ p = path.replace("\\", "/")
+ return [p, p.replace("/", "\\\\")]
+
+def mentions(rows, needles):
+ low = os.name == "nt"
+ for row in rows:
+  for run in row.get("runs", []):
+   hay = run.lower() if low else run
+   for n in needles:
+    if (n.lower() if low else n) in hay:
+     return True
+ return False
+
+def db_candidates(tree, since, key):
+ c = cache.get(key)
+ if isinstance(c, str) and c and os.path.isfile(c):
+  return [{"path": c, "mtime": db_mtime(c), "matched": True}]
+ base = os.path.join(HOME, ".gemini", "antigravity-cli", "conversations")
+ try:
+  names = [n for n in os.listdir(base) if n.endswith(".db")]
+ except Exception:
+  return []
+ needles = path_needles(tree) if tree else []
+ out = []
+ for n in names:
+  p = os.path.join(base, n)
+  mt = db_mtime(p)
+  if mt < since:
+   continue
+  if needles and not mentions(agy_steps(p)[1], needles):
+   continue
+  out.append({"path": p, "mtime": mt, "matched": True})
+ return out
+
+def pick_db(cands):
+ best = ""
+ best_mt = -1.0
+ for c in cands:
+  if not c.get("matched"):
+   continue
+  if c.get("mtime", 0) >= best_mt:
+   best = c.get("path", "")
+   best_mt = c.get("mtime", 0)
+ return best
+
+def stage_lines(log):
+ out = []
+ for line in log.splitlines()[-4000:]:
+  s = line.strip()
+  low = s.lower()
+  if re.search(r"copied\s+\d+\s+files?|toolbox:|trying\s*[:=]|^apply|apply:|^check|check:|verify:|^handoff|handoff:|^result|result:", low):
+   out.append(s[:200])
+  if len(out) >= 80:
+   break
+ return out
+
+def tree_of(jobdir, jobid, state, log):
+ t = state.get("tree") if isinstance(state, dict) else None
+ if isinstance(t, str) and t.strip():
+  return t.strip()
+ j = re.escape(jobid)
+ m = re.search(r'([A-Za-z]:[\\/][^\s"\']*?[/\\]dsbench[/\\]jobs[/\\]' + j + r'[/\\]tree)', log, re.I)
+ if m:
+  return m.group(1)
+ m = re.search(r'(/[^\s"\']*?/dsbench/jobs/' + j + r'/tree)', log)
+ if m:
+  return m.group(1)
+ return os.path.join(tempfile.gettempdir(), "dsbench", "jobs", jobid, "tree")
+
+def newest_file(tree, base, job):
+ try:
+  start = os.stat(base).st_mtime
+ except Exception:
+  try:
+   start = float(job.get("ts") or 0)
+  except Exception:
+   start = 0.0
+ newest = ""
+ nm = 0.0
+ count = 0
+ seen = 0
+ for dp, dns, fns in os.walk(tree):
+  dns[:] = [x for x in dns if x not in (".git", "node_modules", ".hg", ".svn", "dist", "build", "target", "__pycache__")]
+  for f in fns:
+   seen += 1
+   if seen > 4000:
+    break
+   p = os.path.join(dp, f)
+   try:
+    m = os.stat(p).st_mtime
+   except Exception:
+    continue
+   if m > start + 0.001:
+    count += 1
+    if m > nm:
+     nm = m
+     newest = p
+  if seen > 4000:
+   break
+ rel = ""
+ if newest:
+  try:
+   rel = os.path.relpath(newest, tree)
+  except Exception:
+   rel = newest
+  rel = rel.replace("\\", "/")
+  if rel.startswith("./"):
+   rel = rel[2:]
+ return rel, count
+`
+
+export const JOBS_PY = String.raw`import json, os, re, sqlite3, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+root = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else os.path.join(HOME, ".claude", "state", "ds-jobs")
+cache = {}
+try:
+ loaded = json.loads(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else {}
+ if isinstance(loaded, dict):
+  cache = loaded
+except Exception:
+ cache = {}
+now = time.time()
+LIVE = ("running", "parked", "need_tool")
+CUTOFF = 30 * 60
+
+` + PID_ALIVE_PY + String.raw`
+
+` + JOB_READERS_PY + String.raw`
+
+def main():
+ out = []
+ try:
+  names = sorted(os.listdir(root))
+ except Exception:
+  names = []
+ for jobid in names:
+  d = os.path.join(root, jobid)
+  sp = os.path.join(d, "state.json")
+  if not os.path.isfile(sp):
+   continue
+  try:
+   mt = os.stat(sp).st_mtime
+  except Exception:
+   continue
+  state = {}
+  try:
+   with open(sp, "r", encoding="utf-8", errors="replace") as fh:
+    data = json.load(fh)
+   if isinstance(data, dict):
+    state = data
+  except Exception:
+   state = {}
+  status = str(state.get("status") or "")
+  live = status in LIVE
+  if not live and now - mt > CUTOFF:
+   continue
+  pid = state.get("pid")
+  pid = pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else 0
+  ts = state.get("ts")
+  ts = float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0.0
+  rc = state.get("rc")
+  rc = rc if isinstance(rc, int) and not isinstance(rc, bool) else None
+  trying = read_text(os.path.join(d, "trying")).strip()
+  handoff = read_text(os.path.join(d, "handoff.txt"), 65536)
+  fields = handoff_of(handoff)
+  log = read_text(os.path.join(d, "job.log"), 65536)
+  tree = tree_of(d, jobid, state, log)
+  job = {"jobid": jobid, "job": str(state.get("job") or jobid), "status": status, "ts": ts, "pid": pid or None, "backend": str(state.get("backend") or ""), "tier": str(state.get("tier") or ""), "profile": str(state.get("profile") or ""), "phase": str(state.get("phase") or ""), "rc": rc, "dir": d, "tree": tree, "live": live, "stale": False, "endedAt": None if live else int(mt * 1000), "mtime": int(mt * 1000), "trying": trying, "stageLines": stage_lines(log), "hasTrying": bool(trying), "hasHandoff": bool(handoff.strip()), "handoff": {"backend": fields.get("backend", ""), "files_changed": fields.get("files_changed", ""), "ds": fields.get("ds", ""), "not_verified": fields.get("not_verified", "")}}
+  job["stale"] = bool(live and status == "running" and not (pid and alive(pid)))
+  if live and (job["stale"] or not (pid and alive(pid))) and time.time() - mt > 1800:
+   continue
+  if live and not job["stale"]:
+   if trying.startswith("agy:"):
+    cands = db_candidates(tree, 0, jobid)
+    job["dbs"] = cands
+    dbp = pick_db(cands)
+    if dbp:
+     total, rows = agy_steps(dbp)
+     job["db"] = dbp
+     job["steps"] = rows
+     job["stepsTotal"] = total
+   else:
+    rel, count = newest_file(tree, os.path.join(d, "base"), job)
+    job["now"] = rel
+    job["work"] = ("%d file%s" % (count, "" if count == 1 else "s")) if count else ""
+  out.append(job)
+ out.sort(key=lambda j: (0 if j["live"] and not j["stale"] else 1, -(j["ts"] if j["live"] else (j["endedAt"] or 0))))
+ print(json.dumps(out[:8]))
+
+try:
+ main()
+except Exception:
+ pass`
+
+/**
+ * The argv that prints the job dirs under `root` (or `~/.claude/state/ds-jobs`) as one JSON array, newest
+ * first, at most 8: live jobs, and ended ones whose `state.json` changed in the last 30 minutes. A live job
+ * whose pid is gone is `stale`. `cache` maps a jobid to the agy conversation db already matched to it.
+ */
+export const jobsProbe = (python: string | readonly string[], root: string, cache: Record<string, string> = {}): string[] => [
+  ...(typeof python === 'string' ? [python] : python),
+  '-c',
+  JOBS_PY,
+  root,
+  JSON.stringify(cache),
+]
+
+export const AGY_PY = String.raw`import json, os, re, sqlite3, sys, time
+
+HOME = os.path.expanduser("~")
+try:
+ calls = json.loads(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else []
+except Exception:
+ calls = []
+cache = {}
+try:
+ loaded = json.loads(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else {}
+ if isinstance(loaded, dict):
+  cache = loaded
+except Exception:
+ cache = {}
+
+` + JOB_READERS_PY + String.raw`
+
+def main():
+ out = []
+ for c in calls if isinstance(calls, list) else []:
+  if not isinstance(c, dict):
+   continue
+  cid = str(c.get("callId") or "")
+  name = str(c.get("name") or "")
+  repo = str(c.get("repo") or "")
+  try:
+   since = float(c.get("since") or 0) / 1000.0
+  except Exception:
+   since = 0.0
+  rec = {"callId": cid, "name": name, "steps": [], "stepsTotal": 0, "handoff": "", "verifyPending": False}
+  cands = db_candidates(repo, since, "agy:" + cid) if repo else []
+  rec["dbs"] = cands
+  dbp = pick_db(cands)
+  if dbp:
+   total, rows = agy_steps(dbp)
+   rec["steps"] = rows
+   rec["stepsTotal"] = total
+   rec["db"] = dbp
+  hp = c.get("handoff")
+  if isinstance(hp, str) and hp:
+   rec["handoff"] = read_text(os.path.expanduser(hp), 65536)
+  vp = os.path.join(HOME, ".claude", "state", "agy-verify-pending", name + ".json")
+  rec["verifyPending"] = bool(name and os.path.isfile(vp))
+  out.append(rec)
+ print(json.dumps(out))
+
+try:
+ main()
+except Exception:
+ pass`
+
+/**
+ * The argv that prints the live rows of agy-job calls: each call's `{callId, name, steps, stepsTotal,
+ * handoff, verifyPending}`. The db is the newest conversation mentioning `--repo` (both separators)
+ * changed after the call started.
+ */
+export const agyProbe = (
+  python: string | readonly string[],
+  calls: { callId: string; name: string; repo: string; since: number; handoff?: string }[],
+  cache: Record<string, string> = {},
+): string[] => [...(typeof python === 'string' ? [python] : python), '-c', AGY_PY, JSON.stringify(calls), JSON.stringify(cache)]
+
+/** A blob's printable ASCII runs (the probe reads the bytes as latin-1), three characters or more. */
+export const printableRuns = (blob: string): string[] => blob.match(/[\x20-\x7e]{3,}/g) ?? []
+
+const unescape = (s: string): string => {
+  try {
+    return JSON.parse(`"${s}"`) as string
+  } catch {
+    return s
+  }
+}
+
+const AGY_TOOLS = ['edit_file', 'write_file', 'multi_edit', 'read_file', 'run_command', 'list_dir', 'find_file', 'grep', 'delete_file', 'move_file']
+
+/** What a tool-call blob says: the tool (the run after the `call_<digits>` id), its `Path`, its command. */
+export const parseAgyCall = (runs: readonly string[]): { tool: string; path: string; command: string } => {
+  let tool = ''
+  for (let i = 0; i < runs.length - 1; i += 1) {
+    if (/^call_\d+$/.test(runs[i]!)) {
+      tool = runs[i + 1]!
+      break
+    }
+  }
+  if (!tool) tool = AGY_TOOLS.find(t => runs.includes(t)) ?? ''
+  const raw = runs.join(' ')
+  const pathM = /"Path"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw)
+  const cmdM = /"(?:CommandLine|Command|command|Cmd)"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw)
+  return { tool, path: pathM ? unescape(pathM[1]!) : '', command: cmdM ? unescape(cmdM[1]!) : '' }
+}
+
+/** A path as the owner sees it: tree prefix stripped, `/` separators. */
+export const repoPath = (path: string, tree: string) => {
+  let p = path.replace(/\\/g, '/')
+  const t = tree.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (t && p.toLowerCase().startsWith(`${t.toLowerCase()}/`)) p = p.slice(t.length + 1)
+  return p.replace(/^\/+/, '')
+}
+
+const AGY_VERBS: Record<string, string> = {
+  edit_file: 'edit',
+  write_file: 'write',
+  multi_edit: 'edit',
+  read_file: 'read',
+  list_dir: 'list',
+  find_file: 'find',
+  delete_file: 'delete',
+  move_file: 'move',
+  run_command: 'run',
+}
+
+export type AgyStep = { type: number; runs: string[] }
+
+const agyCallLine = (c: { tool: string; path: string; command: string }, tree: string) => {
+  if (c.tool === 'run_command') return c.command ? `run ${shorten(c.command, 40)}` : 'run'
+  const verb = AGY_VERBS[c.tool] ?? c.tool.replace(/_file$/, '')
+  if (!verb) return ''
+  return c.path ? `${verb} ${repoPath(c.path, tree)}` : verb
+}
+
+/**
+ * What a live agy conversation shows: the latest tool call (`now`), the edited files, step and command
+ * counts (`work`), and the first line of the latest model text (`think`). '' for what the rows don't say.
+ */
+export const agyLive = (steps: readonly AgyStep[], tree: string, total = steps.length): { now: string; work: string; think: string } => {
+  const calls = steps.filter(s => s.type === 132).map(s => parseAgyCall(s.runs))
+  const latest = calls[calls.length - 1]
+  const now = latest ? agyCallLine(latest, tree) : ''
+  const edits = new Set<string>()
+  let runs = 0
+  for (const c of calls) {
+    if (c.tool === 'run_command') runs += 1
+    if (/edit|write|patch/.test(c.tool) && c.path) edits.add(repoPath(c.path, tree))
+  }
+  const work = [edits.size > 0 ? `${edits.size} file${edits.size === 1 ? '' : 's'}` : '', total > 0 ? `${total} st` : '', runs > 0 ? `${runs} run` : ''].filter(Boolean).join(' · ')
+  let think = ''
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    const s = steps[i]!
+    if (s.type !== 15) continue
+    think = shorten(s.runs[0] ?? '', 60)
+    break
+  }
+  return { now, work, think }
+}
+
+/** The model id an agy step blob names, '' when none does. */
+export const agyModel = (steps: readonly AgyStep[]): string => {
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    for (const run of steps[i]!.runs) {
+      const m = /"(?:model|model_id|modelId)"\s*:\s*"([^"]{2,60})"/.exec(run)
+      if (m?.[1]) return m[1]
+    }
+  }
+  return ''
+}
+
+const numOf = (v: unknown, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? v : d)
+const strOf = (v: unknown) => (typeof v === 'string' ? v : '')
+
+const tokensOf = (v: unknown): JobTokens | null =>
+  isObject(v) ? { in: numOf(v.in), cache: numOf(v.cache), out: numOf(v.out), think: numOf(v.think) } : null
+
+const agyStepsOf = (raw: unknown): AgyStep[] =>
+  listOf<unknown>(raw)
+    .filter(isObject)
+    .map(s => ({ type: numOf(s.type), runs: listOf<unknown>(s.runs).filter((r): r is string => typeof r === 'string').slice(0, 40) }))
+
+/** A probe row as a Job, its live rows parsed from the agy blobs it carried. */
+export const normalizeJob = (raw: unknown): Job => {
+  const j = isObject(raw) ? raw : {}
+  const steps = agyStepsOf(j.steps)
+  const total = typeof j.stepsTotal === 'number' && j.stepsTotal >= 0 ? j.stepsTotal : steps.length
+  const tree = strOf(j.tree)
+  const liveRows = steps.length > 0 ? agyLive(steps, tree, total) : { now: '', work: '', think: '' }
+  const handoff = isObject(j.handoff) ? j.handoff : {}
+  const ds = strOf(handoff.ds)
+  const stage =
+    j.stageLines !== undefined
+      ? jobStage(listOf<unknown>(j.stageLines).filter((l): l is string => typeof l === 'string'), strOf(j.phase), j.hasTrying === true, j.hasHandoff === true)
+      : { stage: strOf(j.stage), attempts: typeof j.attempts === 'number' && j.attempts >= 1 ? j.attempts : 1 }
+  const dbs = listOf<unknown>(j.dbs)
+    .filter(isObject)
+    .map(d => ({ path: strOf(d.path), mtime: numOf(d.mtime), matched: d.matched === true }))
+  return {
+    jobid: strOf(j.jobid),
+    job: strOf(j.job),
+    status: strOf(j.status),
+    ts: numOf(j.ts),
+    pid: typeof j.pid === 'number' && j.pid > 0 ? j.pid : null,
+    backend: strOf(j.backend),
+    tier: strOf(j.tier),
+    profile: strOf(j.profile),
+    phase: strOf(j.phase),
+    rc: typeof j.rc === 'number' ? j.rc : null,
+    dir: strOf(j.dir),
+    tree,
+    stale: j.stale === true,
+    endedAt: typeof j.endedAt === 'number' ? j.endedAt : null,
+    trying: strOf(j.trying),
+    stage: stage.stage,
+    attempts: stage.attempts,
+    now: strOf(j.now) || liveRows.now,
+    work: strOf(j.work) || liveRows.work,
+    think: strOf(j.think) || liveRows.think,
+    handoffBackend: strOf(handoff.backend) || strOf(j.handoffBackend),
+    tokens: parseHandoffTokens(ds) ?? tokensOf(j.tokens),
+    cost: parseJobCost(ds) ?? (typeof j.cost === 'number' ? j.cost : null),
+    wall: parseJobWall(ds) ?? (typeof j.wall === 'number' ? j.wall : null),
+    filesChanged: parseFilesChanged(handoff.files_changed) || (typeof j.filesChanged === 'number' ? j.filesChanged : 0),
+    notVerified: strOf(handoff.not_verified) || strOf(j.notVerified),
+    db: pickAgyDb(dbs) || strOf(j.db),
+  }
+}
+
+/** `jobsProbe` stdout as jobs; null on malformed output. With `now`, applies the pane's cutoff, order and limit. */
+export const parseJobs = (stdout: string, now = 0): Job[] | null => {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    return null
+  }
+  if (!Array.isArray(raw)) return null
+  const jobs = raw.filter(isObject).map(normalizeJob)
+  return now > 0 ? orderJobs(jobs, now) : jobs
+}
+
+export type AgyLive = { callId: string; name: string; steps: AgyStep[]; stepsTotal: number; handoff: string; verifyPending: boolean; db: string }
+
+/** `agyProbe` stdout as live rows; null on malformed output. */
+export const parseAgyLive = (stdout: string): AgyLive[] | null => {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    return null
+  }
+  if (!Array.isArray(raw)) return null
+  return raw.filter(isObject).map(x => ({
+    callId: strOf(x.callId),
+    name: strOf(x.name),
+    steps: agyStepsOf(x.steps),
+    stepsTotal: typeof x.stepsTotal === 'number' && x.stepsTotal >= 0 ? x.stepsTotal : 0,
+    handoff: strOf(x.handoff),
+    verifyPending: x.verifyPending === true,
+    db:
+      pickAgyDb(
+        listOf<unknown>(x.dbs)
+          .filter(isObject)
+          .map(d => ({ path: strOf(d.path), mtime: numOf(d.mtime), matched: d.matched === true })),
+      ) || strOf(x.db),
+  }))
+}
+
+/** The issued agy calls after one agy probe: their live rows, worker and verify badge. */
+export const applyAgyLive = (list: readonly Issued[], live: readonly AgyLive[]): Issued[] => {
+  const byId = new Map(live.map(l => [l.callId, l]))
+  return list.map(i => {
+    const l = byId.get(i.callId)
+    if (!l || i.kind !== 'agy') return i
+    const rows = l.steps.length > 0 ? agyLive(l.steps, i.repo, l.stepsTotal) : { now: '', work: '', think: '' }
+    return {
+      ...i,
+      now: rows.now,
+      work: rows.work,
+      model: agyModel(l.steps) || i.model,
+      worker: i.worker || parseJobText(l.handoff).backend,
+      verifyPending: l.verifyPending,
+    }
+  })
+}
+
+// ---------------------------------------------------------------- who issued what
+
+/** A job runner or consult command found in a Bash call. */
+export type RunnerCall = { kind: IssuedKind; name: string; repo: string; model: string; effort: string; handoff: string }
+
+const flagOf = (cmd: string, name: string): string => {
+  const m = new RegExp(`--${name}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|([^\\s'"]+))`).exec(cmd)
+  return (m?.[1] ?? m?.[2] ?? m?.[3] ?? '').trim()
+}
+
+/**
+ * What a Bash command starts: `ds-job.py run|batch --job <name>`, `agy-job.py run --job <name>` (with
+ * `--repo`, `--model`, `--effort`, `--handoff`), or `consult-cli.js`. Null for anything else, and for a
+ * runner call that names no `--job`.
+ */
+export const parseRunnerCall = (command: string): RunnerCall | null => {
+  const cmd = typeof command === 'string' ? command : ''
+  if (!cmd) return null
+  if (/(?:^|[\s;&|"'/])consult-cli\.js(?:[\s;&|"']|$)/.test(cmd)) return { kind: 'consult', name: '', repo: '', model: '', effort: '', handoff: '' }
+  const m = /(?:^|[\s;&|"'/])(ds-job|agy-job)\.py\s+(run|batch)(?:[\s;&|"']|$)/.exec(cmd)
+  if (!m) return null
+  if (m[1] === 'agy-job' && m[2] !== 'run') return null
+  const name = flagOf(cmd, 'job')
+  if (!name) return null
+  return {
+    kind: m[1] === 'agy-job' ? 'agy' : 'job',
+    name,
+    repo: flagOf(cmd, 'repo'),
+    model: flagOf(cmd, 'model'),
+    effort: flagOf(cmd, 'effort'),
+    handoff: flagOf(cmd, 'handoff'),
+  }
+}
+
+export const MAX_ISSUED = 40
+
+export type IssueInput = RunnerCall & { callId: string; agentId: string; at: number; task: string }
+
+/** A Bash call that starts a runner joins the binding store, waiting for its result's `jobid:` line. */
+export const issueCall = (list: readonly Issued[], call: IssueInput): Issued[] => {
+  if (!call.callId || list.some(x => x.callId === call.callId)) return [...list]
+  const entry: Issued = {
+    callId: call.callId,
+    agentId: call.agentId,
+    kind: call.kind,
+    name: call.name,
+    repo: call.repo,
+    model: call.model,
+    effort: call.effort,
+    handoff: call.handoff,
+    at: call.at,
+    task: call.task,
+    jobid: '',
+    runId: '',
+    endedAt: null,
+    ok: null,
+    worker: '',
+    now: '',
+    work: '',
+    verifyPending: false,
+  }
+  return [...list, entry].slice(-MAX_ISSUED)
+}
+
+/** The call's result came back: it ends there, and a `jobid:` line binds the job dir it started. */
+export const bindResult = (list: readonly Issued[], callId: string, text: unknown, at: number, ok: boolean | null = null): Issued[] => {
+  if (!callId || !list.some(x => x.callId === callId)) return [...list]
+  const backend = parseJobText(text).backend
+  const jobid = parseJobId(text)
+  return list.map(x =>
+    x.callId !== callId ? x : { ...x, endedAt: x.endedAt ?? at, ok: ok ?? x.ok, jobid: x.jobid || jobid, worker: x.worker || backend },
+  )
+}
+
+/** The newest consult run file started after a consult call is that call's run. */
+export const bindConsultRun = (list: readonly Issued[], run: ConsultRun | null): Issued[] => {
+  if (!run || !run.id) return [...list]
+  const open = [...list].reverse().find(x => x.kind === 'consult' && !x.runId && run.startedAt >= x.at)
+  return open ? list.map(x => (x === open ? { ...x, runId: run.id } : x)) : [...list]
+}
+
+/** The agent a job dir was bound to: its issuer's id, '' (main) when no call bound it. */
+export const ownerOfJob = (list: readonly Issued[], jobid: string): string => list.find(x => x.jobid === jobid)?.agentId ?? ''
+
+/** The mesh task a job serves: its issuer's `task:` line, else the `doing` item, else ''. */
+export const taskOfJob = (list: readonly Issued[], jobid: string): string => list.find(x => x.jobid === jobid)?.task ?? ''
+
+const MESH_PY = String.raw`import json, os, sys
+home = os.environ.get("MESH_HOME") or os.path.join(os.path.expanduser("~"), ".agent-mesh")
+path = os.path.join(home, "tasks", (sys.argv[1] if len(sys.argv) > 1 else "") + ".json")
+try:
+ with open(path, "r", encoding="utf-8", errors="replace") as fh:
+  data = json.load(fh)
+except Exception:
+ data = []
+items = data
+if isinstance(data, dict):
+ items = data.get("tasks") or data.get("items") or []
+out = []
+for i in items if isinstance(items, list) else []:
+ if isinstance(i, dict):
+  out.append({"id": str(i.get("id") or ""), "status": str(i.get("status") or ""), "subject": str(i.get("subject") or "")})
+print(json.dumps(out))`
+
+/** The argv that prints a session's mesh task items (`<MESH_HOME or ~/.agent-mesh>/tasks/<id>.json`); [] when none. */
+export const meshProbe = (python: string | readonly string[], sessionId: string): string[] => [
+  ...(typeof python === 'string' ? [python] : python),
+  '-c',
+  MESH_PY,
+  sessionId,
+]
+
+/** `meshProbe` stdout as task items, whatever shape the cache holds (`[]` when it is not JSON). */
+export const parseMeshTasks = (stdout: string): MeshTask[] => {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    return []
+  }
+  if (isObject(raw)) raw = listOf<unknown>(raw.tasks).length > 0 ? raw.tasks : raw.items
+  if (!Array.isArray(raw)) return []
+  return raw.filter(isObject).map(x => ({ id: strOf(x.id), status: strOf(x.status), subject: strOf(x.subject) }))
+}
+
+/** The `task: t<N>` a sub-main's brief names, '' when none. */
+export const taskOfBrief = (text: unknown): string => {
+  const t = typeof text === 'string' ? text : ''
+  const m = /\btask:\s*(t\d+)\b/i.exec(t)
+  return m?.[1]?.toLowerCase() ?? ''
+}
+
+/** The mesh item a job issued now serves: the one whose status is `doing`, '' when none. */
+export const doingTask = (items: readonly MeshTask[]): string => items.find(i => i.status === 'doing' && i.id)?.id ?? ''
+
+/** Main's direct workers go under the item that was `doing` when they were issued; a sub-main's under its own task. */
+export const taskAtIssue = (agentId: string, cardTask: string, items: readonly MeshTask[]): string => (agentId ? cardTask : doingTask(items))
+
+const issuedKind = (v: unknown): IssuedKind => (v === 'agy' || v === 'consult' ? v : 'job')
+
+/** Stored bindings normalized over their defaults. */
+export const normalizeIssued = (stored: unknown): Issued[] =>
+  listOf<unknown>(stored)
+    .filter(isObject)
+    .map(x => ({
+      callId: strOf(x.callId),
+      agentId: strOf(x.agentId),
+      kind: issuedKind(x.kind),
+      name: strOf(x.name),
+      repo: strOf(x.repo),
+      model: strOf(x.model),
+      effort: strOf(x.effort),
+      handoff: strOf(x.handoff),
+      at: numOf(x.at),
+      task: strOf(x.task),
+      jobid: strOf(x.jobid),
+      runId: strOf(x.runId),
+      endedAt: typeof x.endedAt === 'number' ? x.endedAt : null,
+      ok: typeof x.ok === 'boolean' ? x.ok : null,
+      worker: strOf(x.worker),
+      now: strOf(x.now),
+      work: strOf(x.work),
+      verifyPending: x.verifyPending === true,
+    }))
 
 const isEngineState = (v: unknown): v is ConsultEngineState =>
   v === 'queued' || v === 'running' || v === 'ok' || v === 'failed' || v === 'skipped'

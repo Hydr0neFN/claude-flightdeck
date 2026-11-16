@@ -70,6 +70,53 @@ import {
   parseConsult,
   ringLayout,
   shortConsultEngine,
+  AGY_PY,
+  JOB_CUTOFF_MS,
+  JOBS_PY,
+  PID_ALIVE_PY,
+  PYTHON_CANDIDATES,
+  agyLive,
+  agyModel,
+  agyWorker,
+  applyAgyLive,
+  bindConsultRun,
+  bindResult,
+  doingTask,
+  isJobLive,
+  issueCall,
+  jobGlyph,
+  jobLeaves,
+  jobStage,
+  jobsProbe,
+  mentionsTree,
+  meshProbe,
+  normalizeIssued,
+  normalizeJob,
+  orderJobs,
+  ownerOfJob,
+  parseAgyCall,
+  parseAgyLive,
+  parseFilesChanged,
+  parseHandoffTokens,
+  parseJobId,
+  parseJobWall,
+  parseJobs,
+  parseMeshTasks,
+  parseRunnerCall,
+  pathNeedles,
+  pickAgyDb,
+  printableRuns,
+  receiptJobRow,
+  receiptPanelRow,
+  receiptSummary,
+  repoPath,
+  showJob,
+  taskAtIssue,
+  taskOfBrief,
+  taskOfJob,
+  turnConsults,
+  turnJobs,
+  workerDisplay,
 } from '../hooks/core'
 
 test('a context budget smaller than the window is what the gauge measures against', () => {
@@ -1593,6 +1640,8 @@ test('external feed polls on start and every 30s, keeps last good on error, skip
   let mode: 'good' | 'fail' | 'bad-json' | 'empty-fields' | 'hang' = 'good'
   let releaseHang: () => void = () => {}
   on('process.run', async (_$, e) => {
+    // The jobs probe runs beside the feed: this test counts the feed's own calls.
+    if (e.argv[0] !== 'feed-cmd') return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
     calls.push({ argv: [...e.argv], stdin: e.init?.stdin, timeoutMs: e.init?.timeoutMs })
     if (mode === 'fail') return { value: { exitCode: 1, stdout: '', stderr: 'err' } } as never
     if (mode === 'bad-json') return { value: { exitCode: 0, stdout: '{oops', stderr: '' } } as never
@@ -1699,14 +1748,14 @@ test('external feed polls on start and every 30s, keeps last good on error, skip
   await emptyUi.unmount()
 })
 
-test('when feedCommand is empty, no process is run and no feed lines render', { options: { panels: 'main,architect,gate,agents,loops,receipt,log' } }, async ($, on) => {
+test('when feedCommand is empty, no feed process is run and no feed lines render', { options: { panels: 'main,architect,gate,agents,loops,receipt,log' } }, async ($, on) => {
   const clock = engine(on)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
   let ran = 0
-  on('process.run', () => {
-    ran += 1
+  on('process.run', (_$, e) => {
+    if (e.argv[0] === 'feed-cmd') ran += 1
     return { value: { exitCode: 0, stdout: '{"ds_cny":10}', stderr: '' } } as never
   })
   await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
@@ -2344,6 +2393,8 @@ test('consult panel renders consult and debate views, animates ring.tsx, polls 2
   let releaseHang: () => void = () => {}
 
   on('process.run', async (_$, e) => {
+    // The jobs probe runs beside the consult's: this test counts the consult's own polls.
+    if (!e.argv[2]?.includes('consult-locks.json')) return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
     pollCount += 1
     lastDir = e.argv[3] ?? ''
     if (mode === 'error') return { value: { exitCode: 1, stdout: '', stderr: 'boom' } } as never
@@ -2567,4 +2618,552 @@ test('with motion off, consult ring draws static grid with ◐ and no Client', {
   expect(await ui.find({ text: /^answers pass round the ring$/ })).toBeDefined()
   await ui.unmount()
   expect(faultKey('desktop', 'hooks/ring.tsx')).toBe('desktop:ring.tsx')
+})
+
+// ---------------------------------------------------------------- farmer jobs
+
+test('the jobs dir option is read leniently and the python fallback is python3, python, py -3', () => {
+  expect([parseConfig({}).jobsDir, parseConfig({ jobsDir: ' /j ' }).jobsDir]).toEqual(['', '/j'])
+  expect(PYTHON_CANDIDATES).toEqual([['python3'], ['python'], ['py', '-3']])
+  const argv = jobsProbe(['py', '-3'], '/j', { j1: '/c.db' })
+  expect(argv.slice(0, 4)).toEqual(['py', '-3', '-c', JOBS_PY])
+  expect(argv.slice(4)).toEqual(['/j', '{"j1":"/c.db"}'])
+  // The consult probe takes the same prefixes, and still a plain string for older callers.
+  expect(consultProbe('python3', '/r')[0]).toBe('python3')
+  expect(consultProbe('python3', '/r')[3]).toBe('/r')
+  expect(consultProbe(['py', '-3'], '/r').slice(0, 3)).toEqual(['py', '-3', '-c'])
+})
+
+test('the pid helper both probes share tests the Windows branch first, and os.kill elsewhere', () => {
+  // The nt branch asks OpenProcess/GetExitCodeProcess (259 = active) before os.kill; the fallback
+  // treats PermissionError as alive. Both probes carry the helper, so both read pids right on Windows.
+  expect(PID_ALIVE_PY.indexOf('os.name == "nt"')).toBeLessThan(PID_ALIVE_PY.indexOf('os.kill'))
+  expect(PID_ALIVE_PY).toContain('OpenProcess(0x1000, False, int(pid))')
+  expect(PID_ALIVE_PY).toContain('code.value == 259')
+  expect(PID_ALIVE_PY).toContain('except PermissionError:\n  return True')
+  expect(jobsProbe('python3', '').at(2)).toContain(PID_ALIVE_PY)
+  expect(consultProbe('python3', '').at(2)).toContain(PID_ALIVE_PY)
+})
+
+test('the job stage comes from job.log lines and state.json, and a backend switch shows as model x2', () => {
+  expect(jobStage(['copied 12 files'], '', false, false)).toEqual({ stage: 'copy', attempts: 1 })
+  expect(jobStage(['copied 2 files', 'toolbox: farmer tools'], '', false, false)).toEqual({ stage: 'toolbox', attempts: 1 })
+  expect(jobStage(['trying: agy:a', 'trying: agy:b'], '', true, false)).toEqual({ stage: 'model', attempts: 2 })
+  expect(jobStage(['trying: agy:a', 'result: ok'], '', true, false).stage).toBe('')
+  expect(jobStage(['apply: 2 patches'], '', false, false).stage).toBe('apply')
+  expect(jobStage(['check: 72 tests pass'], '', false, false).stage).toBe('check')
+  expect(jobStage([], 'apply', false, false).stage).toBe('apply')
+  // A phase is the runner's own word for where it is: it wins over the lines.
+  expect(jobStage(['check: 1 test'], 'apply', false, false).stage).toBe('apply')
+  // A handoff file settles it, whatever the log said.
+  expect(jobStage(['apply: 1 patch'], '', false, true).stage).toBe('handoff')
+  expect(jobStage(['something else entirely'], '', false, false).stage).toBe('')
+  expect(jobStage(['copied 2 files'], '', true, false).stage).toBe('model')
+  expect(JOB_CUTOFF_MS).toBe(30 * 60_000)
+})
+
+test('job rows parse live, stale, partial and missing handoff; a bad probe is no rows', () => {
+  expect(parseJobs('not json')).toBe(null)
+  expect(parseJobs('{"jobid":"j"}')).toBe(null)
+  expect(parseJobs('null')).toBe(null)
+  expect(parseJobs('[]')).toEqual([])
+  const live = normalizeJob({
+    jobid: 'j',
+    job: 'ring-panel',
+    status: 'running',
+    ts: 10,
+    pid: 42,
+    trying: 'agy:gemini-4-hydrogen-xhigh',
+    stageLines: ['copied 2 files', 'trying: agy:a', 'trying: agy:b'],
+    hasTrying: true,
+    tree: '/t',
+  })
+  expect([live.job, isJobLive(live), jobGlyph(live), live.stage, live.attempts]).toEqual(['ring-panel', true, '◐', 'model', 2])
+  const stale = normalizeJob({ ...live, stale: true })
+  expect([isJobLive(stale), jobGlyph(stale)]).toEqual([false, '⊘'])
+  // A stale job stays listed (its pid died), marked, rather than vanishing as if it never ran.
+  expect(showJob(stale, 1_800_000)).toBe(true)
+  expect(jobLeaves([stale], [], 1_800_000)[0]?.glyph).toBe('⊘')
+  const partial = normalizeJob({
+    jobid: 'p',
+    job: 'half',
+    status: 'partial',
+    ts: 1,
+    endedAt: 5,
+    handoff: { backend: 'paid-flash', ds: 'wall=30s cost_cny_est=0.2', files_changed: '4 files' },
+  })
+  expect([jobGlyph(partial), partial.handoffBackend, partial.wall, partial.filesChanged]).toEqual(['◑', 'paid-flash', 30, 4])
+  expect(Math.round((partial.cost ?? 0) * 1000)).toBe(Math.round(0.2 * CNY_USD * 1000))
+  const bare = normalizeJob({ jobid: 'b', job: 'b', status: 'done', ts: 2, endedAt: 3 })
+  expect([bare.tokens, bare.cost, bare.wall, bare.handoffBackend, bare.filesChanged]).toEqual([null, null, null, '', 0])
+  expect([jobGlyph(normalizeJob({ status: 'failed' })), jobGlyph(normalizeJob({ status: 'dry' }))]).toEqual(['✗', '○'])
+  // A stored row (already normalized, its raw handoff gone) reads back unchanged.
+  expect(normalizeJob(partial)).toEqual(partial)
+  expect(normalizeJob(live)).toEqual(live)
+  expect(parseHandoffTokens('ds: tokens=in=12000 cache=3000 out=4500 think=800')).toEqual({ in: 12_000, cache: 3_000, out: 4_500, think: 800 })
+  expect(parseHandoffTokens('tokens=in=?')).toBe(null)
+  expect(parseJobWall('wall=246s cost_cny_est=0')).toBe(246)
+  expect(parseFilesChanged('4 files')).toBe(4)
+  expect(parseJobId('jobdir: /x\njobid: 20261116-1')).toBe('20261116-1')
+})
+
+test('the pane lists a job while it is live and for 30 minutes after, newest first, at most 8', () => {
+  const at = (id: string, ts: number, endedAt: number | null, status = 'done') => normalizeJob({ jobid: id, job: id, status, ts, endedAt })
+  const now = 10_000_000
+  const jobs = [
+    at('live-old', 1, null, 'running'),
+    at('ended-new', 50, now - 60_000),
+    at('ended-old', 60, now - JOB_CUTOFF_MS - 1),
+    ...Array.from({ length: 9 }, (_, i) => at(`e${i}`, 100 + i, now - 120_000 - i * 1_000)),
+  ]
+  const shown = orderJobs(jobs, now)
+  expect(shown.length).toBe(8)
+  expect(shown[0]?.jobid).toBe('live-old')
+  expect(shown[1]?.jobid).toBe('ended-new')
+  expect(shown.some(j => j.jobid === 'ended-old')).toBe(false)
+  expect([showJob(shown[0]!, now), showJob(jobs[2]!, now)]).toEqual([true, false])
+  // A job that ages past the cutoff drops out of the agents lines even when no probe rewrote it.
+  expect(jobLeaves([jobs[2]!], [], now).length).toBe(0)
+  // parseJobs applies the same rule when it is told now.
+  const json = JSON.stringify(jobs.map(j => ({ jobid: j.jobid, job: j.job, status: j.status, ts: j.ts, endedAt: j.endedAt })))
+  expect(parseJobs(json, now)?.length).toBe(8)
+  expect(parseJobs(json)?.length).toBe(12)
+})
+
+test('agy blobs parse into tool, path and command; the live rows say now, work and think', () => {
+  const tree = '/private/tmp/dsbench/jobs/j1/tree'
+  // A step blob as the probe hands it over: its bytes, read one char each (latin-1).
+  const editBlob = `\x0a\x07call_12\x12\x09edit_file\x1a\x00{"Path":"${tree}/hooks/register.tsx"}`
+  expect(parseAgyCall(printableRuns(editBlob))).toEqual({ tool: 'edit_file', path: `${tree}/hooks/register.tsx`, command: '' })
+  const runBlob = `\x00call_13\x00run_command\x00{"CommandLine":"npm run test -- --coverage"}`
+  expect(parseAgyCall(printableRuns(runBlob))).toEqual({ tool: 'run_command', path: '', command: 'npm run test -- --coverage' })
+  // A metadata blob and a payload blob are separate: a null keeps their runs apart.
+  expect(printableRuns('\x08call_9\x12\x09edit_file\x00{"Path":"/a"}')).toEqual(['call_9', 'edit_file', '{"Path":"/a"}'])
+  // No call id: a known tool name still names it.
+  expect(parseAgyCall(['edit_file', '{"Path":"/a/b.ts"}']).tool).toBe('edit_file')
+
+  const steps = [
+    { type: 132, runs: ['call_1', 'edit_file', `{"Path":"${tree}/hooks/register.tsx"}`] },
+    { type: 132, runs: ['call_2', 'run_command', '{"CommandLine":"npm test"}'] },
+    { type: 15, runs: ['Looking at the hook now, then the tests'] },
+    { type: 132, runs: ['call_3', 'edit_file', `{"Path":"${tree}/src/a.ts"}`] },
+  ]
+  expect(agyLive(steps, tree)).toEqual({ now: 'edit src/a.ts', work: '2 files · 4 st · 1 run', think: 'Looking at the hook now, then the tests' })
+  expect(agyLive([{ type: 15, runs: ['x'.repeat(80)] }], tree).think.length).toBe(60)
+  const longCommand = `{"CommandLine":"${'a'.repeat(80)}"}`
+  expect(agyLive([{ type: 132, runs: ['call_4', 'run_command', longCommand] }], tree).now.length).toBe('run '.length + 40)
+  expect(agyLive([], tree)).toEqual({ now: '', work: '', think: '' })
+  expect(agyModel([{ type: 132, runs: ['"model":"gemini-4-hydrogen-xhigh"'] }])).toBe('gemini-4-hydrogen-xhigh')
+  expect(agyModel([])).toBe('')
+  expect(repoPath('C:\\w\\tree\\src\\a.ts', 'C:/w/tree')).toBe('src/a.ts')
+  expect(repoPath('/other/src/a.ts', '/other/tree')).toBe('other/src/a.ts')
+})
+
+test('the agy db is matched by tree path, both separators, and a locked or missing one leaves rows out', () => {
+  const tree = 'C:\\work\\dsbench\\jobs\\j1\\tree'
+  expect(pathNeedles(tree)).toEqual(['C:/work/dsbench/jobs/j1/tree', 'C:\\\\work\\\\dsbench\\\\jobs\\\\j1\\\\tree'])
+  expect(mentionsTree('{"Path":"C:\\\\work\\\\dsbench\\\\jobs\\\\j1\\\\tree\\\\src\\\\a.ts"}', tree)).toBe(true)
+  expect(mentionsTree('{"Path":"C:\\\\WORK\\\\DSBENCH\\\\JOBS\\\\J1\\\\TREE\\\\a.ts"}', tree, true)).toBe(true)
+  expect(mentionsTree('{"Path":"C:\\\\WORK\\\\DSBENCH\\\\JOBS\\\\J1\\\\TREE\\\\a.ts"}', tree, false)).toBe(false)
+  expect(mentionsTree('/x/other/tree/a.ts', tree)).toBe(false)
+  const dbs = [
+    { path: '/locked.db', mtime: 400, matched: false }, // no rows could be read
+    { path: '/c2.db', mtime: 200, matched: true },
+    { path: '/c3.db', mtime: 300, matched: true },
+  ]
+  expect(pickAgyDb(dbs)).toBe('/c3.db')
+  expect(pickAgyDb(dbs, 250)).toBe('/c3.db')
+  expect(pickAgyDb(dbs, 350)).toBe('')
+  expect(pickAgyDb([])).toBe('')
+
+  const live = normalizeJob({
+    jobid: 'j',
+    status: 'running',
+    ts: 1,
+    trying: 'agy:x',
+    tree,
+    dbs: [{ path: '/c.db', mtime: 10, matched: true }],
+    steps: [{ type: 132, runs: ['call_1', 'edit_file', `{"Path":"${tree}\\src\\a.ts"}`] }],
+    stepsTotal: 1,
+  })
+  expect([live.dir, live.db, live.now]).toEqual(['', '/c.db', 'edit src/a.ts'])
+  // No db read (missing or locked): the row is left out, not wrong.
+  const none = normalizeJob({ jobid: 'm', status: 'running', ts: 1, trying: 'agy:x', tree, dbs: [], steps: [] })
+  expect([none.db, none.now, none.work]).toEqual(['', '', ''])
+})
+
+test('a job line names the worker with its effort, as the owner says it', () => {
+  expect(workerDisplay('agy:gemini-4-hydrogen-xhigh')).toBe('Hydrogen xhigh')
+  expect(workerDisplay('agy:gemini-4-hydrogen-high')).toBe('Hydrogen high')
+  expect(workerDisplay('agy:claude-sonnet-5-5-high')).toBe('agy Sonnet high')
+  expect(workerDisplay('azure:gpt-6.1-sol')).toBe('sol')
+  expect(workerDisplay('paid-flash')).toBe('DS Flash')
+  expect(workerDisplay('opencode:opencode/qwen3-coder-free')).toBe('qwen3-coder')
+  expect(workerDisplay('')).toBe('')
+  expect([agyWorker('', '', ''), agyWorker('', 'sonnet', 'high'), agyWorker('azure:gpt-6.1-sol', '')]).toEqual(['agy', 'agy Sonnet high', 'sol'])
+})
+
+test('a Bash call that starts a runner binds its job dir, and an unbound job belongs to main', () => {
+  const cmd = 'cd /w && python3 ds-job.py run --job ring-panel --detach'
+  expect(parseRunnerCall(cmd)).toEqual({ kind: 'job', name: 'ring-panel', repo: '', model: '', effort: '', handoff: '' })
+  expect(parseRunnerCall('python3 ds-job.py batch --job receipt')?.kind).toBe('job')
+  expect(parseRunnerCall('python3 agy-job.py run --job verify --repo C:\\w\\proj --model sonnet --effort high --handoff C:\\w\\h.txt')).toEqual({
+    kind: 'agy',
+    name: 'verify',
+    repo: 'C:\\w\\proj',
+    model: 'sonnet',
+    effort: 'high',
+    handoff: 'C:\\w\\h.txt',
+  })
+  expect(parseRunnerCall('node consult-cli.js --kind debate')?.kind).toBe('consult')
+  expect(parseRunnerCall('python3 ds-job.py run --detach')).toBe(null)
+  expect(parseRunnerCall('agy-job.py batch --job x')).toBe(null)
+  expect(parseRunnerCall('ls -la')).toBe(null)
+
+  let store = issueCall([], { ...parseRunnerCall(cmd)!, callId: 'c1', agentId: '', at: 1_000, task: 't3' })
+  expect(store[0]?.jobid).toBe('')
+  expect(ownerOfJob(store, '20261116-1')).toBe('') // never bound: main's
+  store = bindResult(store, 'c1', 'ds_status: running\njobid: 20261116-1\nnext: poll', 5_000)
+  expect([store[0]?.jobid, store[0]?.endedAt, ownerOfJob(store, '20261116-1'), taskOfJob(store, '20261116-1')]).toEqual([
+    '20261116-1',
+    5_000,
+    '',
+    't3',
+  ])
+  // Issued inside a subagent: bound to that card.
+  const sub = issueCall([], { kind: 'job', name: 'b', repo: '', model: '', effort: '', handoff: '', callId: 'c2', agentId: 'a1', at: 2_000, task: 't4' })
+  const bound = bindResult(sub, 'c2', 'jobid: 20261116-2', 6_000)
+  expect([ownerOfJob(bound, '20261116-2'), taskOfJob(bound, '20261116-2')]).toEqual(['a1', 't4'])
+  // A repeat result does not move the binding or its end.
+  const again = bindResult(bound, 'c2', 'jobid: another', 9_000)
+  expect([again[0]?.jobid, again[0]?.endedAt]).toEqual(['20261116-2', 6_000])
+  expect(issueCall(store, { kind: 'job', name: 'x', repo: '', model: '', effort: '', handoff: '', callId: 'c1', agentId: '', at: 1, task: '' }).length).toBe(1)
+})
+
+test('a worker hangs under its task: a sub-main brief names it, main takes the doing item', () => {
+  expect(taskOfBrief('Fix the probe.\ntask: t4 receipt\nreport: .handoffs/x.md')).toBe('t4')
+  expect(taskOfBrief('Task: T12 docs')).toBe('t12')
+  expect(taskOfBrief('no task here')).toBe('')
+  const items = [
+    { id: 't3', status: 'done' },
+    { id: 't4', status: 'doing' },
+    { id: 't5', status: 'todo' },
+  ]
+  expect(doingTask(items)).toBe('t4')
+  expect(doingTask([{ id: 't3', status: 'done' }])).toBe('')
+  expect([taskAtIssue('a1', 't4', items), taskAtIssue('', '', items), taskAtIssue('', '', [])]).toEqual(['t4', 't4', ''])
+  // The mesh cache is read at issue time: an array, or an object holding `tasks`/`items`.
+  const argv = meshProbe('python3', 'sess-1')
+  const code = argv[2] ?? ''
+  expect([argv[0], argv[1], argv[3]]).toEqual(['python3', '-c', 'sess-1'])
+  expect([code.includes('MESH_HOME'), code.includes('.agent-mesh')]).toEqual([true, true])
+  expect(parseMeshTasks(JSON.stringify(items))).toEqual([
+    { id: 't3', status: 'done', subject: '' },
+    { id: 't4', status: 'doing', subject: '' },
+    { id: 't5', status: 'todo', subject: '' },
+  ])
+  expect(parseMeshTasks(JSON.stringify({ tasks: [{ id: 't9', status: 'doing', subject: 'ship' }] }))).toEqual([{ id: 't9', status: 'doing', subject: 'ship' }])
+  expect(parseMeshTasks('not json')).toEqual([])
+  expect(parseMeshTasks('{}')).toEqual([])
+})
+
+test('a consult call binds the run file started after it, never an earlier one', () => {
+  const call = issueCall([], { kind: 'consult', name: '', repo: '', model: '', effort: '', handoff: '', callId: 'cc', agentId: '', at: 10_000, task: '' })
+  expect(bindConsultRun(call, { ...makeRun({ startedAt: 9_000 }), id: 'old' } as never)[0]?.runId).toBe('')
+  expect(bindConsultRun(call, { ...makeRun({ startedAt: 20_000 }), id: 'new' } as never)[0]?.runId).toBe('new')
+  expect(bindConsultRun(call, null)).toEqual(call)
+})
+
+test('an agy-job leaf keeps its real-repo mark, its worker and the verify-pending badge, without the thought', () => {
+  const live = parseAgyLive(
+    JSON.stringify([
+      {
+        callId: 'c1',
+        name: 'private',
+        steps: [
+          { type: 132, runs: ['call_1', 'edit_file', '{"Path":"/w/proj/src/a.ts"}'] },
+          { type: 132, runs: ['call_2', 'run_command', '{"CommandLine":"npm test"}'] },
+          { type: 15, runs: ['private thinking here'] },
+        ],
+        stepsTotal: 3,
+        dbs: [{ path: '/c.db', mtime: 5, matched: true }],
+        verifyPending: true,
+      },
+    ]),
+  ) ?? []
+  let issued = applyAgyLive(normalizeIssued([{ callId: 'c1', kind: 'agy', name: 'private', repo: '/w/proj', at: 1, model: 'sonnet', effort: 'high' }]), live)
+  const leaf = jobLeaves([], issued, 10_000)[0]
+  expect(leaf && [leaf.isRealRepo, leaf.worker, leaf.detail, leaf.verifyPending]).toEqual([true, 'agy Sonnet high', 'run npm test · 1 file · 3 st · 1 run', true])
+  expect(leaf?.detail).not.toContain('private thinking')
+  expect(live[0]?.db).toBe('/c.db')
+  // The badge clears when the file is gone.
+  issued = applyAgyLive(issued, [{ ...live[0]!, verifyPending: false }])
+  expect(jobLeaves([], issued, 10_000)[0]?.verifyPending).toBe(false)
+  // The ended handoff's backend names the worker.
+  const ended = applyAgyLive(issued, [{ ...live[0]!, handoff: 'backend: azure:gpt-6.1-sol\n' }])
+  expect(jobLeaves([], ended, 10_000)[0]?.worker).toBe('sol')
+  // Before any handoff, the db's model id names it: `--model` was only a family.
+  const modeled = parseAgyLive(
+    JSON.stringify([{ callId: 'c9', name: 'm', steps: [{ type: 132, runs: ['"model":"gemini-4-hydrogen-xhigh"'] }], stepsTotal: 1, dbs: [] }]),
+  ) ?? []
+  const named = applyAgyLive(normalizeIssued([{ callId: 'c9', kind: 'agy', name: 'm', at: 1 }]), modeled)
+  expect(jobLeaves([], named, 10_000)[0]?.worker).toBe('Hydrogen xhigh')
+})
+
+test('a receipt counts the jobs and panel runs started inside its turn window', () => {
+  const j = (id: string, ts: number, status = 'done') => normalizeJob({ jobid: id, job: id, status, ts })
+  const jobs = [j('before', 1), j('inside', 20), j('after', 50)]
+  expect(turnJobs(jobs, [], 10_000, 40_000).map(x => x.name)).toEqual(['inside'])
+  const issued = normalizeIssued([
+    { callId: 'c1', kind: 'agy', name: 'v', at: 20_000, endedAt: 30_000 },
+    { callId: 'c2', kind: 'agy', name: 'w', at: 50_000 },
+  ])
+  expect(turnJobs([], issued, 10_000, 40_000).map(x => [x.name, x.cost, x.glyph])).toEqual([['v', 0, '●']])
+  expect(turnConsults({ ...makeRun({ startedAt: 20_000, endedAt: 30_000 }), id: 'r' } as never, 10_000, 40_000).length).toBe(1)
+  expect(turnConsults({ ...makeRun({ startedAt: 50_000 }), id: 'r' } as never, 10_000, 40_000).length).toBe(0)
+  expect(turnConsults(null, 0, 1)).toEqual([])
+})
+
+test('a receipt row carries the job, its worker, tokens and cost; a running one keeps its clock', () => {
+  const done = {
+    id: 'j',
+    name: 'ring-panel',
+    worker: 'Hydrogen xhigh',
+    glyph: '●',
+    status: 'done',
+    startedAt: 0,
+    endedAt: 246_000,
+    isLive: false,
+    tokens: { in: 12_000, cache: 3_000, out: 4_500, think: 800 },
+    cost: 0,
+  }
+  expect(receiptJobRow(done, 1_000_000)).toBe('● ring-panel  ▸ Hydrogen xhigh  4m06s  12k→5k  free')
+  const running = { ...done, glyph: '◐', isLive: true, endedAt: null, tokens: null, cost: null, startedAt: 935_000 }
+  expect(receiptJobRow(running, 1_000_000)).toBe('◐ ring-panel  ▸ Hydrogen xhigh  1m05s')
+  expect(receiptJobRow({ ...done, cost: 0.042, tokens: null }, 1_000_000)).toBe('● ring-panel  ▸ Hydrogen xhigh  4m06s  $0.04')
+  const consult = makeRun({ kind: 'debate', round: 2, rounds: 3, startedAt: 0, endedAt: 72_000 })
+  expect(receiptPanelRow(consult as never, 100_000)).toBe('◎ panel debate R2  1/5 answered · 1 failed · 1m12s')
+  const base = { ...DEFAULT_TURN, durationMs: 15_000, agents: 0, jobs: 0, panels: 0, costDelta: null, reason: 'answer', since: 0 }
+  expect(receiptSummary(base)).toBe('last turn 15s · 0 agents · 0 edits · 0 errors')
+  expect(receiptSummary({ ...base, durationMs: 252_000, jobs: 2, panels: 1, edits: 3 })).toBe(
+    'last turn 4m12s · 0 agents · 2 jobs · 1 panel · 3 edits · 0 errors',
+  )
+})
+
+const JOBS_PANELS = { options: { panels: 'main,agents,receipt,log' } }
+
+const JOBS_NOW = 3_600_000
+
+const jobsSession = async ($: Parameters<TestBody>[0], on: On, body: (now: number) => string) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('process.run', (_$, e) => {
+    if (e.argv[2] !== JOBS_PY) return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+    return { value: { exitCode: 0, stdout: body(JOBS_NOW), stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  return clock
+}
+
+const jobPayload = (now: number) =>
+  JSON.stringify([
+    {
+      jobid: 'j1',
+      job: 'ring-panel',
+      status: 'running',
+      ts: (now - 120_000) / 1000,
+      pid: 42,
+      tree: '/x',
+      trying: 'agy:gemini-4-hydrogen-xhigh',
+      stageLines: ['copied 4 files', 'trying: agy:gemini-4-hydrogen-xhigh'],
+      hasTrying: true,
+      stepsTotal: 83,
+      steps: [{ type: 132, runs: ['call_1', 'edit_file', '{"Path":"/x/hooks/register.tsx"}'] }],
+      dbs: [{ path: '/c.db', mtime: now, matched: true }],
+    },
+    {
+      jobid: 'j2',
+      job: 'receipt',
+      status: 'done',
+      ts: (now - 600_000) / 1000,
+      endedAt: now - 300_000,
+      handoff: { backend: 'azure:gpt-6.1-sol', files_changed: '4', ds: 'wall=246s cost_cny_est=0 tokens=in=12000 cache=3000 out=4500 think=800' },
+    },
+  ])
+
+test('the agents panel lists a farmer job and its live detail line until the work tree lands', JOBS_PANELS, async ($, on) => {
+  await jobsSession($, on, now => jobPayload(now))
+  for (const cols of [64, 40]) {
+    const ui = await $.ui.mount({ ...pane(cols), surface: 'terminal' })
+    expect(await ui.find({ text: /ring-panel ▸ Hydrogen xhigh/ })).toBeDefined()
+    expect(await ui.find({ text: /receipt ▸ sol/ })).toBeDefined()
+    if (cols >= 56) expect(await ui.find({ text: /edit hooks\/register\.tsx · 1 file · 83 st/ })).toBeDefined()
+    else expect(await ui.find({ text: /edit hooks\/register\.tsx/ })).toBeUndefined()
+    expect(spillsOf(await ui.drawn(), cols)).toEqual([])
+    await ui.unmount()
+  }
+})
+
+test('the job lines refit at 40x20, 60x30 and 100x45, and a size change drops the detail line', JOBS_PANELS, async ($, on) => {
+  await jobsSession($, on, now => jobPayload(now))
+  for (const [cols, rows] of [
+    [40, 20],
+    [60, 30],
+    [100, 45],
+  ] as const) {
+    const props = { ...pane(cols).props, scroll: { offset: 0, bodyRows: rows } }
+    const ui = await $.ui.mount({ ...pane(cols), props, surface: 'terminal' })
+    expect(await ui.find({ text: /ring-panel/ })).toBeDefined()
+    expect(spillsOf(await ui.drawn(), cols)).toEqual([])
+    await ui.unmount()
+  }
+  // The same state drawn narrow and wide: no width is kept between renders.
+  const narrow = await $.ui.mount({ ...pane(40), surface: 'terminal' })
+  expect(await narrow.find({ text: /edit hooks\/register\.tsx/ })).toBeUndefined()
+  await narrow.unmount()
+  const wide = await $.ui.mount({ ...pane(100), surface: 'terminal' })
+  expect(await wide.find({ text: /edit hooks\/register\.tsx · 1 file · 83 st/ })).toBeDefined()
+  await wide.unmount()
+})
+
+test('an empty probe leaves the agents panel out, and no job line is drawn', JOBS_PANELS, async ($, on) => {
+  await jobsSession($, on, () => '[]')
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui.find({ text: /agents ·/ })).toBeUndefined()
+  expect(await ui.find({ text: /▸/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('an agy-job call shows as a ◇ real-repo leaf with its worker and a verify-pending badge', { options: { panels: 'main,agents,log' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('tool.call', () => ({ result: {}, text: 'all good' }))
+  on('process.run', async (_$, e) => {
+    if (e.argv[2] === AGY_PY) {
+      const calls = JSON.parse(e.argv[3] ?? '[]') as { callId: string; name: string }[]
+      const rows = calls.map(c => ({
+        callId: c.callId,
+        name: c.name,
+        steps: [{ type: 132, runs: ['call_1', 'edit_file', '{"Path":"/w/proj/src/a.ts"}'] }],
+        stepsTotal: 1,
+        dbs: [{ path: '/c.db', mtime: 1, matched: true }],
+        verifyPending: true,
+      }))
+      return { value: { exitCode: 0, stdout: JSON.stringify(rows), stderr: '' } } as never
+    }
+    if (e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(3_600_000)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  // A tool.call carries its input on the event itself, as the engine's do.
+  await $.tool.call({ tool: 'Bash', command: 'python3 agy-job.py run --job verify --repo /w/proj --model sonnet --effort high', tool_use_id: 'b1' } as never)
+  await clock.advance(3_000)
+  await Promise.resolve()
+  await Promise.resolve()
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui.find({ text: /◇verify ▸ agy Sonnet high/ })).toBeDefined()
+  expect(await ui.find({ text: /^verify pending$/ })).toBeDefined()
+  expect(spillsOf(await ui.drawn(), 64)).toEqual([])
+  await ui.unmount()
+})
+
+test('the receipt lists the turn jobs and panel run, four job rows then +N more, and only the summary when narrow', { options: { panels: 'main,receipt,consult,log' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  let startedAt = 0
+  on('process.run', async (_$, e) => {
+    if (e.argv[2] === JOBS_PY) {
+      const jobs = Array.from({ length: 5 }, (_, i) => ({
+        jobid: `j${i}`,
+        job: `job-${i}`,
+        status: i === 0 ? 'running' : 'done',
+        ts: (startedAt + 60_000) / 1000,
+        endedAt: i === 0 ? null : startedAt + 120_000,
+        ...(i === 0 ? {} : { handoff: { backend: 'agy:gemini-4-hydrogen-high', ds: 'wall=60s cost_cny_est=0 tokens=in=1000 cache=0 out=2000 think=0' } }),
+      }))
+      return { value: { exitCode: 0, stdout: JSON.stringify(jobs), stderr: '' } } as never
+    }
+    return {
+      value: { exitCode: 0, stdout: JSON.stringify({ run: makeRun({ startedAt: startedAt + 60_000, endedAt: startedAt + 120_000 }), locks: {} }), stderr: '' },
+    } as never
+  })
+  await clock.advance(3_600_000)
+  startedAt = 3_600_000
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'go', turnId: 'R' })
+  await clock.advance(120_000)
+  await $.turn.complete({ answer: '', durationMs: 120_000, isAborted: false, turnId: 'R', reason: 'answer' })
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui.find({ text: /last turn 2m00s · 0 agents · 5 jobs · 1 panel · 0 edits · 0 errors/ })).toBeDefined()
+  // The running job keeps its clock and shows no tokens; the ended ones carry the handoff's.
+  expect(await ui.find({ key: 'receipt-clock-job:j0' })).toBeDefined()
+  expect(await ui.find({ text: /job-1/ })).toBeDefined()
+  expect(await ui.find({ text: /▸ Hydrogen high/ })).toBeDefined()
+  expect(await ui.find({ text: /1k→2k/ })).toBeDefined()
+  expect(await ui.find({ text: /^free$/ })).toBeDefined()
+  expect(await ui.find({ text: /^\+1 more$/ })).toBeDefined()
+  expect(await ui.find({ text: /◎ panel consult R1  1\/5 answered · 1 failed · 1m00s/ })).toBeDefined()
+  await ui.unmount()
+  const narrow = await $.ui.mount({ ...pane(36), surface: 'terminal' })
+  expect(await narrow.find({ text: /last turn 2m00s · 0 agents · 5 jobs · 1 panel/ })).toBeDefined()
+  expect(await narrow.find({ text: /^\+1 more$/ })).toBeUndefined()
+  expect(await narrow.find({ text: /◎ panel/ })).toBeUndefined()
+  await narrow.unmount()
+})
+
+test('the jobs probe polls every 3 s while a job is live and every 20 s otherwise, once at a time, silently', { options: { panels: 'main,agents' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  let polls = 0
+  let mode: 'live' | 'idle' | 'error' | 'hang' = 'live'
+  let release: () => void = () => {}
+  on('process.run', async (_$, e) => {
+    if (e.argv[2] !== JOBS_PY) return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+    polls += 1
+    if (mode === 'error') return { value: { exitCode: 1, stdout: '', stderr: 'boom' } } as never
+    if (mode === 'hang') {
+      await new Promise<void>(resolve => {
+        release = resolve
+      })
+      return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    }
+    const rows = mode === 'live' ? [{ jobid: 'j', job: 'j', status: 'running', ts: 0, pid: 1 }] : []
+    return { value: { exitCode: 0, stdout: JSON.stringify(rows), stderr: '' } } as never
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  expect(polls).toBe(1)
+  await clock.advance(2_000)
+  expect(polls).toBe(1)
+  await clock.advance(1_000)
+  expect(polls).toBe(2) // 3 s while live
+  mode = 'hang'
+  await clock.advance(3_000)
+  expect(polls).toBe(3)
+  await clock.advance(3_000)
+  expect(polls).toBe(3) // in flight: the tick is skipped
+  release()
+  await Promise.resolve()
+  await Promise.resolve()
+  mode = 'idle'
+  await clock.advance(3_000)
+  expect(polls).toBe(3) // not 20 s yet
+  await clock.advance(17_000)
+  expect(polls).toBe(4)
+  mode = 'error'
+  await clock.advance(20_000)
+  expect(polls).toBe(5)
+  // The last good rows stayed; no error reached the pane.
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui.find({ text: /agents ·/ })).toBeUndefined()
+  await ui.unmount()
 })
