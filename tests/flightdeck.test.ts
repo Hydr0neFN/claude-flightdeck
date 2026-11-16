@@ -2907,6 +2907,8 @@ test('a worker hangs under its task: a sub-main brief names it, main takes the d
     { id: 't5', status: 'todo', subject: '' },
   ])
   expect(parseMeshTasks(JSON.stringify({ tasks: [{ id: 't9', status: 'doing', subject: 'ship' }] }))).toEqual([{ id: 't9', status: 'doing', subject: 'ship' }])
+  // The mesh task_* tools name the text `title`.
+  expect(parseMeshTasks(JSON.stringify({ items: [{ id: 't2', status: 'doing', title: 'demo box' }] }))).toEqual([{ id: 't2', status: 'doing', subject: 'demo box' }])
   expect(parseMeshTasks('not json')).toEqual([])
   expect(parseMeshTasks('{}')).toEqual([])
 })

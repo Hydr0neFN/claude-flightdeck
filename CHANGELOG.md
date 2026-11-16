@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.3
+
+- Mesh task rows show their text again: the `task_*` tools name it `title`, and the parser read only `subject`, so a row drew as a bare `t2`.
+
 ## 0.8.2
 
 - A worker line's clock sits at the right edge, in one column with its box header's clock.

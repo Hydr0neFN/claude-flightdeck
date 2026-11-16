@@ -2002,7 +2002,7 @@ export const parseMeshTasks = (stdout: string): MeshTask[] => {
   }
   if (isObject(raw)) raw = listOf<unknown>(raw.tasks).length > 0 ? raw.tasks : raw.items
   if (!Array.isArray(raw)) return []
-  return raw.filter(isObject).map(x => ({ id: strOf(x.id), status: strOf(x.status), subject: strOf(x.subject) }))
+  return raw.filter(isObject).map(x => ({ id: strOf(x.id), status: strOf(x.status), subject: strOf(x.subject) || strOf(x.title) }))
 }
 
 /** The `task: t<N>` a sub-main's brief names, '' when none. */
