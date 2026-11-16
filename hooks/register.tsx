@@ -25,6 +25,7 @@ import {
   workRows,
   DEFAULT_ARCHITECT,
   addCard,
+  cardForTaskStop,
   resumeCard,
   DEFAULT_GATE,
   DEFAULT_MAIN,
@@ -655,6 +656,39 @@ async function noteCheckpoint($: EngineInterface, id: string, tail: CheckpointTa
   await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(c => (c.id === id ? { ...c, check: tail } : c)))
 }
 
+/** Marks a card ended (by `turn.complete` or `TaskStop`), reads its final checkpoint, logs and updates status. */
+async function finishCard(
+  $: EngineInterface,
+  cfg: Config,
+  checkLock: CheckpointLock,
+  card: AgentCard,
+  status: string,
+  at: number,
+  opts: { answer?: string; checkpoint?: string; note?: string } = {},
+) {
+  const checkpoint = opts.checkpoint ?? card.checkpoint
+  const answer = opts.answer !== undefined ? shorten(opts.answer, 400) : card.answer
+  await update($, agents, list =>
+    listOf<unknown>(list)
+      .map(normalizeCard)
+      .map(c => (c.id === card.id ? { ...c, status, endedAt: at, answer, checkpoint } : c)),
+  )
+  // One last read of the checkpoint, so an ended card shows its final status and tests.
+  if (checkpoint) {
+    let res: { exitCode: number; stdout: string } | null = null
+    for (const py of checkLock.python.length > 0 ? [checkLock.python] : PYTHON_CANDIDATES) {
+      res = await $.process.run(checkpointProbe(py, checkpoint), { timeoutMs: CHECKPOINT_TIMEOUT_MS }).catch(() => null)
+      if (res && res.exitCode === 0) {
+        checkLock.python = py
+        break
+      }
+    }
+    if (res && res.exitCode === 0) await noteCheckpoint($, card.id, parseCheckpoint(res.stdout))
+  }
+  await say($, await whoIs($, card.id), opts.note ?? status, status === 'done' ? 'done' : 'error', card.id)
+  await refreshStatus($, cfg)
+}
+
 export const register: Register = (on, options) => {
   const cfg = parseConfig(options)
   const C = PALETTES[cfg.palette]
@@ -1067,6 +1101,11 @@ export const register: Register = (on, options) => {
       if (isSettled) await refreshStatus($, cfg)
       return ran
     }
+    if (e.tool === 'TaskStop' && didRun && ran.isError !== true) {
+      const taskId = typeof input.task_id === 'string' ? input.task_id : ''
+      const card = taskId ? cardForTaskStop(await getCards($), taskId) : undefined
+      if (card) await finishCard($, cfg, checkLock, card, 'stopped', await $.clock.now())
+    }
     const hasFailed = didRun && ran.isError === true
     const isEdit = !hasFailed && didRun && EDIT_TOOLS.has(e.tool)
     const t0 = await getTurn($)
@@ -1192,29 +1231,12 @@ export const register: Register = (on, options) => {
       // The brief named no checkpoint, but the final message may: its HANDOFF: / REPORT: line.
       const cwd = !card.checkpoint && e.answer ? await $.session.cwd().catch(() => '') : ''
       const checkpoint = card.checkpoint || checkpointOfAnswer(e.answer, cwd)
-      await update($, agents, list =>
-        listOf<unknown>(list)
-          .map(normalizeCard)
-          .map(c => (c.id === id ? { ...c, status, endedAt: now, answer: shorten(e.answer, 400), checkpoint } : c)),
-      )
-      // One last read of the checkpoint, so an ended card shows its final status and tests.
-      if (checkpoint) {
-        let res: { exitCode: number; stdout: string } | null = null
-        for (const py of checkLock.python.length > 0 ? [checkLock.python] : PYTHON_CANDIDATES) {
-          res = await $.process.run(checkpointProbe(py, checkpoint), { timeoutMs: CHECKPOINT_TIMEOUT_MS }).catch(() => null)
-          if (res && res.exitCode === 0) {
-            checkLock.python = py
-            break
-          }
-        }
-        if (res && res.exitCode === 0) await noteCheckpoint($, id, parseCheckpoint(res.stdout))
-      }
       // This run's own length: a resumed agent's card clock also spans the idle time between runs.
       const took = fmtDuration(e.durationMs)
-      await say($, await whoIs($, id), status === 'done' ? `done · ${took}` : status, status === 'done' ? 'done' : 'error', id)
-    } else {
-      await update($, loops, l => listOf<Loop>(l).map(x => (x.id === id ? { ...x, isDone: true, lastAt: now } : x)))
+      await finishCard($, cfg, checkLock, card, status, now, { answer: e.answer, checkpoint, note: status === 'done' ? `done · ${took}` : status })
+      return done
     }
+    await update($, loops, l => listOf<Loop>(l).map(x => (x.id === id ? { ...x, isDone: true, lastAt: now } : x)))
     await refreshStatus($, cfg)
     return done
   })
@@ -1331,7 +1353,7 @@ export const register: Register = (on, options) => {
         <Text color={color}>{(span ? fmtSpan : fmtTimer)((endAt ?? now) - since)}</Text>
       )
 
-    // A work status as its colour: done green, running blue, failed red, waiting dim.
+    // A work status as its colour: done green, running blue, failed red, waiting faint.
     const toneOfStatus = (s: string) =>
       s === 'done' || s === 'ok'
         ? C.gate
@@ -1341,7 +1363,7 @@ export const register: Register = (on, options) => {
             ? C.warn
             : isRunningStatus(s)
               ? C.agent
-              : C.dim
+              : C.faint
 
     const isTerminal = e.surface === 'terminal'
     // A row of marks (gate checks, loop dots), sized by `marksIn`. Should a surface draw them wider
@@ -1870,7 +1892,9 @@ export const register: Register = (on, options) => {
       return (
         <Box key={`work-leaf-${l.id}`} width={w} columnGap={1} overflow="hidden">
           {prefix ? <Text color={C.faint}>{prefix}</Text> : null}
-          <Button key={`work-${l.id}`} plain label={l.glyph} onPress={expandOnPress(l.id)} />
+          <Button key={`work-${l.id}`} plain onPress={expandOnPress(l.id)}>
+            <Text color={toneOfStatus(l.status)}>{l.glyph}</Text>
+          </Button>
           <Box flexShrink={1}>
             <Text dimColor={done} wrap="truncate">{`${l.isRealRepo ? '◇' : ''}${l.name}${l.worker ? ` ▸ ${l.worker}` : ''}`}</Text>
           </Box>
@@ -1927,7 +1951,7 @@ export const register: Register = (on, options) => {
 
     const workBoxLine = (b: WorkBox, w: number) => (
       <Box key={`work-boxline-${b.id}`} width={w} columnGap={1} overflow="hidden">
-        <Text color={toneOfStatus(b.isLive ? 'running' : 'done')}>{b.glyph}</Text>
+        <Text color={toneOfStatus(b.status)}>{b.glyph}</Text>
         <Box flexShrink={1}>
           <Text bold wrap="truncate">{`${b.title} ${stripText(b.strip)}`}</Text>
         </Box>
@@ -1951,7 +1975,7 @@ export const register: Register = (on, options) => {
         >
           <Box justifyContent="space-between">
             <Box flexShrink={1} columnGap={1}>
-              <Text color={toneOfStatus(b.isLive ? 'running' : 'done')} bold>
+              <Text color={toneOfStatus(b.status)} bold>
                 {b.glyph}
               </Text>
               <Text bold wrap="truncate">{b.title}</Text>
@@ -1970,7 +1994,7 @@ export const register: Register = (on, options) => {
       if (fittedWork.collapsed || w < WORK_NARROW || workBudget < 3) {
         const lines = [
           <Box key="work-main-line" width={w} columnGap={1} overflow="hidden">
-            <Text color={toneOfStatus(fittedWork.isLive ? 'running' : 'done')}>{fittedWork.glyph}</Text>
+            <Text color={toneOfStatus(fittedWork.status)}>{fittedWork.glyph}</Text>
             <Box flexShrink={1}>
               <Text bold wrap="truncate">{`${fittedWork.title} ${stripText(fittedWork.strip)}`}</Text>
             </Box>
@@ -1985,7 +2009,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column" borderStyle="round" borderColor={C.main} borderDimColor={!fittedWork.isLive} paddingX={1} width={w}>
           <Box justifyContent="space-between">
             <Box flexShrink={1} columnGap={1}>
-              <Text color={toneOfStatus(fittedWork.isLive ? 'running' : 'done')} bold>
+              <Text color={toneOfStatus(fittedWork.status)} bold>
                 {fittedWork.glyph}
               </Text>
               <Text bold wrap="truncate">{fittedWork.title}</Text>

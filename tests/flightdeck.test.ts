@@ -120,16 +120,19 @@ import {
   CHECKPOINT_PY,
   COLLAPSE_AFTER_MS,
   CONSULT_PY,
+  DONE_KEEP_MS,
   MESH_PY,
   WORK_DETAIL_COLS,
   WORK_NARROW,
   WORK_STRIP_MAX,
   buildWork,
+  cardForTaskStop,
   checkpointOfAnswer,
   checkpointPath,
   checkpointProbe,
   fitWork,
   fmtSpan,
+  jobStartOf,
   treePrefixes,
   isWorkEmpty,
   normalizeCheckpoint,
@@ -1279,7 +1282,7 @@ const needs = (n: unknown, out: string[], path: string): number => {
   const p = n.props ?? {}
   const here = `${path}/${String(p.key ?? n.type)}`
   if (n.type === 'Text') return p.wrap === undefined ? cellsOf(textOf(n)) : p.wrap === 'wrap' ? longestWord(textOf(n)) : 1
-  if (n.type === 'Button') return cellsOf(String(p.label ?? '')) + (p.plain ? (p.hotkey ? 3 : 0) : 4)
+  if (n.type === 'Button') return cellsOf(p.label !== undefined ? String(p.label) : textOf(n)) + (p.plain ? (p.hotkey ? 3 : 0) : 4)
   if (n.type === 'Client') return typeof p.width === 'number' ? p.width : 5
   if (n.type !== 'Box') return 0
   const kids = (n.children ?? []).filter(c => c !== null && c !== undefined && c !== false && c !== '')
@@ -3144,7 +3147,7 @@ const workTreeInput = (now: number) => {
       job: 'receipt',
       status: 'done',
       ts: (now - 600_000) / 1000,
-      endedAt: now - 300_000,
+      endedAt: now - 60_000,
       handoff: { backend: 'azure:gpt-6.1-sol', files_changed: '4', ds: 'wall=246s cost_cny_est=0' },
     }),
   ]
@@ -3610,6 +3613,240 @@ test('checkpoint probes run every 10 s for a card with a checkpoint, one at a ti
   await ui.press({ key: 'work-b1' })
   expect(await ui.find({ text: /last {2}✔ step 1 read/ })).toBeDefined()
   expect(await ui.find({ text: /next {2}edit x/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('jobStartOf recovers local start time from the jobid suffix, else earliest mtime or ts', () => {
+  const ts = 1_700_000_000_000
+  const expected = new Date(2026, 10, 16, 22, 23, 57).getTime()
+  expect(jobStartOf('farmer-smoke-20261116-222357', ts)).toBe(expected)
+  expect(jobStartOf('farmer-smoke', ts)).toBe(ts)
+  expect(jobStartOf('bad-20261332-256161', ts)).toBe(ts)
+  expect(jobStartOf('farmer-smoke', ts, ts - 11_000)).toBe(ts - 11_000)
+  // A done job whose state.json ts was rewritten to its end still shows its real duration.
+  const end = expected + 11_000
+  const job = normalizeJob({ jobid: 'farmer-smoke-20261116-222357', job: 'farmer-smoke', status: 'done', ts: end / 1000, endedAt: end })
+  const leaf = buildWork({ jobs: [job], issued: [], cards: [], tasks: [], run: null, now: end + 1_000 }).entries.find(e => e.kind === 'leaf')?.leaf
+  expect(leaf && fmtSpan((leaf.endedAt ?? 0) - leaf.startedAt)).toBe('11s')
+  expect(fmtSpan((jobLeaves([job], [], end + 1_000)[0]!.endedAt ?? 0) - jobLeaves([job], [], end + 1_000)[0]!.startedAt)).toBe('11s')
+  expect(turnJobs([job], [], expected - 1_000, end + 1_000).length).toBe(1)
+  // Without a suffix, the probe mtime breaks the 0s tie against rewritten ts.
+  const noSuffix = normalizeJob({ jobid: 'plain', job: 'plain', status: 'done', ts: end / 1000, endedAt: end, mtime: expected })
+  expect(jobLeaves([noSuffix], [], end + 1_000)[0]?.startedAt).toBe(expected)
+})
+
+test('glyph Text inside the leaf Button carries the status colour (running vs done differ)', { options: { panels: 'main,work' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  const jobs = [
+    { jobid: 'jrun', job: 'run-job', status: 'running', ts: (JOBS_NOW - 10_000) / 1000, pid: 1 },
+    { jobid: 'jdone', job: 'done-job', status: 'done', ts: (JOBS_NOW - 40_000) / 1000, endedAt: JOBS_NOW - 20_000 },
+    { jobid: 'jfail', job: 'fail-job', status: 'failed', ts: (JOBS_NOW - 40_000) / 1000, endedAt: JOBS_NOW - 20_000 },
+    { jobid: 'jdry', job: 'dry-job', status: 'dry', ts: (JOBS_NOW - 40_000) / 1000, endedAt: JOBS_NOW - 20_000 },
+  ]
+  on('process.run', (_$, e) => {
+    if (e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: JSON.stringify(jobs), stderr: '' } } as never
+    if (e.argv[2] === MESH_PY) return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.agent.spawn({ ...spawn('builder', 'stopped-card') } as never)
+  await $.turn.complete({ answer: '', durationMs: 5_000, isAborted: true, turnId: 'S1', agentId: 'a1', reason: 'aborted' })
+  const ui = await $.ui.mount({ ...pane(66), surface: 'terminal' })
+  const drawn = await ui.drawn()
+  const findButton = (n: unknown, key: string): Drawn | undefined => {
+    if (!isDrawn(n)) return undefined
+    if (n.type === 'Button' && n.props?.key === key) return n
+    for (const c of n.children ?? []) {
+      const hit = findButton(c, key)
+      if (hit) return hit
+    }
+    return undefined
+  }
+  const childText = (key: string) => {
+    const btn = findButton(drawn, key)
+    const kid = (btn?.children ?? []).find(isDrawn)
+    return { glyph: textOf(kid), color: kid?.props?.color }
+  }
+  expect(childText('work-job:jrun')).toEqual({ glyph: '◐', color: PALETTES.theme.agent })
+  expect(childText('work-job:jdone')).toEqual({ glyph: '●', color: PALETTES.theme.gate })
+  expect(childText('work-job:jfail')).toEqual({ glyph: '✗', color: PALETTES.theme.warn })
+  expect(childText('work-job:jdry')).toEqual({ glyph: '○', color: PALETTES.theme.faint })
+  expect(childText('work-a1')).toEqual({ glyph: '◑', color: PALETTES.theme.amber })
+  expect(childText('work-job:jrun').color).not.toBe(childText('work-job:jdone').color)
+  expect(spillsOf(drawn, 66)).toEqual([])
+  await ui.unmount()
+})
+
+test('TaskStop with a matching task_id ends the card as stopped', { options: { panels: 'main,work,log' } }, async ($, on) => {
+  // Pure matcher covers id, name (type) and description, skipping already-ended cards.
+  const r1 = normalizeCard({ id: 'id-1', type: 'demo', description: 'Flightdeck sub-main demo', status: 'running' })
+  const r2 = normalizeCard({ id: 'id-2', type: 'builder', description: 'second worker', status: 'done', endedAt: 100 })
+  expect(cardForTaskStop([r2, r1], 'id-1')?.id).toBe('id-1')
+  expect(cardForTaskStop([r2, r1], 'demo')?.id).toBe('id-1')
+  expect(cardForTaskStop([r2, r1], 'Flightdeck sub-main demo')?.id).toBe('id-1')
+  expect(cardForTaskStop([r2, r1], 'second worker')).toBeUndefined()
+
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a-demo' }))
+  on('tool.call', () => ({ result: {}, text: 'stopped' }))
+  const tasks = [
+    { id: 't1', status: 'done', subject: 'one' },
+    { id: 't2', status: 'done', subject: 'two' },
+    { id: 't3', status: 'todo', subject: 'three' },
+  ]
+  on('process.run', (_$, e) => {
+    if (e.argv[2] === MESH_PY) return { value: { exitCode: 0, stdout: JSON.stringify(tasks), stderr: '' } } as never
+    if (e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.agent.spawn({ ...spawn('sub-main', 'Flightdeck sub-main demo'), name: 'demo' } as never)
+  await clock.advance(30_000)
+  await $.tool.call({ tool: 'TaskStop', task_id: 'demo' } as never)
+
+  const ui = await $.ui.mount({ ...pane(66), surface: 'terminal' })
+  const stopGlyph = await ui.find({ type: 'Text', text: /^◑$/ })
+  expect(stopGlyph?.props.color).toBe(PALETTES.theme.amber)
+  // Header stays ○ while 2/3 are done, t3 is to-do and nothing runs.
+  const headGlyph = await ui.find({ type: 'Text', text: /^○$/ })
+  expect(headGlyph?.props.color).toBe(PALETTES.theme.faint)
+  expect(await ui.find({ text: /Flightdeck sub-main demo/ })).toBeDefined()
+  await ui.unmount()
+
+  // Past DONE_KEEP_MS the stopped leaf drops from the tree.
+  await clock.advance(DONE_KEEP_MS + 1_000)
+  const later = await $.ui.mount({ ...pane(66), surface: 'terminal' })
+  expect(await later.find({ text: /Flightdeck sub-main demo/ })).toBeUndefined()
+  await later.unmount()
+})
+
+test('an ended leaf is drawn at now = end + 60 s and gone at end + 121 s; a done box likewise', () => {
+  const end = 1_000_000
+  const tasks = [
+    { id: 't1', status: 'done', subject: 'one' },
+    { id: 't2', status: 'doing', subject: 'two' },
+    { id: 't3', status: 'todo', subject: 'three' },
+  ]
+  const jobs = [
+    normalizeJob({ jobid: 'jdone', job: 'done-job', status: 'done', ts: (end - 30_000) / 1000, endedAt: end }),
+  ]
+  const issued = normalizeIssued([
+    { callId: 'cj', kind: 'job', agentId: '', at: end - 30_000, task: 't1', jobid: 'jdone' },
+    { callId: 'ca', kind: 'agy', agentId: '', at: end - 30_000, endedAt: end, ok: true, name: 'agy-one' },
+    { callId: 'cc', kind: 'consult', agentId: '', at: end - 30_000, endedAt: end, runId: 'r1' },
+  ])
+  const run = makeRun({ kind: 'all', round: 1, startedAt: end - 30_000, endedAt: end }) as never
+  const cards = [
+    normalizeCard({ id: 'sm', type: 'sub-main', status: 'done', spawnedAt: end - 40_000, endedAt: end }),
+    normalizeCard({ id: 'b', type: 'builder', status: 'done', spawnedAt: end - 30_000, endedAt: end, parentId: 'sm' }),
+    normalizeCard({ id: 'solo', type: 'builder', status: 'done', spawnedAt: end - 30_000, endedAt: end }),
+  ]
+  // At end + 60 s: all four leaf kinds and the box (not yet collapsed) remain drawn.
+  const at60 = buildWork({ jobs, issued, cards, tasks, run, now: end + 60_000 })
+  expect(DONE_KEEP_MS).toBe(120_000)
+  expect(at60.entries.filter(e => e.kind === 'leaf').map(e => e.leaf?.kind).sort()).toEqual(['agy', 'card', 'consult', 'job'])
+  expect(at60.entries.some(e => e.kind === 'task' && e.text === 't1 one')).toBe(true)
+  expect(at60.boxes.length).toBe(1)
+  expect(at60.boxes[0]?.collapsed).toBe(false)
+  // At end + 61 s .. 120 s: the box stays in its collapsed one-line form.
+  const at61 = buildWork({ jobs, issued, cards, tasks, run, now: end + 61_000 })
+  expect(at61.boxes.length).toBe(1)
+  expect(at61.boxes[0]?.collapsed).toBe(true)
+  // At end + 121 s: ended leaves, the done box, and the done task row are all gone; probe & receipt still keep the job.
+  const at121 = buildWork({ jobs, issued, cards, tasks, run, now: end + 121_000 })
+  expect(at121.entries.some(e => e.kind === 'leaf')).toBe(false)
+  expect(at121.boxes.length).toBe(0)
+  expect(at121.entries.some(e => e.kind === 'task' && e.text === 't1 one')).toBe(false)
+  expect(orderJobs(jobs, end + 121_000).length).toBe(1)
+  expect(turnJobs(jobs, issued, end - 40_000, end + 121_000).length).toBe(2)
+
+  // Task ordering: doing tasks first, then todo with leaves, then done with kept leaves.
+  const ordered = buildWork({
+    jobs: [
+      normalizeJob({ jobid: 'jd', job: 'd', status: 'done', ts: 1, endedAt: end }),
+      normalizeJob({ jobid: 'jt', job: 't', status: 'running', ts: 2 }),
+      normalizeJob({ jobid: 'jg', job: 'g', status: 'running', ts: 3 }),
+    ],
+    issued: normalizeIssued([
+      { callId: 'c1', kind: 'job', agentId: '', at: 1, task: 't1', jobid: 'jd' },
+      { callId: 'c2', kind: 'job', agentId: '', at: 2, task: 't3', jobid: 'jt' },
+      { callId: 'c3', kind: 'job', agentId: '', at: 3, task: 't2', jobid: 'jg' },
+    ]),
+    cards: [],
+    tasks,
+    run: null,
+    now: end + 30_000,
+  })
+  expect(ordered.entries.filter(e => e.kind === 'task').map(e => e.text)).toEqual(['t2 two', 't3 three', 't1 one'])
+})
+
+test('all tasks done, nothing live: body is all done · 3 tasks', { options: { panels: 'main,work' } }, async ($, on) => {
+  const now = 2_000_000
+  const allDoneTasks = [
+    { id: 't1', status: 'done', subject: 'one' },
+    { id: 't2', status: 'done', subject: 'two' },
+    { id: 't3', status: 'done', subject: 'three' },
+  ]
+  const doneTree = buildWork({ jobs: [], issued: [], cards: [], tasks: allDoneTasks, run: null, now })
+  expect(doneTree.glyph).toBe('●')
+  expect(doneTree.status).toBe('done')
+  expect(stripText(doneTree.strip)).toBe('●●● 3/3')
+  expect(doneTree.entries).toEqual([{ kind: 'closing', depth: 0, text: 'all done · 3 tasks' }])
+  expect(isWorkEmpty(doneTree)).toBe(false)
+
+  // Header glyph is ◐ while anything is live even when every task is done or t3 is todo.
+  const liveJob = normalizeJob({ jobid: 'jl', job: 'live', status: 'running', ts: (now - 10_000) / 1000, pid: 1 })
+  expect(buildWork({ jobs: [liveJob], issued: [], cards: [], tasks: allDoneTasks, run: null, now }).glyph).toBe('◐')
+  expect(
+    buildWork({
+      jobs: [liveJob],
+      issued: [],
+      cards: [],
+      tasks: [allDoneTasks[0]!, allDoneTasks[1]!, { id: 't3', status: 'todo', subject: 'three' }],
+      run: null,
+      now,
+    }).glyph,
+  ).toBe('◐')
+  expect(
+    buildWork({
+      jobs: [],
+      issued: [],
+      cards: [],
+      tasks: [allDoneTasks[0]!, allDoneTasks[1]!, { id: 't3', status: 'todo', subject: 'three' }],
+      run: null,
+      now,
+    }).glyph,
+  ).toBe('○')
+
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('process.run', (_$, e) => {
+    if (e.argv[2] === MESH_PY) return { value: { exitCode: 0, stdout: JSON.stringify(allDoneTasks), stderr: '' } } as never
+    if (e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...pane(66), surface: 'terminal' })
+  const headerGlyph = await ui.find({ type: 'Text', text: /^●$/ })
+  expect(headerGlyph?.props.color).toBe(PALETTES.theme.gate)
+  const bodyLine = await ui.find({ text: /^all done · 3 tasks$/ })
+  expect(bodyLine?.props.dimColor).toBe(true)
+  expect(spillsOf(await ui.drawn(), 66)).toEqual([])
   await ui.unmount()
 })
 

@@ -447,7 +447,7 @@ export const jobLeaves = (jobs: readonly Job[], issued: readonly Issued[], now: 
       worker: workerDisplay(worker),
       glyph: jobGlyph(j),
       detail: live && j.status === 'running' ? [j.now, j.work].filter(Boolean).join(' · ') : '',
-      startedAt: j.ts * 1000,
+      startedAt: jobStartOf(j.jobid, j.ts * 1000),
       endedAt: live ? null : j.endedAt,
       isLive: live,
       isRealRepo: false,
@@ -933,7 +933,7 @@ export type TurnJob = {
 export const turnJobs = (jobs: readonly Job[], issued: readonly Issued[], since: number, end: number): TurnJob[] => {
   const out: TurnJob[] = []
   for (const j of jobs) {
-    const startedAt = j.ts * 1000
+    const startedAt = jobStartOf(j.jobid, j.ts * 1000)
     if (startedAt < since || startedAt > end) continue
     const live = isJobLive(j)
     out.push({
@@ -1024,6 +1024,19 @@ export const addCard = (cards: AgentCard[], card: AgentCard): AgentCard[] =>
   cards.some(c => c.id === card.id)
     ? cards.map(c => (c.id === card.id ? resumeCard({ ...c, description: card.description || c.description, model: card.model || c.model }) : c))
     : [...cards, card].slice(-24)
+
+/**
+ * The running card a `TaskStop` call's `task_id` names: an exact id match first, else the newest
+ * running card whose name (`type`) or `description` matches.
+ */
+export const cardForTaskStop = (cards: readonly AgentCard[], taskId: string): AgentCard | undefined => {
+  const id = taskId.trim()
+  if (!id) return undefined
+  return (
+    cards.find(c => c.status === 'running' && c.id === id) ??
+    [...cards].reverse().find(c => c.status === 'running' && (c.type === id || c.description === id))
+  )
+}
 
 export const stepLoop = (loops: Loop[], id: string, at: number): Loop[] => {
   const found = loops.find(l => l.id === id)
@@ -1545,6 +1558,12 @@ def main():
    mt = os.stat(sp).st_mtime
   except Exception:
    continue
+  start_mt = mt
+  for p in (d, os.path.join(d, "job.log"), os.path.join(d, "base")):
+   try:
+    start_mt = min(start_mt, os.stat(p).st_mtime)
+   except Exception:
+    pass
   state = {}
   try:
    with open(sp, "r", encoding="utf-8", errors="replace") as fh:
@@ -1568,7 +1587,7 @@ def main():
   fields = handoff_of(handoff)
   log = read_text(os.path.join(d, "job.log"), 65536)
   tree = tree_of(d, jobid, state, log)
-  job = {"jobid": jobid, "job": str(state.get("job") or jobid), "status": status, "ts": ts, "pid": pid or None, "backend": str(state.get("backend") or ""), "tier": str(state.get("tier") or ""), "profile": str(state.get("profile") or ""), "phase": str(state.get("phase") or ""), "rc": rc, "dir": d, "tree": tree, "live": live, "stale": False, "endedAt": None if live else int(mt * 1000), "mtime": int(mt * 1000), "trying": trying, "stageLines": stage_lines(log), "hasTrying": bool(trying), "hasHandoff": bool(handoff.strip()), "handoff": {"backend": fields.get("backend", ""), "files_changed": fields.get("files_changed", ""), "ds": fields.get("ds", ""), "not_verified": fields.get("not_verified", "")}}
+  job = {"jobid": jobid, "job": str(state.get("job") or jobid), "status": status, "ts": ts, "pid": pid or None, "backend": str(state.get("backend") or ""), "tier": str(state.get("tier") or ""), "profile": str(state.get("profile") or ""), "phase": str(state.get("phase") or ""), "rc": rc, "dir": d, "tree": tree, "live": live, "stale": False, "endedAt": None if live else int(mt * 1000), "mtime": int(start_mt * 1000), "trying": trying, "stageLines": stage_lines(log), "hasTrying": bool(trying), "hasHandoff": bool(handoff.strip()), "handoff": {"backend": fields.get("backend", ""), "files_changed": fields.get("files_changed", ""), "ds": fields.get("ds", ""), "not_verified": fields.get("not_verified", "")}}
   job["stale"] = bool(live and status == "running" and not (pid and alive(pid)))
   if live and (job["stale"] or not (pid and alive(pid))) and time.time() - mt > 1800:
    continue
@@ -1775,6 +1794,37 @@ const agyStepsOf = (raw: unknown): AgyStep[] =>
     .filter(isObject)
     .map(s => ({ type: numOf(s.type), runs: listOf<unknown>(s.runs).filter((r): r is string => typeof r === 'string').slice(0, 40) }))
 
+/**
+ * A job's start time in ms: the local time encoded in a `-YYYYMMDD-HHMMSS` jobid suffix when it
+ * parses, else the earliest of `ts` and the probe's `mtime` (when positive), else `ts`.
+ */
+export const jobStartOf = (jobid: string, ts: number, mtime?: number | null): number => {
+  const m = /(?:^|-)(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/.exec(jobid)
+  if (m) {
+    const y = Number(m[1])
+    const mo = Number(m[2])
+    const d = Number(m[3])
+    const H = Number(m[4])
+    const M = Number(m[5])
+    const S = Number(m[6])
+    const dt = new Date(y, mo - 1, d, H, M, S)
+    if (
+      dt.getFullYear() === y &&
+      dt.getMonth() === mo - 1 &&
+      dt.getDate() === d &&
+      dt.getHours() === H &&
+      dt.getMinutes() === M &&
+      dt.getSeconds() === S
+    ) {
+      return dt.getTime()
+    }
+  }
+  if (typeof mtime === 'number' && Number.isFinite(mtime) && mtime > 0) {
+    return ts > 0 ? Math.min(ts, mtime) : mtime
+  }
+  return ts
+}
+
 /** A probe row as a Job, its live rows parsed from the agy blobs it carried. */
 export const normalizeJob = (raw: unknown): Job => {
   const j = isObject(raw) ? raw : {}
@@ -1791,11 +1841,14 @@ export const normalizeJob = (raw: unknown): Job => {
   const dbs = listOf<unknown>(j.dbs)
     .filter(isObject)
     .map(d => ({ path: strOf(d.path), mtime: numOf(d.mtime), matched: d.matched === true }))
+  const rawTs = numOf(j.ts)
+  const probeMt = typeof j.mtime === 'number' && Number.isFinite(j.mtime) && j.mtime > 0 ? j.mtime : 0
+  const ts = probeMt > 0 ? (rawTs > 0 ? Math.min(rawTs, probeMt / 1000) : probeMt / 1000) : rawTs
   return {
     jobid: strOf(j.jobid),
     job: strOf(j.job),
     status: strOf(j.status),
-    ts: numOf(j.ts),
+    ts,
     pid: typeof j.pid === 'number' && j.pid > 0 ? j.pid : null,
     backend: strOf(j.backend),
     tier: strOf(j.tier),
@@ -2207,6 +2260,9 @@ export const checkpointOfAnswer = (answer: string, cwd: string): string => {
 /** A box whose work is all done collapses to its header line this long after the last end. */
 export const COLLAPSE_AFTER_MS = 60_000
 
+/** An ended leaf or done box stays in the tree this long after its end, then drops out. */
+export const DONE_KEEP_MS = 120_000
+
 /** Under 56 columns the tree leaves out its live detail lines. */
 export const WORK_DETAIL_COLS = 56
 
@@ -2244,7 +2300,7 @@ export const sumStatus = (statuses: readonly string[]): string =>
     ? 'running'
     : statuses.some(s => s === 'failed' || s === 'refused')
       ? 'failed'
-      : statuses.some(s => s === 'partial')
+      : statuses.some(s => s === 'partial' || s === 'stopped')
         ? 'partial'
         : statuses.length > 0 && statuses.every(s => s === 'done' || s === 'ok')
           ? 'done'
@@ -2365,6 +2421,7 @@ export type WorkBox = {
   id: string
   title: string
   glyph: string
+  status: string
   strip: WorkStrip
   startedAt: number
   endedAt: number | null
@@ -2377,6 +2434,7 @@ export type WorkBox = {
 export type WorkTree = {
   title: string
   glyph: string
+  status: string
   strip: WorkStrip
   startedAt: number
   endedAt: number | null
@@ -2409,7 +2467,7 @@ const jobWorkLeaf = (j: Job, issued: readonly Issued[]): WorkLeaf => {
     worker: workerDisplay(worker),
     note: '',
     status: j.status,
-    startedAt: j.ts * 1000,
+    startedAt: jobStartOf(j.jobid, j.ts * 1000),
     endedAt: live ? null : j.endedAt,
     isLive: live,
     isRealRepo: false,
@@ -2590,31 +2648,37 @@ export const buildWork = (input: WorkInput): WorkTree => {
     return ''
   }
 
-  const leaves: WorkLeaf[] = []
-  for (const j of orderJobs(input.jobs, now)) leaves.push(jobWorkLeaf(j, input.issued))
-  for (const i of input.issued) {
-    if (i.kind === 'agy' && (i.endedAt === null || now - i.endedAt <= AGY_SHOW_MS)) leaves.push(agyWorkLeaf(i))
-    if (i.kind === 'consult' && consultShown(i, input.run, now)) leaves.push(consultWorkLeaf(i, input.run))
-  }
-  for (const c of cards) if (!hasKids(c.id)) leaves.push(cardWorkLeaf(c))
+  const keepLeaf = (l: WorkLeaf): boolean => l.isLive || l.endedAt === null || now - l.endedAt <= DONE_KEEP_MS
 
-  const directOf = (id: string) => leaves.filter(l => l.owner === id)
+  const rawLeaves: WorkLeaf[] = []
+  for (const j of orderJobs(input.jobs, now)) rawLeaves.push(jobWorkLeaf(j, input.issued))
+  for (const i of input.issued) {
+    if (i.kind === 'agy' && (i.endedAt === null || now - i.endedAt <= DONE_KEEP_MS)) rawLeaves.push(agyWorkLeaf(i))
+    if (i.kind === 'consult' && consultShown(i, input.run, now)) rawLeaves.push(consultWorkLeaf(i, input.run))
+  }
+  for (const c of cards) if (!hasKids(c.id)) rawLeaves.push(cardWorkLeaf(c))
+
+  const leaves = rawLeaves.filter(keepLeaf)
+  const directOf = (id: string, src: readonly WorkLeaf[] = leaves) => src.filter(l => l.owner === id)
   /** A deeper coordinator's workers: its own and its descendants', not the root box's direct ones. */
-  const underOf = (id: string, root: string) => leaves.filter(l => l.owner !== root && chainOf(l.owner).includes(id))
+  const underOf = (id: string, root: string, src: readonly WorkLeaf[] = leaves) =>
+    src.filter(l => l.owner !== root && chainOf(l.owner).includes(id))
 
   const roots = cards.filter(c => hasKids(c.id) && boxOf(c.id) === c.id)
   const deeps = cards.filter(c => hasKids(c.id) && boxOf(c.id) !== c.id)
 
-  const endedAtOf = (ls: readonly WorkLeaf[]): number | null => {
-    const ends = ls.map(l => l.endedAt).filter((n): n is number => n !== null)
-    return ls.length > 0 && ends.length === ls.length ? Math.max(...ends) : null
-  }
-  const collapsedOf = (ls: readonly WorkLeaf[]) => {
-    const end = endedAtOf(ls)
-    return end !== null && ls.length > 0 && now - end > COLLAPSE_AFTER_MS
-  }
+  const subBox = (c: AgentCard): WorkBox | null => {
+    const boxDeeps = deeps.filter(x => boxOf(x.id) === c.id)
+    const rawAll = [...directOf(c.id, rawLeaves), ...boxDeeps.flatMap(d => underOf(d.id, c.id, rawLeaves))]
+    const isBoxLive = c.status === 'running' || rawAll.some(l => l.isLive) || boxDeeps.some(d => d.status === 'running')
+    let boxEnd: number | null = null
+    if (!isBoxLive) {
+      const ends = [c.endedAt, ...rawAll.map(l => l.endedAt), ...boxDeeps.map(d => d.endedAt)].filter((n): n is number => n !== null)
+      if (rawAll.every(l => l.endedAt !== null) && ends.length > 0) boxEnd = Math.max(...ends)
+    }
+    if (boxEnd !== null && now - boxEnd > DONE_KEEP_MS) return null
+    const collapsed = boxEnd !== null && now - boxEnd > COLLAPSE_AFTER_MS
 
-  const subBox = (c: AgentCard): WorkBox => {
     const workers = orderWorkLeaves(directOf(c.id))
     const check = c.check
     const steps = check?.steps ?? []
@@ -2636,30 +2700,37 @@ export const buildWork = (input: WorkInput): WorkTree => {
     const moreDone = Math.max(0, doneWorkers.length - 2)
     const moreSteps = Math.max(0, steps.length - 2)
     if (moreDone + moreSteps > 0) entries.push({ kind: 'more', depth: 0, count: moreDone + moreSteps })
-    for (const d of deeps.filter(x => boxOf(x.id) === c.id)) {
-      const dl = coordWorkLeaf(d, underOf(d.id, c.id))
+    for (const d of boxDeeps) {
+      const keptUnder = underOf(d.id, c.id)
+      const rawUnder = underOf(d.id, c.id, rawLeaves)
+      const dLive = d.status === 'running' || rawUnder.some(l => l.isLive)
+      const dEnds = [d.endedAt, ...rawUnder.map(l => l.endedAt)].filter((n): n is number => n !== null)
+      const dEnd = !dLive && rawUnder.every(l => l.endedAt !== null) && dEnds.length > 0 ? Math.max(...dEnds) : null
+      if (dEnd !== null && now - dEnd > DONE_KEEP_MS) continue
+      const dl = coordWorkLeaf(d, keptUnder)
       entries.push({ kind: 'leaf', depth: 0, leaf: dl, done: !dl.isLive })
     }
+    if (!isBoxLive && entries.length === 0 && !collapsed) return null
     const startedEnds = [c.spawnedAt, ...workers.map(w => w.startedAt)].filter(n => n > 0)
-    const end = endedAtOf(workers)
-    const status = sumStatus(statuses)
+    const boxStatus = isBoxLive ? 'running' : sumStatus(statuses)
     return {
       id: c.id,
       title: `${c.type || 'sub-main'}${c.task ? ` · ${c.task}` : ''}`,
-      glyph: workGlyph(status),
+      glyph: workGlyph(boxStatus),
+      status: boxStatus,
       strip: stripOf(statuses),
       startedAt: startedEnds.length > 0 ? Math.min(...startedEnds) : 0,
-      endedAt: end,
-      isLive: workers.some(w => w.isLive) || c.status === 'running',
+      endedAt: boxEnd,
+      isLive: isBoxLive,
       last: check?.last ?? '',
       entries,
-      collapsed: collapsedOf(workers),
+      collapsed,
     }
   }
 
   const plan = input.tasks.filter(t => t.id)
   const taskById = new Map(plan.map(t => [t.id, t]))
-  const rank: Record<string, number> = { doing: 0, running: 0, todo: 1, blocked: 1, done: 2 }
+  const rank: Record<string, number> = { doing: 0, running: 0, todo: 1, blocked: 1, done: 2, ok: 2 }
   const tasks = [...plan].sort((a, b) => (rank[a.status] ?? 1) - (rank[b.status] ?? 1))
 
   const mainLeaves = orderWorkLeaves(leaves.filter(l => boxOf(l.owner) === ''))
@@ -2683,28 +2754,51 @@ export const buildWork = (input: WorkInput): WorkTree => {
     for (const l of orderWorkLeaves(ls)) entries.push(...entriesOf(l, 1, true, exp))
   }
   const boxes = [...roots]
-    .sort((a, b) => (rank[taskById.get(a.task)?.status ?? ''] ?? 1) - (rank[taskById.get(b.task)?.status ?? ''] ?? 1) || a.spawnedAt - b.spawnedAt)
     .map(subBox)
-    .filter(b => b.entries.length > 0 || b.collapsed)
+    .filter((b): b is WorkBox => b !== null)
+    .sort((a, b) => {
+      const ta = byId.get(a.id)?.task ?? ''
+      const tb = byId.get(b.id)?.task ?? ''
+      return (
+        Number(b.isLive) - Number(a.isLive) ||
+        (rank[taskById.get(ta)?.status ?? ''] ?? 1) - (rank[taskById.get(tb)?.status ?? ''] ?? 1) ||
+        (byId.get(a.id)?.spawnedAt ?? 0) - (byId.get(b.id)?.spawnedAt ?? 0)
+      )
+    })
   for (const b of boxes) entries.push({ kind: 'box', depth: 0, box: b })
   for (const l of loose) entries.push(...entriesOf(l, 0, true, exp))
   const rest = tasks.filter(t => !used.has(t.id) && (t.status === 'todo' || t.status === 'blocked'))
   if (rest.length > 0) entries.push({ kind: 'closing', depth: 0, text: rest.map(t => `○ ${t.id}${t.subject ? ` ${shorten(t.subject, 18)}` : ''}`).join(' · ') })
 
-  const all = [...leaves]
-  const starts = all.map(l => l.startedAt).filter(n => n > 0)
+  const isLive = leaves.some(l => l.isLive) || boxes.some(b => b.isLive)
+  const allTasksDone = plan.length > 0 && plan.every(t => t.status === 'done' || t.status === 'ok')
+  const anyTaskDoing = plan.some(t => isRunningStatus(t.status))
+  if (allTasksDone && !isLive && entries.length === 0 && boxes.length === 0) {
+    entries.push({ kind: 'closing', depth: 0, text: `all done · ${plural(plan.length, 'task')}` })
+  }
+
+  const starts = [...leaves.map(l => l.startedAt), ...boxes.map(b => b.startedAt)].filter(n => n > 0)
+  const ends = [...leaves.map(l => l.endedAt), ...boxes.map(b => b.endedAt)]
+  const endedAll = !isLive && ends.length > 0 && ends.every((n): n is number => n !== null) ? Math.max(...ends) : null
   const stripStatuses = plan.length > 0 ? plan.map(t => t.status) : mainLeaves.map(l => l.status)
+  const allDone =
+    plan.length > 0
+      ? allTasksDone
+      : stripStatuses.length > 0
+        ? stripStatuses.every(s => s === 'done' || s === 'ok')
+        : boxes.length > 0 && boxes.every(b => b.status === 'done' || b.status === 'ok')
+  const treeStatus = isLive || anyTaskDoing ? 'running' : allDone ? 'done' : 'todo'
   return {
     title: "WORK · main's tasks",
-    glyph: workGlyph(sumStatus(stripStatuses)),
+    glyph: workGlyph(treeStatus),
+    status: treeStatus,
     strip: stripOf(stripStatuses),
     startedAt: starts.length > 0 ? Math.min(...starts) : 0,
-    endedAt: endedAtOf(all),
-    isLive: all.some(l => l.isLive),
+    endedAt: endedAll,
+    isLive,
     entries,
     boxes,
-    // Main keeps its plan visible while a task is still to do, however long its workers have been gone.
-    collapsed: collapsedOf(all) && !plan.some(t => isTodoStatus(t.status) || isRunningStatus(t.status)),
+    collapsed: false,
   }
 }
 

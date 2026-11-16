@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.4
+
+- Leaf glyphs in the `work` tree draw inside the `Button` as coloured `Text` (`agent` running, `gate` done, `amber` stopped/partial, `warn` failed, `faint` to-do).
+- Done job clocks recover their real start time from the `-YYYYMMDD-HHMMSS` jobid suffix (local time), falling back to the earliest of `ts` and the probe's `job.log` / dir `mtime` (`jobStartOf`), instead of `0s`.
+- `TaskStop` with a `task_id` ends the matching card (by id, name or description) as `stopped` (`◑`, amber) so stopped agents no longer stay `◐`.
+- Ended leaves and collapsed done boxes drop from the tree 2 minutes (`DONE_KEEP_MS`) after their end (kept in probes and the turn receipt); `done` mesh tasks draw no row once their leaves drop, and when every task is done and nothing is live the body shows `all done · <N> tasks`.
+- The work tree header draws `◐` while anything is live, `●` (gate colour) when every task is done and nothing is live, and `○` otherwise.
+
 ## 0.8.3
 
 - Mesh task rows show their text again: the `task_*` tools name it `title`, and the parser read only `subject`, so a row drew as a bare `t2`.
