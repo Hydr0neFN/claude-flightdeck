@@ -1877,6 +1877,8 @@ export const register: Register = (on, options) => {
           {l.note ? <Text dimColor wrap="truncate">{l.note}</Text> : null}
           {l.verifyPending ? <Text color={C.amber} wrap="truncate">verify pending</Text> : null}
           {cost ? <Text color={l.cost === 0 ? C.dim : C.agent} wrap="truncate">{cost}</Text> : null}
+          {/* The clock sits at the right edge, in one column with the box header's clock. */}
+          <Box flexGrow={1} />
           <Box flexShrink={0}>{workClock(`work-clock-${l.id}`, l.startedAt, l.endedAt)}</Box>
         </Box>
       )
@@ -2053,7 +2055,7 @@ export const register: Register = (on, options) => {
                         <Text color={color}>{p.glyph}</Text>
                         <Text wrap="truncate">{p.name}</Text>
                         {p.worker ? <Text color={C.dim} wrap="truncate">{`▸ ${p.worker}`}</Text> : null}
-                        {p.isLive ? <Box flexShrink={0}>{clock(`receipt-clock-${j.id}`, p.startedAt, null, C.dim)}</Box> : <Text dimColor>{p.duration}</Text>}
+                        {p.isLive ? <Box flexShrink={0}>{clock(`receipt-clock-${j.id}`, p.startedAt, null, C.dim, true)}</Box> : <Text dimColor>{p.duration}</Text>}
                         {p.tokens ? <Text dimColor>{p.tokens}</Text> : null}
                         {p.cost ? <Text color={j.cost === 0 ? C.dim : C.agent}>{p.cost}</Text> : null}
                       </Box>

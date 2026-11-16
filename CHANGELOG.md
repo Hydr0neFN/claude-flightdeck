@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.2
+
+- A worker line's clock sits at the right edge, in one column with its box header's clock.
+- A live job row on the turn receipt uses the compact clock (`25s`, `1m12s`) like the work tree.
+
 ## 0.8.1
 
 - Work tree clocks use the compact form (`16m`, `1m12s`, `1h05m`) in place of the card clock's `16:00`; the cards keep `m:ss`.
