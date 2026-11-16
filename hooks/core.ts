@@ -2037,7 +2037,7 @@ if isinstance(data, dict):
 out = []
 for i in items if isinstance(items, list) else []:
  if isinstance(i, dict):
-  out.append({"id": str(i.get("id") or ""), "status": str(i.get("status") or ""), "subject": str(i.get("subject") or "")})
+  out.append({"id": str(i.get("id") or ""), "status": str(i.get("status") or ""), "subject": str(i.get("subject") or i.get("title") or "")})
 print(json.dumps(out))`
 
 /** The argv that prints a session's mesh task items (`<MESH_HOME or ~/.agent-mesh>/tasks/<id>.json`); [] when none. */

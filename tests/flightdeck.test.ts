@@ -4000,3 +4000,7 @@ test('a failed row stays until the next turn starts; a stale card draws ⊘ and 
   expect(gone.entries.length).toBe(0)
 })
 
+
+test('the mesh probe keeps a task title when the cache has no subject (mesh writes title)', () => {
+  expect(MESH_PY).toContain('i.get("subject") or i.get("title")')
+})
