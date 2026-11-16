@@ -990,6 +990,7 @@ export const activeConsultLocks = (
 
 export type RingCell = { x: number; y: number; glyph: string }
 export type RingArcCell = RingCell & { lineGlyph: string; arrowGlyph: string; isArrow: boolean }
+export type RingNodeInput = { label: string; width: number; glyph?: string; name?: string; dur?: string }
 export type RingNodePos = {
   label: string
   width: number
@@ -1066,221 +1067,312 @@ const collapseCorners = (pts: Pt[], prot: Set<string>): Pt[] => {
   return out
 }
 
-const symRound = (v: number) => (v >= 0 ? Math.round(v) : -Math.round(-v))
-
-const stepGlyph = (dx: number, dy: number) => {
-  if (dx === 0) return '│'
-  if (dy === 0) return '─'
-  return dx * dy > 0 ? '╲' : '╱'
-}
-
-const arrowGlyph = (dx: number, dy: number) => {
-  if (dx === 0 && dy > 0) return '▼'
-  if (dx === 0 && dy < 0) return '▲'
-  if (dy === 0 && dx > 0) return '▶'
-  if (dy === 0 && dx < 0) return '◀'
-  if (dx > 0 && dy > 0) return '◢'
-  if (dx < 0 && dy > 0) return '◣'
-  if (dx > 0 && dy < 0) return '◥'
-  if (dx < 0 && dy < 0) return '◤'
-  return '●'
-}
-
-const arrowFromTangent = (vx: number, vy: number) => {
+const arrowFromVec = (vx: number, vy: number): string => {
   const deg = (Math.atan2(vy, vx) * 180) / Math.PI
-  if (deg >= -22.5 && deg < 22.5) return '▶'
-  if (deg >= 22.5 && deg < 67.5) return '◢'
-  if (deg >= 67.5 && deg < 112.5) return '▼'
-  if (deg >= 112.5 && deg < 157.5) return '◣'
-  if (deg >= 157.5 || deg < -157.5) return '◀'
-  if (deg >= -157.5 && deg < -112.5) return '◤'
-  if (deg >= -112.5 && deg < -67.5) return '▲'
-  return '◥'
+  if (deg >= -22.5 && deg < 22.5) return '→'
+  if (deg >= 22.5 && deg < 67.5) return '↘'
+  if (deg >= 67.5 && deg < 112.5) return '↓'
+  if (deg >= 112.5 && deg < 157.5) return '↙'
+  if (deg >= 157.5 || deg < -157.5) return '←'
+  if (deg >= -157.5 && deg < -112.5) return '↖'
+  if (deg >= -112.5 && deg < -67.5) return '↑'
+  return '↗'
+}
+
+const DUR_SUFFIX_RE = /^(\S+) (.+?) (\d+(?:s|m\d{2}s|h\d{2}m))$/
+
+const fitRingLabel = (nd: RingNodeInput, room: number): string => {
+  if (cellWidth(nd.label) <= room) return nd.label
+  let glyph = nd.glyph
+  let name = nd.name
+  if (glyph === undefined || name === undefined) {
+    const m = DUR_SUFFIX_RE.exec(nd.label)
+    if (m) {
+      glyph = m[1]!
+      name = m[2]!
+    }
+  }
+  if (glyph !== undefined && name !== undefined) {
+    const noDur = `${glyph} ${name}`
+    if (cellWidth(noDur) <= room) return noDur
+    if (room >= 3) return `${glyph} ${shorten(name, room - 2)}`
+    return shorten(noDur, room)
+  }
+  const sp = nd.label.indexOf(' ')
+  if (sp === 1 && room >= 3) return `${nd.label[0]} ${shorten(nd.label.slice(2), room - 2)}`
+  return shorten(nd.label, room)
+}
+
+const isNodeLabelCell = (nodes: readonly RingNodePos[], x: number, y: number): boolean =>
+  nodes.some(nd => y === nd.labelY && x >= nd.labelX && x < nd.labelX + nd.width)
+
+const angDiff = (a: number, b: number): number => Math.abs(((a - b + 3 * Math.PI) % (2 * Math.PI)) - Math.PI)
+
+const ellipsePointAngle = (p: Pt, cxMid: number, cy: number, rx: number, ry: number): number =>
+  (Math.atan2((p.x - cxMid) / Math.max(1, rx), -(p.y - cy) / Math.max(1, ry)) + 2 * Math.PI) % (2 * Math.PI)
+
+const pickArcArrowIdx = (
+  seg: readonly Pt[],
+  nodes: readonly RingNodePos[],
+  fromAngle: number,
+  toAngle: number,
+  cxMid: number,
+  cy: number,
+  rx: number,
+  ry: number,
+): number => {
+  const delta = ((toAngle - fromAngle + 2 * Math.PI) % (2 * Math.PI)) || 2 * Math.PI
+  const tMid = (fromAngle + delta / 2) % (2 * Math.PI)
+  let arrowIdx = Math.floor(seg.length / 2)
+  let bestAng = Infinity
+  for (let k = 0; k < seg.length; k += 1) {
+    const p = seg[k]!
+    if (!isNodeLabelCell(nodes, p.x, p.y)) {
+      const d = angDiff(ellipsePointAngle(p, cxMid, cy, rx, ry), tMid)
+      if (d < bestAng) {
+        bestAng = d
+        arrowIdx = k
+      }
+    }
+  }
+  return arrowIdx
 }
 
 /**
- * Computes balanced ellipse layout for `nodes` on a `cols x rows` cell grid:
- * `( MAIN )` centre box, clockwise spoke paths from each engine stopping 1 cell before `centre`,
- * and clockwise neighbour ring arcs.
+ * Computes balanced, mirror-symmetric ellipse layout for `nodes` on a `cols x rows` cell grid:
+ * rounded `MAIN` centre box, straight dotted spokes stopping 1 cell outside `centre` with
+ * collision-free 8-way arrowheads, and a smooth dotted clockwise ring.
  */
-export const ringLayout = (nodes: readonly { label: string; width: number }[], cols: number, rows: number): RingLayout => {
+export const ringLayout = (
+  nodes: readonly RingNodeInput[],
+  cols: number,
+  rows: number,
+  options: { isDebate?: boolean; tagWidth?: number } = {},
+): RingLayout => {
   const n = nodes.length
-  const x0 = Math.floor((cols - 8) / 2)
+  const isDebate = Boolean(options.isDebate)
+  const tagW = options.tagWidth ?? 6
+  const boxW = isDebate ? Math.max(8, tagW + 4 + (tagW % 2)) : 8
+  const boxH = isDebate ? 4 : 3
+  const boxX = Math.floor((cols - boxW) / 2)
   const cy = Math.floor(rows / 2)
-  const centre: RingBox = { x: x0 - 1, y: cy, width: 10, height: 1 }
-  const cxLeft = x0 + 3
-  const cxRight = x0 + 4
-  const cx = Math.floor(cols / 2)
+  const centre: RingBox = { x: boxX, y: cy - 1, width: boxW, height: boxH }
+  const cxLeft = boxX + Math.floor(boxW / 2) - 1
+  const cxRight = boxX + Math.floor(boxW / 2)
+  const cx = cxRight
   const ry = Math.max(2, cy - 1)
-  const rxMin = 6
-  const rxTarget = Math.min(18, Math.round(ry * 3.0))
-  let rxLimit = rxTarget
-  for (let i = 0; i < n; i += 1) {
-    const theta = (2 * Math.PI * i) / n
-    const s = Math.sin(theta)
-    const w = nodes[i]!.width
-    if (s > 0.05) rxLimit = Math.min(rxLimit, (cols - cxRight - 2 - w) / s)
-    else if (s < -0.05) rxLimit = Math.min(rxLimit, (cxLeft - 2 - w) / -s)
+  // Terminal glyphs are roughly twice as tall as wide (~2.2 aspect); cap only when cols is very narrow.
+  const rx = Math.max(7, Math.min(Math.round(ry * 2.2), Math.floor((cols - 20) / 2)))
+
+  type RawAnchor = {
+    angle: number
+    dx: number
+    ady: number
+    anchorX: number
+    anchorY: number
+    labelY: number
+    align: RingNodePos['align']
   }
-  const rx = Math.max(rxMin, Math.min(rxTarget, Math.floor(rxLimit)))
-  const inCentre = (x: number, y: number) => y === centre.y && x >= centre.x && x < centre.x + centre.width
-  const ringX = (s: number) => (Math.abs(s) < 0.05 ? cx : s > 0 ? cxRight + Math.round(rx * s) : cxLeft - Math.round(rx * -s))
-
-  const anchors = nodes.map((node, i) => {
-    const angle = (2 * Math.PI * i) / n
-    const s = Math.sin(angle)
-    const c = Math.cos(angle)
-    return { ...node, angle, s, c, anchorX: ringX(s), anchorY: cy - symRound(ry * c) }
-  })
-
-  const arcs: RingArcCell[][] =
-    n < 2
-      ? nodes.map(() => [])
-      : anchors.map((node, i) => {
-          const t0 = (2 * Math.PI * i) / n
-          const t1 = (2 * Math.PI * (i + 1)) / n
-          const nextAnchor = anchors[(i + 1) % n]!
-          const raw: Pt[] = [{ x: node.anchorX, y: node.anchorY }]
-          const steps = 64
-          for (let k = 1; k < steps; k += 1) {
-            const t = t0 + ((t1 - t0) * k) / steps
-            const x = ringX(Math.sin(t))
-            const y = cy - symRound(ry * Math.cos(t))
-            const prev = raw[raw.length - 1]!
-            if (x !== prev.x || y !== prev.y) {
-              if (Math.abs(x - prev.x) > 1 || Math.abs(y - prev.y) > 1) {
-                const bridge = bresenham(prev.x, prev.y, x, y)
-                for (let b = 1; b < bridge.length; b += 1) raw.push(bridge[b]!)
-              } else {
-                raw.push({ x, y })
-              }
-            }
-          }
-          const prev = raw[raw.length - 1]!
-          if (prev.x !== nextAnchor.anchorX || prev.y !== nextAnchor.anchorY) {
-            if (Math.abs(nextAnchor.anchorX - prev.x) > 1 || Math.abs(nextAnchor.anchorY - prev.y) > 1) {
-              const bridge = bresenham(prev.x, prev.y, nextAnchor.anchorX, nextAnchor.anchorY)
-              for (let b = 1; b < bridge.length; b += 1) raw.push(bridge[b]!)
-            } else {
-              raw.push({ x: nextAnchor.anchorX, y: nextAnchor.anchorY })
-            }
-          }
-          const prot = new Set<string>([`${node.anchorX},${node.anchorY}`, `${nextAnchor.anchorX},${nextAnchor.anchorY}`])
-          for (const pt of raw) if (pt.x === cxLeft - rx || pt.x === cxRight + rx) prot.add(`${pt.x},${pt.y}`)
-          const clean = collapseCorners(raw, prot)
-          if (clean.length > 1) clean.pop()
-          const arrowIdx = Math.floor(clean.length / 2)
-          const cells: RingArcCell[] = []
-          for (let k = 0; k < clean.length; k += 1) {
-            const p = clean[k]!
-            const nxt = k < clean.length - 1 ? clean[k + 1]! : { x: nextAnchor.anchorX, y: nextAnchor.anchorY }
-            const dx = Math.sign(nxt.x - p.x)
-            const dy = Math.sign(nxt.y - p.y)
-            const frac = clean.length > 1 ? k / (clean.length - 1) : 0.5
-            const tk = t0 + (t1 - t0) * frac
-            const aGlyph = arrowFromTangent(rx * Math.cos(tk), ry * Math.sin(tk) * 1.8)
-            const lGlyph = stepGlyph(dx, dy)
-            const isArrow = k === arrowIdx
-            cells.push({ x: p.x, y: p.y, glyph: isArrow ? aGlyph : lGlyph, lineGlyph: lGlyph, arrowGlyph: aGlyph, isArrow })
-          }
-          return cells
-        })
-
-  const rowMinX = Array.from({ length: rows }, () => cxLeft)
-  const rowMaxX = Array.from({ length: rows }, () => cxRight)
-  for (const arc of arcs) {
-    for (const pt of arc) {
-      if (pt.y >= 0 && pt.y < rows) {
-        rowMinX[pt.y] = Math.min(rowMinX[pt.y]!, pt.x)
-        rowMaxX[pt.y] = Math.max(rowMaxX[pt.y]!, pt.x)
-      }
+  const rawAnchors: RawAnchor[] = new Array(n)
+  if (n > 0) {
+    rawAnchors[0] = { angle: 0, dx: 0, ady: ry, anchorX: cx, anchorY: cy - ry, labelY: 0, align: 'center' }
+    if (n % 2 === 0) {
+      const h = n / 2
+      rawAnchors[h] = { angle: Math.PI, dx: 0, ady: ry, anchorX: cx, anchorY: cy + ry, labelY: rows - 1, align: 'center' }
     }
-  }
-  for (const nd of anchors) {
-    if (nd.anchorY >= 0 && nd.anchorY < rows) {
-      rowMinX[nd.anchorY] = Math.min(rowMinX[nd.anchorY]!, nd.anchorX)
-      rowMaxX[nd.anchorY] = Math.max(rowMaxX[nd.anchorY]!, nd.anchorX)
+    // Round once in [0, pi/2] and mirror both top/bottom and left/right so i and n-i match exactly.
+    for (let i = 1; i < n / 2; i += 1) {
+      const theta = (2 * Math.PI * i) / n
+      const inTop = theta <= Math.PI / 2 + 1e-9
+      const alpha = inTop ? theta : Math.PI - theta
+      const dx = Math.max(1, Math.round(rx * Math.sin(alpha)))
+      const ady = Math.round(ry * Math.cos(alpha))
+      const y = cy + (inTop ? -ady : ady)
+      rawAnchors[i] = { angle: theta, dx, ady, anchorX: cxRight + dx, anchorY: y, labelY: y, align: 'left' }
+      const j = n - i
+      rawAnchors[j] = { angle: (2 * Math.PI * j) / n, dx, ady, anchorX: cxLeft - dx, anchorY: y, labelY: y, align: 'right' }
     }
   }
 
-  const placed: RingNodePos[] = anchors.map(nd => {
-    let labelY = nd.anchorY
-    let labelX = 0
-    let align: RingNodePos['align'] = 'center'
+  const placed: RingNodePos[] = rawAnchors.map((a, i) => {
+    const nd = nodes[i]!
     let label = nd.label
     let width = nd.width
-    if (Math.abs(nd.s) < 0.05) {
-      labelY = nd.c > 0 ? 0 : rows - 1
-      if (width > cols) {
-        label = shorten(label, cols)
-        width = cellWidth(label)
-      }
-      labelX = Math.max(0, Math.min(cols - width, Math.round(cx - width / 2)))
-      align = 'center'
-    } else if (nd.s > 0) {
-      const base = Math.max(nd.anchorX, rowMaxX[labelY] ?? nd.anchorX)
-      const gap = base + 2 < cols ? 2 : 1
-      const start = Math.min(cols - 1, base + gap)
-      const room = Math.max(1, cols - start)
-      if (width > room) {
-        label = shorten(label, room)
-        width = cellWidth(label)
-      }
+    let labelX = 0
+    if (a.align === 'center') {
+      const room = Math.max(1, cols - 2)
+      label = fitRingLabel(nd, room)
+      width = cellWidth(label)
+      labelX = Math.max(1, Math.min(cols - 1 - width, Math.floor((cols - width) / 2)))
+    } else if (a.align === 'left') {
+      const start = Math.min(cols - 2, a.anchorX + 2)
+      const room = Math.max(1, cols - 1 - start)
+      label = fitRingLabel(nd, room)
+      width = cellWidth(label)
       labelX = start
-      align = 'left'
     } else {
-      const base = Math.min(nd.anchorX, rowMinX[labelY] ?? nd.anchorX)
-      const gap = base - 2 >= 0 ? 2 : 1
-      const end = Math.max(0, base - gap)
-      const room = Math.max(1, end + 1)
-      if (width > room) {
-        label = shorten(label, room)
-        width = cellWidth(label)
-      }
+      const end = Math.max(1, a.anchorX - 2)
+      const room = Math.max(1, end)
+      label = fitRingLabel(nd, room)
+      width = cellWidth(label)
       labelX = end - width + 1
-      align = 'right'
     }
-    return { label, width, angle: nd.angle, anchorX: nd.anchorX, anchorY: nd.anchorY, labelX, labelY, align }
+    return {
+      label,
+      width,
+      angle: a.angle,
+      anchorX: a.anchorX,
+      anchorY: a.anchorY,
+      labelX,
+      labelY: a.labelY,
+      align: a.align,
+    }
   })
 
-  const spokes: RingCell[][] = anchors.map(node => {
-    const tx =
-      Math.abs(node.s) < 0.05
-        ? cx
-        : Math.abs(node.c) < 0.45
-          ? node.s > 0
-            ? centre.x + centre.width - 1
-            : centre.x
-          : cx + symRound(3 * node.s)
-    const raw = bresenham(node.anchorX, node.anchorY, tx, cy)
-    const cut: Pt[] = []
-    for (const p of raw) {
-      if (inCentre(p.x, p.y)) break
-      cut.push(p)
-    }
-    const cells: RingCell[] = []
-    for (let k = 0; k < cut.length; k += 1) {
-      const p = cut[k]!
-      if (k === cut.length - 1) {
-        let adx = 0
-        let ady = 0
-        if (Math.abs(node.s) < 0.15) {
-          adx = 0
-          ady = node.c > 0 ? 1 : -1
-        } else if (p.y === cy) {
-          adx = p.x < cx ? 1 : -1
-          ady = 0
-        } else {
-          adx = p.x < cx ? 1 : -1
-          ady = p.y < cy ? 1 : -1
-        }
-        cells.push({ x: p.x, y: p.y, glyph: arrowGlyph(adx, ady) })
+  // Build one smooth, 4-way symmetric ellipse from a single first-quadrant curve (0 .. pi/2).
+  const q1Angles: number[] = []
+  const SAMPLES = 128
+  for (let k = 0; k <= SAMPLES; k += 1) q1Angles.push((Math.PI / 2) * (k / SAMPLES))
+  for (let i = 1; i < n / 2; i += 1) {
+    const theta = (2 * Math.PI * i) / n
+    q1Angles.push(theta <= Math.PI / 2 + 1e-9 ? theta : Math.PI - theta)
+  }
+  q1Angles.sort((a, b) => a - b)
+
+  const q1Raw: Pt[] = []
+  for (const t of q1Angles) {
+    const dx = Math.round(rx * Math.sin(t))
+    const ady = Math.round(ry * Math.cos(t))
+    const prev = q1Raw[q1Raw.length - 1]
+    if (!prev) {
+      q1Raw.push({ x: dx, y: ady })
+    } else if (dx !== prev.x || ady !== prev.y) {
+      if (Math.abs(dx - prev.x) > 1 || Math.abs(ady - prev.y) > 1) {
+        const bridge = bresenham(prev.x, prev.y, dx, ady)
+        for (let b = 1; b < bridge.length; b += 1) q1Raw.push(bridge[b]!)
       } else {
-        const next = cut[k + 1]!
-        cells.push({ x: p.x, y: p.y, glyph: stepGlyph(next.x - p.x, next.y - p.y) })
+        q1Raw.push({ x: dx, y: ady })
       }
     }
-    return cells
+  }
+  const protQ1 = new Set<string>([`0,${ry}`, `${rx},0`])
+  for (let i = 1; i < n / 2; i += 1) protQ1.add(`${rawAnchors[i]!.dx},${rawAnchors[i]!.ady}`)
+  const q1 = collapseCorners(q1Raw, protQ1)
+
+  const loop: Pt[] = []
+  const pushLoopPt = (x: number, y: number) => {
+    const prev = loop[loop.length - 1]
+    if (!prev || prev.x !== x || prev.y !== y) loop.push({ x, y })
+  }
+  for (let k = 0; k < q1.length; k += 1) pushLoopPt(cxRight + q1[k]!.x, cy - q1[k]!.y)
+  for (let k = q1.length - 2; k >= 0; k -= 1) pushLoopPt(cxRight + q1[k]!.x, cy + q1[k]!.y)
+  for (let k = 0; k < q1.length; k += 1) pushLoopPt(cxLeft - q1[k]!.x, cy + q1[k]!.y)
+  for (let k = q1.length - 2; k >= 0; k -= 1) pushLoopPt(cxLeft - q1[k]!.x, cy - q1[k]!.y)
+  if (loop.length > 1 && loop[loop.length - 1]!.x === loop[0]!.x && loop[loop.length - 1]!.y === loop[0]!.y) loop.pop()
+
+  const cxMid = centre.x + (centre.width - 1) / 2
+  const cyMid = centre.y + (centre.height - 1) / 2
+
+  let arcs: RingArcCell[][]
+  if (n < 2) {
+    arcs = nodes.map(() => [])
+  } else {
+    const anchorIdx: number[] = new Array(n)
+    let searchFrom = 0
+    for (let i = 0; i < n; i += 1) {
+      const nd = placed[i]!
+      let found = -1
+      for (let idx = searchFrom; idx < loop.length; idx += 1) {
+        if (loop[idx]!.x === nd.anchorX && loop[idx]!.y === nd.anchorY) {
+          found = idx
+          break
+        }
+      }
+      if (found < 0) {
+        let bestD = Infinity
+        for (let idx = searchFrom; idx < loop.length; idx += 1) {
+          const d = Math.abs(loop[idx]!.x - nd.anchorX) + Math.abs(loop[idx]!.y - nd.anchorY)
+          if (d < bestD) {
+            bestD = d
+            found = idx
+          }
+        }
+      }
+      anchorIdx[i] = found
+      searchFrom = found + 1
+    }
+    arcs = placed.map((nd, i) => {
+      const nextNd = placed[(i + 1) % n]!
+      const start = anchorIdx[i]!
+      const end = i < n - 1 ? anchorIdx[i + 1]! : loop.length
+      const seg = loop.slice(start, end)
+      const arrowIdx = pickArcArrowIdx(seg, placed, nd.angle, nextNd.angle, cxMid, cy, rx, ry)
+      return seg.map((p, k) => {
+        const aGlyph = arrowFromVec(-(p.y - cy) / Math.max(1, ry), (p.x - cxMid) / Math.max(1, rx))
+        const isArrow = k === arrowIdx
+        return { x: p.x, y: p.y, glyph: isArrow ? aGlyph : '·', lineGlyph: '·', arrowGlyph: aGlyph, isArrow }
+      })
+    })
+  }
+
+  const bx0 = centre.x
+  const bx1 = centre.x + centre.width - 1
+  const by0 = centre.y
+  const by1 = centre.y + centre.height - 1
+  const outerRing: Pt[] = []
+  for (let x = bx0 - 1; x <= bx1 + 1; x += 1) outerRing.push({ x, y: by0 - 1 })
+  for (let y = by0; y <= by1; y += 1) outerRing.push({ x: bx1 + 1, y })
+  for (let x = bx1 + 1; x >= bx0 - 1; x -= 1) outerRing.push({ x, y: by1 + 1 })
+  for (let y = by1; y >= by0; y -= 1) outerRing.push({ x: bx0 - 1, y })
+  const outerRingIdx = new Map(outerRing.map((p, idx) => [`${p.x},${p.y}`, idx]))
+  const inCentre = (x: number, y: number) => x >= bx0 && x <= bx1 && y >= by0 && y <= by1
+
+  const usedArrows = new Set<string>()
+  const spokes: RingCell[][] = rawAnchors.map((a, i) => {
+    const nd = placed[i]!
+    const tx = a.align === 'center' ? nd.anchorX : a.align === 'left' ? cxRight : cxLeft
+    const raw = bresenham(nd.anchorX, nd.anchorY, tx, cy)
+    const prefix: Pt[] = []
+    let hit: Pt | null = null
+    for (const p of raw) {
+      if (inCentre(p.x, p.y)) break
+      prefix.push(p)
+      if (outerRingIdx.has(`${p.x},${p.y}`)) {
+        hit = p
+        break
+      }
+    }
+    let pts = prefix
+    if (hit && usedArrows.has(`${hit.x},${hit.y}`)) {
+      const rIdx = outerRingIdx.get(`${hit.x},${hit.y}`)!
+      for (let step = 1; step < outerRing.length; step += 1) {
+        const cand = outerRing[(rIdx + step) % outerRing.length]!
+        if (usedArrows.has(`${cand.x},${cand.y}`)) continue
+        const direct = bresenham(nd.anchorX, nd.anchorY, cand.x, cand.y)
+        if (!direct.some((p, k) => inCentre(p.x, p.y) || (k < direct.length - 1 && usedArrows.has(`${p.x},${p.y}`)))) {
+          pts = direct
+          break
+        }
+      }
+      if (pts === prefix) {
+        for (let step = 1; step < outerRing.length; step += 1) {
+          const cand = outerRing[(rIdx + step) % outerRing.length]!
+          if (usedArrows.has(`${cand.x},${cand.y}`)) continue
+          const direct = bresenham(nd.anchorX, nd.anchorY, cand.x, cand.y)
+          if (!direct.some(p => inCentre(p.x, p.y))) {
+            pts = direct
+            break
+          }
+        }
+      }
+    }
+    const last = pts[pts.length - 1]
+    if (last) usedArrows.add(`${last.x},${last.y}`)
+    return pts.map((p, k) =>
+      k === pts.length - 1
+        ? { x: p.x, y: p.y, glyph: arrowFromVec(cxMid - p.x, cyMid - p.y) }
+        : { x: p.x, y: p.y, glyph: '·' },
+    )
   })
 
   return { cols, rows, cx, cy, rx, ry, centre, nodes: placed, spokes, arcs }
@@ -1314,19 +1406,19 @@ export const consultEngineDuration = (e: ConsultEngine, run: ConsultRun, now: nu
 export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, now: number): RingGrid => {
   const isDebate = run.round >= 2 || run.kind === 'round2'
   const height = run.engines.length <= 6 ? 11 : 13
-  const maxSide = Math.max(8, Math.floor((cols - 16) / 2))
   const parts = run.engines.map(e => {
     const glyph = consultGlyph(e.state)
     const dur = consultEngineDuration(e, run, now)
-    const nameMax = Math.min(12, Math.max(4, maxSide - 2 - (dur ? cellWidth(dur) + 1 : 0)))
-    const name = shortConsultEngine(e.name, nameMax)
+    const name = shortConsultEngine(e.name, 12)
     const label = dur ? `${glyph} ${name} ${dur}` : `${glyph} ${name}`
     return { e, glyph, name, dur, label, width: cellWidth(label) }
   })
+  const tag = `⟳ R${run.round}/${run.rounds}`
   const layout = ringLayout(
-    parts.map(p => ({ label: p.label, width: p.width })),
+    parts.map(p => ({ label: p.label, width: p.width, glyph: p.glyph, name: p.name, dur: p.dur })),
     cols,
     height,
+    { isDebate, tagWidth: cellWidth(tag) },
   )
   const buf: (GridCell | null)[][] = Array.from({ length: height }, () => Array.from({ length: cols }, () => null))
   const put = (x: number, y: number, ch: string, color: string, bold = false, dim = false) => {
@@ -1338,11 +1430,18 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
     for (let i = 0; i < chars.length; i += 1) put(x + i, y, chars[i]!, color, bold, dim)
   }
 
-  putStr(layout.centre.x + 1, layout.centre.y, '( MAIN )', colors.main, true)
+  const c = layout.centre
+  putStr(c.x, c.y, `╭${'─'.repeat(c.width - 2)}╮`, colors.main)
+  put(c.x, c.y + 1, '│', colors.main)
+  put(c.x + c.width - 1, c.y + 1, '│', colors.main)
+  putStr(c.x + Math.floor((c.width - 4) / 2), c.y + 1, 'MAIN', colors.main, true)
   if (isDebate) {
-    const tag = `⟳ R${run.round}/${run.rounds}`
-    const tx = Math.max(0, Math.min(cols - cellWidth(tag), Math.round(layout.cx - cellWidth(tag) / 2)))
-    putStr(tx, layout.centre.y + 1, tag, colors.arch)
+    put(c.x, c.y + 2, '│', colors.main)
+    put(c.x + c.width - 1, c.y + 2, '│', colors.main)
+    putStr(c.x + Math.floor((c.width - cellWidth(tag)) / 2), c.y + 2, tag, colors.arch)
+    putStr(c.x, c.y + 3, `╰${'─'.repeat(c.width - 2)}╯`, colors.main)
+  } else {
+    putStr(c.x, c.y + 2, `╰${'─'.repeat(c.width - 2)}╯`, colors.main)
   }
 
   const paths: RingAnimatedPath[] = []
@@ -1354,14 +1453,14 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
       const spoke = layout.spokes[i] ?? []
       if (st === 'failed' || st === 'skipped' || spoke.length === 0) continue
       if (st === 'ok') {
-        for (const c of spoke) put(c.x, c.y, c.glyph, colors.gate)
+        for (const pt of spoke) put(pt.x, pt.y, pt.glyph, colors.gate)
       } else if (st === 'queued') {
-        for (let k = 0; k < spoke.length; k += 1) {
-          const c = spoke[k]!
-          put(c.x, c.y, k === spoke.length - 1 ? c.glyph : '·', colors.faint)
-        }
+        for (const pt of spoke) put(pt.x, pt.y, '·', colors.faint)
       } else if (st === 'running') {
-        for (const c of spoke) put(c.x, c.y, c.glyph, colors.agent)
+        for (let k = 0; k < spoke.length; k += 1) {
+          const pt = spoke[k]!
+          put(pt.x, pt.y, pt.glyph, k === spoke.length - 1 ? colors.agent : colors.dim)
+        }
         if (isRunLive) paths.push({ cells: spoke, color: colors.agent, baseColor: colors.dim, stride: Math.max(8, spoke.length + 3), closed: false })
       }
     }
@@ -1372,25 +1471,32 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
       const anyRunning = isRunLive && parts.some(p => p.e.state === 'running')
       const allOk = partIdx.every(i => parts[i]!.e.state === 'ok')
       const staticColor = run.stale ? colors.amber : anyRunning ? colors.agent : allOk ? colors.gate : colors.faint
+      const cxMid = c.x + (c.width - 1) / 2
       const closedCells: RingCell[] = []
       for (let k = 0; k < partIdx.length; k += 1) {
         const from = partIdx[k]!
         const to = partIdx[(k + 1) % partIdx.length]!
-        if (to === (from + 1) % n) {
-          for (const c of layout.arcs[from] ?? []) {
-            put(c.x, c.y, c.glyph, staticColor)
-            closedCells.push({ x: c.x, y: c.y, glyph: c.glyph })
-          }
-        } else {
-          const seg: RingArcCell[] = []
-          for (let j = from; j !== to; j = (j + 1) % n) seg.push(...(layout.arcs[j] ?? []))
-          const mid = Math.floor(seg.length / 2)
-          for (let m = 0; m < seg.length; m += 1) {
-            const c = seg[m]!
-            const g = m === mid ? c.arrowGlyph : c.lineGlyph
-            put(c.x, c.y, g, staticColor)
-            closedCells.push({ x: c.x, y: c.y, glyph: g })
-          }
+        const seg: RingArcCell[] = []
+        for (let j = from; ; j = (j + 1) % n) {
+          seg.push(...(layout.arcs[j] ?? []))
+          if ((j + 1) % n === to) break
+        }
+        const arrowIdx = pickArcArrowIdx(
+          seg,
+          layout.nodes,
+          layout.nodes[from]!.angle,
+          layout.nodes[to]!.angle,
+          cxMid,
+          layout.cy,
+          layout.rx,
+          layout.ry,
+        )
+        for (let m = 0; m < seg.length; m += 1) {
+          const pt = seg[m]!
+          if (isNodeLabelCell(layout.nodes, pt.x, pt.y)) continue
+          const g = m === arrowIdx ? pt.arrowGlyph : pt.lineGlyph
+          put(pt.x, pt.y, g, staticColor)
+          closedCells.push({ x: pt.x, y: pt.y, glyph: g })
         }
       }
       if (anyRunning && closedCells.length > 0) {

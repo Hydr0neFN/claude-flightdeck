@@ -180,15 +180,15 @@ Consult (round 1, spokes fan in to `MAIN`):
 ╭──────────────────────────────────────────────────────────────╮
 │ CONSULT · consult · R1/1                          3/6 · 0:24 │
 │                        ● copilot 10s                         │
-│                              │                               │
-│                              │                               │
-│       ● claude 18s ─╲        │        ╱─ ◐ gemini 12s        │
-│                      ───◢    ▼    ◣───                       │
-│                          ( MAIN )                            │
-│                      ···◥    ▲    ◤───                       │
-│         ○ qwen ······╱       ·        ╲─ ● codex 20s         │
-│                              ·                               │
-│                              ·                               │
+│                               ·                              │
+│                               ·                              │
+│         ● claude 18s ··       ↓      ·· ◐ gemini 12s         │
+│                        ··→╭──────╮←··                        │
+│                           │ MAIN │                           │
+│                        ···╰──────╯←··                        │
+│               ○ qwen ··       ·      ·· ● codex 20s          │
+│                               ·                              │
+│                               ·                              │
 │                          ○ deepseek                          │
 │ “Which approach fits best?”                                  │
 │ ● done  ◐ running  ○ queued  ✗ failed  ⊘ locked              │
@@ -201,16 +201,16 @@ Debate (round 2+, answers circulate clockwise around the ring):
 ╭──────────────────────────────────────────────────────────────╮
 │ CONSULT · debate · R2/3                           2/6 · 1:05 │
 │                        ● copilot 10s                         │
-│                       ─▶──────────▶                          │
-│                    ──╱             ──╲                       │
-│       ● claude 12s╱                   ─╲ ◐ gemini 8s         │
-│                  ╱                      ╲                    │
-│                 ▲        ( MAIN )        ▼                   │
-│                  ╲        ⟳ R2/3        ╱                    │
-│        ◐ qwen 6s  ╲─                   ╱ ● codex 14s         │
-│                     ╲──             ╱──                      │
-│                        ╲◀─────────◀─                         │
-│                       ● deepseek 11s                         │
+│                           ········                           │
+│                        ··↗        ↘··                        │
+│         ◐ claude 12s ··              ·· ◐ gemini 8s          │
+│                     ·    ╭────────╮    ·                     │
+│                     ↑    │  MAIN  │    ↓                     │
+│                     ·    │ ⟳ R2/3 │    ·                     │
+│            ◐ qwen 6s ··  ╰────────╯  ·· ● codex 14s          │
+│                        ··↖        ↙··                        │
+│                           ········                           │
+│                        ◐ deepseek 11s                        │
 │                 answers pass round the ring                  │
 │ “Which approach fits best?”                                  │
 │ ● done  ◐ running  ○ queued  ✗ failed  ⊘ locked              │

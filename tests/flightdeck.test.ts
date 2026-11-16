@@ -1719,7 +1719,32 @@ test('when feedCommand is empty, no process is run and no feed lines render', { 
 
 // ---------------------------------------------------------------- consult ring
 
-const ARROWS = new Set(['▲', '▼', '◀', '▶', '◥', '◤', '◣', '◢'])
+const ARROWS = new Set(['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'])
+
+const expected8WayArrow = (vx: number, vy: number): string => {
+  const deg = (Math.atan2(vy, vx) * 180) / Math.PI
+  if (deg >= -22.5 && deg < 22.5) return '→'
+  if (deg >= 22.5 && deg < 67.5) return '↘'
+  if (deg >= 67.5 && deg < 112.5) return '↓'
+  if (deg >= 112.5 && deg < 157.5) return '↙'
+  if (deg >= 157.5 || deg < -157.5) return '←'
+  if (deg >= -157.5 && deg < -112.5) return '↖'
+  if (deg >= -112.5 && deg < -67.5) return '↑'
+  return '↗'
+}
+
+const gridMatrix = (grid: ReturnType<typeof buildConsultGrid>): string[][] => {
+  const buf = Array.from({ length: grid.height }, () => Array.from({ length: grid.width }, () => ' '))
+  for (let y = 0; y < grid.rows.length; y += 1) {
+    for (const r of grid.rows[y] ?? []) {
+      const chs = [...r.text]
+      for (let k = 0; k < chs.length; k += 1) {
+        if (r.x + k >= 0 && r.x + k < grid.width) buf[y]![r.x + k] = chs[k]!
+      }
+    }
+  }
+  return buf
+}
 
 test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and connects spokes & clockwise arcs', () => {
   for (const n of [3, 7, 10]) {
@@ -1737,14 +1762,16 @@ test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and connects spo
       expect(L.nodes[0]?.labelY).toBe(0)
       for (let i = 1; i < n; i += 1) expect(L.nodes[i]!.angle).toBeGreaterThan(L.nodes[i - 1]!.angle)
 
-      // Fit inside cols x rows, right-aligned on left half, left-aligned on right half, no centre overlap.
+      // Fit inside 1-cell side margins, right-aligned on left half, left-aligned on right half, no centre overlap.
       for (const nd of L.nodes) {
-        expect(nd.labelX >= 0 && nd.labelX + nd.width <= cols).toBe(true)
+        expect(nd.labelX >= 1 && nd.labelX + nd.width <= cols - 1).toBe(true)
         expect(nd.labelY >= 0 && nd.labelY < rows).toBe(true)
         if (nd.align === 'left') expect(nd.labelX).toBeGreaterThan(nd.anchorX)
         if (nd.align === 'right') expect(nd.labelX + nd.width - 1).toBeLessThan(nd.anchorX)
         const overlapsCentre =
-          nd.labelY === L.centre.y && !(nd.labelX + nd.width <= L.centre.x || nd.labelX >= L.centre.x + L.centre.width)
+          nd.labelY >= L.centre.y &&
+          nd.labelY < L.centre.y + L.centre.height &&
+          !(nd.labelX + nd.width <= L.centre.x || nd.labelX >= L.centre.x + L.centre.width)
         expect(overlapsCentre).toBe(false)
       }
 
@@ -1761,24 +1788,31 @@ test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and connects spo
 
       // Every spoke fits, stays clear of labels, and ends next to centre with an arrowhead pointing at it.
       expect(L.spokes.length).toBe(n)
+      const cMidX = L.centre.x + (L.centre.width - 1) / 2
+      const cMidY = L.centre.y + (L.centre.height - 1) / 2
+      const usedArrows = new Set<string>()
       for (const sp of L.spokes) {
         expect(sp.length).toBeGreaterThan(0)
+        for (let k = 0; k < sp.length - 1; k += 1) expect(sp[k]!.glyph).toBe('·')
         const last = sp[sp.length - 1]!
         expect(ARROWS.has(last.glyph)).toBe(true)
+        expect(usedArrows.has(`${last.x},${last.y}`)).toBe(false)
+        usedArrows.add(`${last.x},${last.y}`)
         const dx =
           last.x < L.centre.x
             ? L.centre.x - last.x
             : last.x >= L.centre.x + L.centre.width
               ? last.x - (L.centre.x + L.centre.width - 1)
               : 0
-        const dy = Math.abs(last.y - L.centre.y)
+        const dy =
+          last.y < L.centre.y
+            ? L.centre.y - last.y
+            : last.y >= L.centre.y + L.centre.height
+              ? last.y - (L.centre.y + L.centre.height - 1)
+              : 0
         expect(Math.max(dx, dy)).toBe(1)
-        // Arrowhead points toward centre.
-        const cMid = L.centre.x + (L.centre.width - 1) / 2
-        if (last.y < L.centre.y) expect(['▼', '◢', '◣'].includes(last.glyph)).toBe(true)
-        else if (last.y > L.centre.y) expect(['▲', '◥', '◤'].includes(last.glyph)).toBe(true)
-        else if (last.x < cMid) expect(last.glyph).toBe('▶')
-        else expect(last.glyph).toBe('◀')
+        // Arrowhead points toward hub centre (8-way rounded).
+        expect(last.glyph).toBe(expected8WayArrow(cMidX - last.x, cMidY - last.y))
         for (const c of sp) {
           expect(c.x >= 0 && c.x < cols && c.y >= 0 && c.y < rows).toBe(true)
           for (const nd of L.nodes) {
@@ -1803,6 +1837,271 @@ test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and connects spo
           const cur = arc[k]!
           expect(Math.max(Math.abs(cur.x - prev.x), Math.abs(cur.y - prev.y))).toBeLessThanOrEqual(1)
         }
+      }
+    }
+  }
+})
+
+test('consult ring spokes use straight · lines, unique 8-way arrowheads, and hub rounded box', () => {
+  for (const n of [4, 6, 7, 9, 10]) {
+    const rows = n <= 6 ? 11 : 13
+    for (const cols of [36, 42, 60, 66, 116]) {
+      const nodes = Array.from({ length: n }, (_, i) => {
+        const glyph = '●'
+        const name = `engine${i}`
+        const dur = `${10 + i}s`
+        const label = `${glyph} ${name} ${dur}`
+        return { label, width: cellWidth(label), glyph, name, dur }
+      })
+      const L = ringLayout(nodes, cols, rows)
+      const cMidX = L.centre.x + (L.centre.width - 1) / 2
+      const cMidY = L.centre.y + (L.centre.height - 1) / 2
+      const arrowCells = new Set<string>()
+
+      for (let i = 0; i < n; i += 1) {
+        const sp = L.spokes[i]!
+        const nd = L.nodes[i]!
+        expect(sp.length).toBeGreaterThanOrEqual(2)
+        expect(sp[0]!.x === nd.anchorX && sp[0]!.y === nd.anchorY).toBe(true)
+        const bodyArrows = sp.slice(0, -1).filter(c => c.glyph !== '·')
+        expect(bodyArrows).toEqual([])
+        for (let k = 1; k < sp.length; k += 1) {
+          expect(Math.max(Math.abs(sp[k]!.x - sp[k - 1]!.x), Math.abs(sp[k]!.y - sp[k - 1]!.y))).toBeLessThanOrEqual(1)
+        }
+        const arrows = sp.filter(c => ARROWS.has(c.glyph))
+        expect(arrows.length).toBe(1)
+        const last = sp[sp.length - 1]!
+        expect(arrows[0]).toBe(last)
+        expect(last.glyph).toBe(expected8WayArrow(cMidX - last.x, cMidY - last.y))
+        const key = `${last.x},${last.y}`
+        expect(arrowCells.has(key)).toBe(false)
+        arrowCells.add(key)
+
+        // No spoke overlaps hub box or any label.
+        for (const c of sp) {
+          const inBox =
+            c.x >= L.centre.x &&
+            c.x < L.centre.x + L.centre.width &&
+            c.y >= L.centre.y &&
+            c.y < L.centre.y + L.centre.height
+          expect(inBox).toBe(false)
+          for (const other of L.nodes) {
+            expect(c.y === other.labelY && c.x >= other.labelX && c.x < other.labelX + other.width).toBe(false)
+          }
+        }
+      }
+    }
+  }
+
+  // Consult hub: 3-row rounded box in C.main, bold MAIN; queued = faint dots without arrowhead; running = dim dots.
+  const cRun = parseConsult(
+    JSON.stringify({
+      run: {
+        v: 1,
+        id: 'hub-1',
+        pid: 1,
+        kind: 'all',
+        startedAt: 10_000,
+        endedAt: null,
+        question: 'Q?',
+        round: 1,
+        rounds: 1,
+        engines: [
+          { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 20_000, reason: null, note: null },
+          { name: 'gemini', state: 'running', startedAt: 22_000, endedAt: null, reason: null, note: null },
+          { name: 'codex', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null },
+          { name: 'deepseek', state: 'failed', startedAt: 10_000, endedAt: 15_000, reason: 'err', note: null },
+        ],
+        summary: null,
+      },
+      locks: {},
+    }),
+  )!.run!
+  const grid = buildConsultGrid(cRun, 60, PALETTES.theme, 34_000)
+  const mat = gridMatrix(grid)
+  const cx = grid.layout.centre
+  expect([cx.width, cx.height]).toEqual([8, 3])
+  expect(mat[cx.y]!.slice(cx.x, cx.x + cx.width).join('')).toBe('╭──────╮')
+  expect(mat[cx.y + 1]!.slice(cx.x, cx.x + cx.width).join('')).toBe('│ MAIN │')
+  expect(mat[cx.y + 2]!.slice(cx.x, cx.x + cx.width).join('')).toBe('╰──────╯')
+  const mainRun = (grid.rows[cx.y + 1] ?? []).find(r => r.text === 'MAIN')
+  expect(mainRun?.color).toBe(PALETTES.theme.main)
+  expect(mainRun?.bold).toBe(true)
+  // Queued spoke (index 2): faint dots, no arrowhead.
+  const qSpoke = grid.layout.spokes[2]!
+  const qLast = qSpoke[qSpoke.length - 1]!
+  expect(mat[qLast.y]![qLast.x]).toBe('·')
+  const qRun = (grid.rows[qLast.y] ?? []).find(r => qLast.x >= r.x && qLast.x < r.x + cellWidth(r.text))
+  expect(qRun?.color).toBe(PALETTES.theme.faint)
+  // Running spoke (index 1): dim body dots + animated path.
+  const rSpoke = grid.layout.spokes[1]!
+  const rBody = rSpoke[0]!
+  const rRun = (grid.rows[rBody.y] ?? []).find(r => rBody.x >= r.x && rBody.x < r.x + cellWidth(r.text))
+  expect(rRun?.color).toBe(PALETTES.theme.dim)
+})
+
+test('consult ring keeps mirror symmetry, 1-cell side margins, and drops duration before truncating name', () => {
+  for (const n of [4, 6, 7, 9, 10]) {
+    const rows = n <= 6 ? 11 : 13
+    for (const cols of [42, 60, 70, 116]) {
+      const nodes = Array.from({ length: n }, (_, i) => {
+        const glyph = '●'
+        const name = 'engine'
+        const dur = '12s'
+        const label = `${glyph} ${name} ${dur}`
+        return { label, width: cellWidth(label), glyph, name, dur }
+      })
+      const L = ringLayout(nodes, cols, rows)
+      // Aspect ratio rx ≈ 2.2 · ry when width does not clamp.
+      if (cols >= 46) expect(Math.abs(L.rx / L.ry - 2.2)).toBeLessThan(0.3)
+      for (let i = 1; i < n / 2; i += 1) {
+        const r = L.nodes[i]!
+        const l = L.nodes[n - i]!
+        expect(r.anchorY).toBe(l.anchorY)
+        expect(r.labelY).toBe(l.labelY)
+        expect(r.anchorX + l.anchorX).toBe(2 * L.centre.x + L.centre.width - 1)
+        expect(r.anchorX + l.anchorX).toBe(cols - 1)
+        if (r.width === l.width) expect(l.labelX).toBe(cols - 1 - (r.labelX + r.width - 1))
+      }
+      for (const nd of L.nodes) {
+        expect(nd.labelX).toBeGreaterThanOrEqual(1)
+        expect(nd.labelX + nd.width).toBeLessThanOrEqual(cols - 1)
+      }
+    }
+  }
+
+  // Tight width (46 cols -> inner 42): drops duration first, then truncates name with …, keeping 1-cell side margins.
+  const run9 = parseConsult(
+    JSON.stringify({
+      run: {
+        v: 1,
+        id: 't1',
+        pid: 1,
+        kind: 'all',
+        startedAt: 10_000,
+        endedAt: null,
+        question: '',
+        round: 1,
+        rounds: 1,
+        engines: [
+          { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 20_000, reason: null, note: null },
+          { name: 'codex', state: 'skipped', startedAt: null, endedAt: null, reason: 'locked', note: null },
+          { name: 'deepseek', state: 'ok', startedAt: 10_000, endedAt: 34_000, reason: null, note: null },
+          { name: 'agy', state: 'running', startedAt: 3_000, endedAt: null, reason: null, note: null },
+          { name: 'nim', state: 'failed', startedAt: 10_000, endedAt: 28_000, reason: 'err', note: null },
+          { name: 'openrouter', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null },
+          { name: 'opencode', state: 'running', startedAt: 12_000, endedAt: null, reason: null, note: null },
+          { name: 'azure', state: 'ok', startedAt: 10_000, endedAt: 19_000, reason: null, note: null },
+          { name: 'gemini', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null },
+        ],
+        summary: null,
+      },
+      locks: {},
+    }),
+  )!.run!
+  const g42 = buildConsultGrid(run9, 42, PALETTES.theme, 34_000)
+  for (const nd of g42.layout.nodes) {
+    expect(nd.labelX).toBeGreaterThanOrEqual(1)
+    expect(nd.labelX + nd.width).toBeLessThanOrEqual(41)
+  }
+  // azure (index 7): drops 9s -> full name "● azure" fits in 7 cells.
+  expect(g42.layout.nodes[7]!.label).toBe('● azure')
+  // deepseek (index 2): drops 24s, then truncates name with ….
+  expect(g42.layout.nodes[2]!.label).toMatch(/^● deep.*…$/)
+  expect(g42.layout.nodes[2]!.label).not.toContain('24s')
+})
+
+test('debate ring has 4-row hub, clockwise arrows, and closed 8-connected loop except where labels cut it', () => {
+  const arrowAngle = (g: string) => ['→', '↘', '↓', '↙', '←', '↖', '↑', '↗'].indexOf(g) * 45
+
+  for (const n of [4, 6, 7, 9, 10]) {
+    for (const skipSome of [false, true]) {
+      const engines = Array.from({ length: n }, (_, i) => ({
+        name: `eng${i}`,
+        state: skipSome && i === 1 ? 'skipped' : i % 2 === 0 ? 'ok' : 'running',
+        startedAt: 10_000,
+        endedAt: i % 2 === 0 ? 20_000 : null,
+        reason: null,
+        note: null,
+      }))
+      const run = parseConsult(
+        JSON.stringify({
+          run: { v: 1, id: 'd', pid: 1, kind: 'debate', startedAt: 10_000, endedAt: null, question: '', round: 2, rounds: 3, engines, summary: null },
+          locks: {},
+        }),
+      )!.run!
+      const grid = buildConsultGrid(run, 60, PALETTES.theme, 34_000)
+      const mat = gridMatrix(grid)
+      const cx = grid.layout.centre
+      expect(cx.height).toBe(4)
+      expect(mat[cx.y]!.slice(cx.x, cx.x + cx.width).join('')).toMatch(/^╭─+╮$/)
+      expect(mat[cx.y + 1]!.slice(cx.x, cx.x + cx.width).join('')).toMatch(/^│ +MAIN +│$/)
+      expect(mat[cx.y + 2]!.slice(cx.x, cx.x + cx.width).join('')).toMatch(/^│ +⟳ R2\/3 +│$/)
+      expect(mat[cx.y + 3]!.slice(cx.x, cx.x + cx.width).join('')).toMatch(/^╰─+╯$/)
+
+      const isLabel = (x: number, y: number) =>
+        grid.layout.nodes.some(nd => y === nd.labelY && x >= nd.labelX && x < nd.labelX + nd.width)
+      const inBox = (x: number, y: number) => x >= cx.x && x < cx.x + cx.width && y >= cx.y && y < cx.y + cx.height
+
+      // No stray cells (spokes) outside labels, hub box, and ellipse loop.
+      const loop = grid.layout.arcs.flat()
+      const loopSet = new Set(loop.map(p => `${p.x},${p.y}`))
+      for (let y = 0; y < grid.height; y += 1) {
+        for (let x = 0; x < grid.width; x += 1) {
+          const ch = mat[y]![x]!
+          if (ch !== ' ' && !isLabel(x, y) && !inBox(x, y)) {
+            expect(loopSet.has(`${x},${y}`)).toBe(true)
+            expect(ch === '·' || ARROWS.has(ch)).toBe(true)
+          }
+        }
+      }
+
+      // Full ellipse is 8-connected; rendered visible cells form a closed 8-connected loop except where labels cut it.
+      const drawnArrows: { x: number; y: number; g: string; ang: number }[] = []
+      const cMidX = cx.x + (cx.width - 1) / 2
+      const visibleIdx: number[] = []
+      for (let k = 0; k < loop.length; k += 1) {
+        const cur = loop[k]!
+        const nxt = loop[(k + 1) % loop.length]!
+        expect(Math.max(Math.abs(nxt.x - cur.x), Math.abs(nxt.y - cur.y))).toBeLessThanOrEqual(1)
+        const ch = mat[cur.y]![cur.x]!
+        if (isLabel(cur.x, cur.y)) {
+          // Label cell is never overwritten by · or arrow.
+          expect(ch === '·' || ARROWS.has(ch)).toBe(false)
+        } else {
+          expect(ch === '·' || ARROWS.has(ch)).toBe(true)
+          visibleIdx.push(k)
+          if (ARROWS.has(ch)) {
+            const ang = (Math.atan2((cur.x - cMidX) / grid.layout.rx, -(cur.y - grid.layout.cy) / grid.layout.ry) * 180) / Math.PI
+            const cwAng = (ang + 360) % 360
+            drawnArrows.push({ x: cur.x, y: cur.y, g: ch, ang: cwAng })
+          }
+        }
+      }
+      for (let v = 0; v < visibleIdx.length; v += 1) {
+        const i0 = visibleIdx[v]!
+        const i1 = visibleIdx[(v + 1) % visibleIdx.length]!
+        const p0 = loop[i0]!
+        const p1 = loop[i1]!
+        if (Math.max(Math.abs(p1.x - p0.x), Math.abs(p1.y - p0.y)) > 1) {
+          for (let step = (i0 + 1) % loop.length; step !== i1; step = (step + 1) % loop.length) {
+            expect(isLabel(loop[step]!.x, loop[step]!.y)).toBe(true)
+          }
+        }
+      }
+
+      // One arrow per participating neighbour pair, ordered clockwise and matching tangent direction.
+      const partCount = engines.filter(e => e.state !== 'failed' && e.state !== 'skipped').length
+      expect(drawnArrows.length).toBe(partCount)
+      const cxMid = cx.x + (cx.width - 1) / 2
+      for (let k = 0; k < drawnArrows.length; k += 1) {
+        const a = drawnArrows[k]!
+        if (k > 0) expect(a.ang).toBeGreaterThan(drawnArrows[k - 1]!.ang)
+        const expected = expected8WayArrow(-(a.y - grid.layout.cy) / grid.layout.ry, (a.x - cxMid) / grid.layout.rx)
+        expect(a.g).toBe(expected)
+        // Arrow glyph angle roughly matches clockwise tangent (cwAng + 90 deg in screen atan2).
+        const diff = Math.abs((((arrowAngle(a.g) - a.ang + 540) % 360) - 180))
+        expect(diff).toBeLessThanOrEqual(45)
       }
     }
   }
@@ -1920,7 +2219,7 @@ test('consult panel hides when empty or ended > 10 min ago, and uses narrow fall
     expect(await narrow.find({ text: /CONSULT · consult · R1\/1/ })).toBeDefined()
     expect(await narrow.find({ key: 'consult-ring' })).toBeUndefined()
     expect(await narrow.find({ text: /^copilot$/ })).toBeDefined()
-    expect(await narrow.find({ text: /\( MAIN \)/ })).toBeUndefined()
+    expect(await narrow.find({ text: /MAIN/ })).toBeUndefined()
     await narrow.unmount()
   }
 
