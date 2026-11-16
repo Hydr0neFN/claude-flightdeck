@@ -382,6 +382,17 @@ export const register: Register = (on, options) => {
     return { text: 'Flightdeck opened. Focus it with ctrl+x tab; 1-6 expand cards, f/s/o open the gate rows.' }
   })
 
+  // Opened at session.start the pane is unasked, so a terminal under 144 columns (110 once opened by hand)
+  // leaves it waiting undrawn. A prompt the person enters counts as asked: seat the waiting pane then, at any
+  // width (docked when fullscreen, else inline). A pane the person closed is not listed and stays closed.
+  on('prompt.submit', async ($, e, next) => {
+    if (cfg.openOnStart) {
+      const waiting = (await $.ui.panes().catch(() => [])).some(p => p.id === PANE && !p.isPlaced)
+      if (waiting) await openPane($, cfg).catch(() => undefined)
+    }
+    return next(e)
+  })
+
   on('classic.UserPromptSubmit', async ($, e, next) => {
     await noteMode($, e.permission_mode)
     return next(e)
