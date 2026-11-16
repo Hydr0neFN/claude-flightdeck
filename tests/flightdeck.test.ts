@@ -62,7 +62,10 @@ import {
 } from '../hooks/core'
 
 test('a job runner backend reads as a short model name', () => {
-  expect(shortWorker('agy:gemini-4-hydrogen-high')).toBe('Gemini 4')
+  expect(shortWorker('agy:gemini-4-hydrogen-high')).toBe('Hydrogen')
+  expect(shortWorker('agy:gemini-4-hydrogen-xhigh')).toBe('Hydrogen')
+  expect(shortWorker('agy:gemini-4-argon-high')).toBe('Argon')
+  expect(shortWorker('gemini-3.5-pro')).toBe('Gemini 3.5')
   expect(shortWorker('agy:claude-sonnet-5-5-high')).toBe('Sonnet 5.5')
   expect(shortWorker('azure:gpt-6.1-sol')).toBe('GPT 6.1')
   expect(shortWorker('paid-flash')).toBe('DS Flash')

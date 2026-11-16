@@ -239,7 +239,7 @@ export const shorten = (s: string, n: number) => {
 
 /**
  * A job runner's backend label as a short model name for a narrow card: `agy:gemini-4-hydrogen-high` →
- * `Gemini 4`, `agy:claude-sonnet-5-5-high` → `Sonnet 5.5`, `azure:gpt-6.1-sol` → `GPT 6.1`,
+ * `Hydrogen`, `agy:claude-sonnet-5-5-high` → `Sonnet 5.5`, `azure:gpt-6.1-sol` → `GPT 6.1`,
  * `paid-flash` → `DS Flash`, `opencode:opencode/qwen3-coder-free` → `qwen3-coder`. '' for ''.
  */
 export const shortWorker = (backend: string): string => {
@@ -249,6 +249,9 @@ export const shortWorker = (backend: string): string => {
   const id = (model.split('/').pop() ?? model).toLowerCase()
   if (id === 'paid-flash' || /deepseek/.test(id)) return 'DS Flash'
   if (/claude-/.test(id)) return prettyModel(id)
+  // A Gemini with a codename goes by it (`gemini-4-hydrogen-high` → `Hydrogen`, `gemini-4-argon-high` → `Argon`).
+  const code = /^gemini-[\d.]+-([a-z]+)(?:-(?:low|medium|high|xhigh|max))?$/.exec(id)
+  if (code?.[1] && !/^(pro|flash|lite|low|medium|high|xhigh|max)$/.test(code[1])) return code[1].charAt(0).toUpperCase() + code[1].slice(1)
   const gem = /^gemini-(\d+(?:\.\d+)?)/.exec(id)
   if (gem?.[1]) return `Gemini ${gem[1]}`
   const gpt = /^gpt-(\d+(?:\.\d+)?)/.exec(id)

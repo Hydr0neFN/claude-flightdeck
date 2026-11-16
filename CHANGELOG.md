@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.6.4 (yu)
+## 0.6.5 (yu)
 
-- An agent card names the model that does its work, not only the agent's own model. A wrapper agent that hands its job to a job runner (`ds-job.py`) shows `farmer ▸ Gemini 4`, `▸ DS Flash`, `▸ GPT 6.1` and so on. The card reads the runner's `backend:` line, and while the job runs, the job dir's `trying` file (polled every 10 s), so a fallback to the next model shows. The expanded card shows the full backend label.
+- An agent card names the model that does its work, not only the agent's own model. A wrapper agent that hands its job to a job runner (`ds-job.py`) shows `farmer ▸ Hydrogen`, `▸ Argon`, `▸ DS Flash`, `▸ GPT 6.1` and so on. The card reads the runner's `backend:` line, and while the job runs, the job dir's `trying` file (polled every 10 s), so a fallback to the next model shows. The expanded card shows the full backend label.
 - The card shows that job's cost when its report gives `cost_cny_est` (`free` for a subscription quota, CNY at 0.14 USD, Azure in USD). The turn receipt adds `jobs +$0.05` (or `jobs free`) beside Claude's own spend; it follows the cards, so a job that ends after the turn still counts.
 
 ## 0.6.1
