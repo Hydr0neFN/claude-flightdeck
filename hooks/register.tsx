@@ -747,6 +747,15 @@ export const register: Register = (on, options) => {
     }
     if (cfg.openOnStart) void openPane($, cfg).catch(() => undefined)
     await refreshStatus($, cfg)
+    // The feed starts before the slow part of the start-up (next(e), the resume seed), so its rows are there as soon as the pane is.
+    if (cfg.feedCommand.length > 0) {
+      stopFeedTimer?.()
+      const stop: unknown = $.clock.every(FEED_INTERVAL_MS, () => {
+        void pollFeed($, cfg.feedCommand, feedLock)
+      })
+      stopFeedTimer = typeof stop === 'function' ? (stop as () => void) : undefined
+      void pollFeed($, cfg.feedCommand, feedLock)
+    }
     const done = await next(e)
     if (resumedWindow > 0) {
       await readCompactWindow($, resumedWindow)
@@ -759,14 +768,6 @@ export const register: Register = (on, options) => {
       void pollWorkers($, workerLock)
     })
     stopWorkerTimer = typeof stopW === 'function' ? (stopW as () => void) : undefined
-    if (cfg.feedCommand.length > 0) {
-      stopFeedTimer?.()
-      const stop: unknown = $.clock.every(FEED_INTERVAL_MS, () => {
-        void pollFeed($, cfg.feedCommand, feedLock)
-      })
-      stopFeedTimer = typeof stop === 'function' ? (stop as () => void) : undefined
-      await pollFeed($, cfg.feedCommand, feedLock)
-    }
     if (cfg.panels.includes('consult')) {
       consultLock.stopped = false
       consultLock.ticks = 0

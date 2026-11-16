@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.5
+
+- The external feed starts before `next(e)` and the resume seed in `session.start`, so its rows show with the pane instead of one start-up later (about 20 s). The first poll no longer blocks the start.
+
 ## 0.9.4
 
 - The feed may carry four quota meters (`MAX_GEM`, was two), drawn as two `agy` rows of two. `feedLabel` keeps weekly and 5h apart: `gem`, `g5h`, `arg`, `cl`, `cl5`.
