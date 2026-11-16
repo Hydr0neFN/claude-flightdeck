@@ -63,6 +63,7 @@ https://github.com/user-attachments/assets/9ad0fcc3-c81c-427a-a743-f7b6c49f5885
 | --- | --- | --- |
 | **main** | model, effort, permission mode, request count; a context gauge with compactions (⟲, or ⟲~ when [estimated](#what-is-inferred-not-measured)), measured against the compaction window when the session compacts in a smaller one than the model's (`autoCompactWindow`, or Claude Code's own); cost and the first two rate-limit windows when your plan reports them, with the time to each reset (↻) from 56 columns; the last main-loop request's time to first token | `turn.step`, `session.measure`, `session.compact`, `$.session.usage()` (at each main-loop request, and its local `summary` breakdown, once per model, for the compaction window); the permission mode from `classic.UserPromptSubmit` and `agent.spawn` |
 | **architect** | consults on a timeline, whether one is running, how long the last took; optionally the moment of each consult; the first line of a subagent architect's advice | a spawn of a matching agent type, or a matching server tool in the assistant's rows |
+| **consult** | external multi-engine consults and debates in a ring around `MAIN`, with live spinners, travelling packets, question, legend, failure reasons, active locks and summary | `~/.claude/state/consult-runs/` (or `consultDir`) and `~/.claude/state/consult-locks.json` |
 | **gate** | one cell per permission check: green allowed without asking, blue decided by the auto-mode classifier or you and then run, amber pending, red ✗ denied, dim if made inside a subagent. Totals, and a drill-down per tool family with credentials masked | `tool.check`, settled by the `tool.call` around it |
 | **agents** | cards side by side while they fit: the task, type, live context and output tokens, steps, a running clock, `max_tokens` in red. Beyond that, swimlanes on one time axis | `agent.spawn`, `turn.step`, `tool.call`, `turn.complete` |
 | **loops** | model loops that match no card: workflow agents, compactions, memory forks | `turn.step` ids no card claims |
@@ -134,7 +135,7 @@ In `/config`, or under `pluginConfigs[<id>].options` in your user `settings.json
 | `matchDescriptions` | `false` | also match agent descriptions, not just type names |
 | `architectLabel` | `ARCHITECT` | the architect's name in the pane |
 | `gateLabel` | `GATE` | the permission panel's name |
-| `panels` | `main,architect,gate,agents,loops,receipt,log` | which panels show, in order |
+| `panels` | `main,architect,consult,gate,agents,loops,receipt,log` | which panels show, in order |
 | `layout` | `auto` | `mini`, `compact`, `wide`, or `auto` (mini inline, wide from 110 columns docked) |
 | `maxCards` | `3` | cards side by side before swimlanes (1–6); fewer if the pane is too narrow |
 | `paneColumns` | `66` | columns the docked pane asks for, 40 or more. Claude Code caps the dock at 45% of the terminal, and a width you dragged it to, in this session or an earlier one, wins. The wide layout starts at 110, so it needs a terminal of about 245 columns, or `layout: wide` |
@@ -143,6 +144,7 @@ In `/config`, or under `pluginConfigs[<id>].options` in your user `settings.json
 | `palette` | `theme` | `pastel` uses fixed colours tuned for dark terminals |
 | `openOnStart` | `true` | ask to open the pane when a session starts |
 | `statusLine` | `true` | context, running agents, consults and denials in the status line |
+| `consultDir` | `""` | directory holding external consult run JSON files (`""` uses `~/.claude/state/consult-runs`) |
 
 ## External feed
 
@@ -166,6 +168,53 @@ The command writes JSON to `stdout` (every field optional; unknown fields ignore
     { "label": "gem pro", "pct": 38, "resets_at": "2026-11-15T20:00:00Z" }
   ]
 }
+```
+
+## Consult ring
+
+The `consult` panel polls `consultDir` (default `~/.claude/state/consult-runs`) every 2 s while a run is live and every 15 s otherwise, hiding when there is no run or 10 minutes after the newest run ends. Below 40 columns or above 10 engines it collapses to a compact list.
+
+Consult (round 1, spokes fan in to `MAIN`):
+
+```
+╭──────────────────────────────────────────────────────────────╮
+│ CONSULT · consult · R1/1                          3/6 · 0:24 │
+│                        ● copilot 10s                         │
+│                              │                               │
+│                              │                               │
+│       ● claude 18s ─╲        │        ╱─ ◐ gemini 12s        │
+│                      ───◢    ▼    ◣───                       │
+│                          ( MAIN )                            │
+│                      ···◥    ▲    ◤───                       │
+│         ○ qwen ······╱       ·        ╲─ ● codex 20s         │
+│                              ·                               │
+│                              ·                               │
+│                          ○ deepseek                          │
+│ “Which approach fits best?”                                  │
+│ ● done  ◐ running  ○ queued  ✗ failed  ⊘ locked              │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+Debate (round 2+, answers circulate clockwise around the ring):
+
+```
+╭──────────────────────────────────────────────────────────────╮
+│ CONSULT · debate · R2/3                           2/6 · 1:05 │
+│                        ● copilot 10s                         │
+│                       ─▶──────────▶                          │
+│                    ──╱             ──╲                       │
+│       ● claude 12s╱                   ─╲ ◐ gemini 8s         │
+│                  ╱                      ╲                    │
+│                 ▲        ( MAIN )        ▼                   │
+│                  ╲        ⟳ R2/3        ╱                    │
+│        ◐ qwen 6s  ╲─                   ╱ ● codex 14s         │
+│                     ╲──             ╱──                      │
+│                        ╲◀─────────◀─                         │
+│                       ● deepseek 11s                         │
+│                 answers pass round the ring                  │
+│ “Which approach fits best?”                                  │
+│ ● done  ◐ running  ○ queued  ✗ failed  ⊘ locked              │
+╰──────────────────────────────────────────────────────────────╯
 ```
 
 ## Troubleshooting

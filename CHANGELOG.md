@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0
+
+- New `consult` panel (in `PANELS` after `architect`, full width in the wide layout) showing live external `consult-cli` runs as an ellipse of engines around `( MAIN )`, polling `consultDir` (default `~/.claude/state/consult-runs`) every 2 s while live and 15 s otherwise.
+- Round 1 (`all`, `first`, `debate` R1) draws spokes from each engine into `MAIN` (animated packets while running, solid when done, faint dotted when queued, absent when failed/skipped); round 2+ (`debate`, `round2`) draws clockwise ring arcs between participating engines with `⟳ R2/3` under `MAIN` and `answers pass round the ring` below.
+- New surface module `hooks/ring.tsx` animates running spinners (`◐◓◑◒`) and travelling packets every ~110 ms, falling back cleanly to a static grid when `motion` is off or `Client` faults/is absent.
+- Below the ring: question line, legend (`● done  ◐ running  ○ queued  ✗ failed  ⊘ locked`), up to 3 failed/skipped reasons, active quota locks (`⊘ <engine> locked until HH:MM`), and end summary; hides automatically 10 min after ending, and falls back to a compact list below 40 columns or above 10 engines.
+
 ## 0.6.7 (yu)
 
 - A finished job names the model whose work was kept (`state.json` `backend`), not its last attempt: a job that fell back to an agy last-resort model which failed showed that model. A card that just ended is probed once more.

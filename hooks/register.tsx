@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AgentCard, Architect, Bucket, Check, Feed, Gate, Layout, LogLine, Loop, Main, Roster, Turn, Usage, View } from '../types'
+import type { AgentCard, Architect, Bucket, Check, ConsultState, Feed, Gate, Layout, LogLine, Loop, Main, Roster, Turn, Usage, View } from '../types'
 import {
   DEFAULT_ARCHITECT,
   addCard,
@@ -14,14 +14,22 @@ import {
   DEFAULT_VIEW,
   EDIT_TOOLS,
   SCHEMA_VERSION,
+  activeConsultLocks,
   afterCall,
   applyStep,
   bucketOf,
+  buildConsultGrid,
   cellWidth,
+  consultEngineDuration,
+  consultGlyph,
+  consultKindLabel,
+  consultProbe,
   piecesThatFit,
   cardTitle,
   afterCompactHooked,
   afterCompactRead,
+  isConsultLive,
+  isConsultShown,
   isObject,
   afterFillRead,
   afterResponse,
@@ -59,6 +67,7 @@ import {
   momentOf,
   normalize,
   normalizeCard,
+  normalizeConsult,
   normalizeFeed,
   normalizeGate,
   normalizeLog,
@@ -67,11 +76,13 @@ import {
   noteJob,
   noteTool,
   parseJobText,
+  shortConsultEngine,
   shortWorker,
   workerProbe,
   PALETTES,
   SVG_COLORS,
   parseConfig,
+  parseConsult,
   parseFeed,
   prettyModel,
   promptLine,
@@ -85,7 +96,7 @@ import {
   stepSpeed,
   stepLoop,
 } from './core'
-import type { Config, Panel } from './core'
+import type { Config, Panel, RingGridRun } from './core'
 
 const PANE = 'flightdeck'
 const TITLE = 'Flightdeck'
@@ -106,6 +117,7 @@ const receipt = atom({ plugin: 'flightdeck', key: 'receipt' } as const, null)
 const view = atom({ plugin: 'flightdeck', key: 'view' } as const, DEFAULT_VIEW)
 const roster = atom({ plugin: 'flightdeck', key: 'roster' } as const, DEFAULT_ROSTER)
 const feed = atom({ plugin: 'flightdeck', key: 'feed' } as const, null)
+const consult = atom({ plugin: 'flightdeck', key: 'consult' } as const, null)
 
 type ServerBlock = { type: string; id?: string; name?: string; tool_use_id?: string }
 
@@ -152,6 +164,9 @@ async function getRoster($: EngineInterface): Promise<Roster> {
 }
 async function getFeed($: EngineInterface): Promise<Feed | null> {
   return normalizeFeed(await read($, feed))
+}
+async function getConsult($: EngineInterface): Promise<ConsultState | null> {
+  return normalizeConsult(await read($, consult))
 }
 
 /** A stored shape older than this build's: drop what cannot be read, keep the rest. */
@@ -341,6 +356,54 @@ async function seedResumed($: EngineInterface, u: { context: { tokens?: number; 
 
 const WORKER_INTERVAL_MS = 10_000
 const WORKER_TIMEOUT_MS = 5_000
+const CONSULT_TICK_MS = 1_000
+const CONSULT_LIVE_TICKS = 2
+const CONSULT_IDLE_TICKS = 15
+const CONSULT_TIMEOUT_MS = 5_000
+
+type ConsultLock = {
+  inFlight: boolean
+  python: string
+  lastJson: string
+  isLive: boolean
+  ticks: number
+  started: boolean
+  stopped: boolean
+  stopTimer: (() => void) | undefined
+}
+
+/**
+ * Polls the newest external consult run file and locks file via `consultProbe`.
+ * Keeps the last good state on failure and skips overlapping calls.
+ */
+async function pollConsult($: EngineInterface, dir: string, lock: ConsultLock): Promise<boolean | null> {
+  if (lock.inFlight || lock.stopped) return null
+  lock.inFlight = true
+  try {
+    let res: { exitCode: number; stdout: string } | null = null
+    for (const py of lock.python ? [lock.python] : ['python3', 'python']) {
+      res = await $.process.run(consultProbe(py, dir), { timeoutMs: CONSULT_TIMEOUT_MS }).catch(() => null)
+      if (res && res.exitCode === 0) {
+        lock.python = py
+        break
+      }
+    }
+    if (!res || res.exitCode !== 0) return null
+    const parsed = parseConsult(res.stdout)
+    if (!parsed) return null
+    if (res.stdout !== lock.lastJson) {
+      lock.lastJson = res.stdout
+      await update($, consult, () => parsed)
+    }
+    const live = isConsultLive(parsed)
+    lock.isLive = live
+    return live
+  } catch {
+    return null
+  } finally {
+    lock.inFlight = false
+  }
+}
 
 /**
  * Asks each running card's job dir which model works on it now (a job runner falls back from model to
@@ -382,6 +445,7 @@ export const register: Register = (on, options) => {
   let stopFeedTimer: (() => void) | undefined
   const workerLock = { inFlight: false, python: '' }
   let stopWorkerTimer: (() => void) | undefined
+  const consultLock: ConsultLock = { inFlight: false, python: '', lastJson: '', isLive: false, ticks: 0, started: false, stopped: false, stopTimer: undefined }
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -430,6 +494,23 @@ export const register: Register = (on, options) => {
       stopFeedTimer = typeof stop === 'function' ? (stop as () => void) : undefined
       await pollFeed($, cfg.feedCommand, feedLock)
     }
+    if (cfg.panels.includes('consult')) {
+      consultLock.stopped = false
+      consultLock.ticks = 0
+      await pollConsult($, cfg.consultDir, consultLock)
+      if (!consultLock.started) {
+        consultLock.started = true
+        const stopC: unknown = $.clock.every(CONSULT_TICK_MS, () => {
+          if (consultLock.stopped || consultLock.inFlight) return
+          consultLock.ticks += 1
+          const target = consultLock.isLive ? CONSULT_LIVE_TICKS : CONSULT_IDLE_TICKS
+          if (consultLock.ticks < target) return
+          consultLock.ticks = 0
+          void pollConsult($, cfg.consultDir, consultLock)
+        })
+        consultLock.stopTimer = typeof stopC === 'function' ? (stopC as () => void) : undefined
+      }
+    }
     return done
   })
 
@@ -440,6 +521,9 @@ export const register: Register = (on, options) => {
     } else if (e.reason !== 'resume') {
       stopFeedTimer?.()
       stopFeedTimer = undefined
+      consultLock.stopped = true
+      consultLock.stopTimer?.()
+      consultLock.stopTimer = undefined
     }
     // The process goes on in another conversation, whose first request may find no fill: no compaction.
     if (e.reason === 'clear' || e.reason === 'resume') await update($, usage, x => ({ ...normalize(DEFAULT_USAGE, x), hasFill: false }))
@@ -835,11 +919,13 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button } = els
     const hasClient = 'Client' in els
     const hasRail = hasClient && !faulted.has(faultKey(e.surface, 'rail.tsx'))
+    const hasRing = hasClient && !faulted.has(faultKey(e.surface, 'ring.tsx'))
     const hasClock = hasClient && !faulted.has(faultKey(e.surface, 'elapsed.tsx'))
-    const [m, u, a, g, cards, lp, lines, t, r, v, f, now, mono] = await Promise.all([
+    const [m, u, a, cs, g, cards, lp, lines, t, r, v, f, now, mono] = await Promise.all([
       getMain($),
       getUsage($),
       getArchitect($),
+      cfg.panels.includes('consult') ? getConsult($) : null,
       getGate($),
       getCards($),
       getLoops($),
@@ -866,11 +952,13 @@ export const register: Register = (on, options) => {
     const advising = isAdvising(a)
     const running = cards.filter(c => c.status === 'running')
     const showArchitect = a.consults.length > 0 || a.ids.length > 0
+    const showConsult = isConsultShown(cs, now)
     const motion = cfg.motion && hasRail
     // A panel with nothing to show yet takes no room: most sessions never spawn an agent.
     const isEmpty: Record<Panel, boolean> = {
       main: false,
       architect: !showArchitect,
+      consult: !showConsult,
       gate: g.recent.length === 0 && gateSummary(g).total === 0,
       agents: cards.length === 0,
       loops: lp.length === 0,
@@ -1375,9 +1463,172 @@ export const register: Register = (on, options) => {
       )
     }
 
+    // ---- consult (external multi-engine consult / debate ring)
+    const staticRing = (rows: RingGridRun[][], width: number, height: number) => {
+      const face = mono ? { mono: true } : {}
+      const nonEmpty: { y: number; groups: { gap: number; items: RingGridRun[] }[] }[] = []
+      for (let y = 0; y < height; y += 1) {
+        const groups: { gap: number; items: RingGridRun[] }[] = []
+        let cursor = 0
+        for (const rowRun of rows[y] ?? []) {
+          if (rowRun.x >= width || rowRun.x < cursor) continue
+          const text = [...rowRun.text].slice(0, width - rowRun.x).join('')
+          if (!text) continue
+          const gap = rowRun.x - cursor
+          const last = groups[groups.length - 1]
+          const clipped = { ...rowRun, text }
+          if (last && gap === 0) last.items.push(clipped)
+          else groups.push({ gap, items: [clipped] })
+          cursor = rowRun.x + cellWidth(text)
+        }
+        if (groups.length > 0) nonEmpty.push({ y, groups })
+      }
+      return (
+        <Box width={width} flexDirection="column" overflow="hidden">
+          {nonEmpty.map((rowItem, i) => {
+            const prevY = i === 0 ? -1 : nonEmpty[i - 1]!.y
+            const topGap = rowItem.y - prevY - 1
+            const botGap = i === nonEmpty.length - 1 ? height - 1 - rowItem.y : 0
+            return (
+              <Box
+                width={width}
+                overflow="hidden"
+                {...(topGap > 0 ? { marginTop: topGap } : {})}
+                {...(botGap > 0 ? { marginBottom: botGap } : {})}
+              >
+                {rowItem.groups.map(grp => (
+                  <Box flexShrink={0} {...(grp.gap > 0 ? { marginLeft: grp.gap } : {})}>
+                    {grp.items.map(item => (
+                      <Text
+                        color={item.color}
+                        {...(item.bold ? { bold: true } : {})}
+                        {...(item.dim ? { dimColor: true } : {})}
+                        {...face}
+                      >
+                        {item.text}
+                      </Text>
+                    ))}
+                  </Box>
+                ))}
+              </Box>
+            )
+          })}
+        </Box>
+      )
+    }
+
+    const consultPanel = (w: number) => {
+      const run = cs?.run
+      if (!run) return null
+      const innerW = Math.max(12, w - 4)
+      const answered = run.engines.filter(eng => eng.state === 'ok').length
+      const total = run.engines.length
+      const isNarrow = w < 40 || total > 10
+      const isDebate = run.round >= 2 || run.kind === 'round2'
+      const grid = isNarrow ? null : buildConsultGrid(run, innerW, C, now)
+      const reasons = run.engines.filter(eng => (eng.state === 'failed' || eng.state === 'skipped') && eng.reason).slice(0, 3)
+      const locks = activeConsultLocks(cs?.locks ?? {}, now)
+      return (
+        <Box flexDirection="column" borderStyle="round" borderColor={run.stale ? C.amber : C.agent} borderDimColor={run.endedAt !== null} paddingX={1} width={w}>
+          <Box justifyContent="space-between">
+            <Text color={run.stale ? C.amber : C.agent} bold wrap="truncate">
+              {`CONSULT · ${consultKindLabel(run.kind)} · R${run.round}/${run.rounds}`}
+            </Text>
+            <Box flexShrink={0} columnGap={1}>
+              <Text dimColor>{`${answered}/${total}`}</Text>
+              <Text dimColor>·</Text>
+              {run.stale ? <Text color={C.warn} bold>stopped</Text> : clock('consult-clock', run.startedAt, run.endedAt, C.dim)}
+            </Box>
+          </Box>
+          {isNarrow
+            ? run.engines.map(eng => {
+                const gChar = consultGlyph(eng.state)
+                const gColor = eng.state === 'ok' ? C.gate : eng.state === 'running' ? C.agent : eng.state === 'failed' ? C.warn : eng.state === 'skipped' ? C.amber : C.faint
+                const dur = consultEngineDuration(eng, run, now)
+                const maxName = innerW < 28 ? Math.min(12, Math.max(5, innerW - 9)) : 12
+                const name = shortConsultEngine(eng.name, maxName)
+                const reason = eng.reason ? shorten(eng.reason, Math.max(8, innerW - 4)) : ''
+                const fixedW = 1 + 1 + cellWidth(name) + (dur ? 1 + cellWidth(dur) : 0)
+                const canFill = Boolean(reason) && innerW - fixedW >= 4
+                return line(
+                  [
+                    { spans: [{ text: gChar, color: gColor }] },
+                    { spans: [{ text: name, color: eng.state === 'queued' ? C.faint : C.text }] },
+                    dur ? { spans: [{ text: dur, dim: true }] } : null,
+                    canFill ? { fill: true, spans: [{ text: reason, color: eng.state === 'failed' ? C.warn : C.dim }] } : null,
+                  ],
+                  innerW,
+                  1,
+                )
+              })
+            : grid
+              ? cfg.motion && hasRing
+                ? (
+                    <els.Client
+                      key="consult-ring"
+                      module="./ring.tsx"
+                      width={innerW}
+                      height={grid.height}
+                      props={{
+                        active: grid.active,
+                        width: innerW,
+                        height: grid.height,
+                        mono,
+                        rows: grid.rows,
+                        paths: grid.paths,
+                        spinners: grid.spinners,
+                      }}
+                    />
+                  )
+                : staticRing(grid.rows, innerW, grid.height)
+              : null}
+          {!isNarrow && isDebate ? (
+            <Box justifyContent="center" width={innerW}>
+              <Text color={C.dim} wrap="truncate">
+                answers pass round the ring
+              </Text>
+            </Box>
+          ) : null}
+          {run.question ? (
+            <Text dimColor wrap="truncate">
+              {`“${shorten(run.question, Math.max(8, innerW - 2))}”`}
+            </Text>
+          ) : null}
+          {line(
+            [
+              { spans: [{ text: '●', color: C.gate }, { text: ' done', dim: true }] },
+              { spans: [{ text: '◐', color: C.agent }, { text: ' running', dim: true }] },
+              { spans: [{ text: '○', color: C.faint }, { text: ' queued', dim: true }] },
+              { spans: [{ text: '✗', color: C.warn }, { text: ' failed', dim: true }] },
+              { spans: [{ text: '⊘', color: C.amber }, { text: ' locked', dim: true }] },
+            ],
+            innerW,
+            2,
+          )}
+          {!isNarrow
+            ? reasons.map(eng => (
+                <Text color={eng.state === 'failed' ? C.warn : C.amber} wrap="truncate">
+                  {`${consultGlyph(eng.state)} ${shortConsultEngine(eng.name)}: ${shorten(eng.reason ?? '', Math.max(8, innerW - 16))}`}
+                </Text>
+              ))
+            : null}
+          {locks.map(lk => (
+            <Text color={C.amber} wrap="truncate">
+              {`⊘ ${lk.engine} locked until ${lk.hhmm}`}
+            </Text>
+          ))}
+          {run.endedAt !== null && run.summary ? (
+            <Text dimColor wrap="truncate">
+              {run.summary}
+            </Text>
+          ) : null}
+        </Box>
+      )
+    }
+
     // ---- log: whatever rows the other panels leave, 4 to 8
     // The main box's speed line, the legend's gap and the gap above the log are a row each.
-    const used = 2 + legendGap + 5 + (m.speed ? 1 : 0) + (hasFeedA ? 1 : 0) + (hasFeedB ? 1 : 0) + 1 + (showArchitect ? 6 : 0) + 6 + (v.gateOpen ? 5 : 0) + (cards.length > cfg.maxCards ? 3 + Math.min(6, cards.length) : 8) + (expandedCard ? 8 : 0) + (lp.length ? 1 : 0) + 3
+    const used = 2 + legendGap + 5 + (m.speed ? 1 : 0) + (hasFeedA ? 1 : 0) + (hasFeedB ? 1 : 0) + 1 + (showArchitect ? 6 : 0) + (showConsult && cfg.panels.includes('consult') ? 15 : 0) + 6 + (v.gateOpen ? 5 : 0) + (cards.length > cfg.maxCards ? 3 + Math.min(6, cards.length) : 8) + (expandedCard ? 8 : 0) + (lp.length ? 1 : 0) + 3
     const bodyRows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
     const nLog = logRows(bodyRows, used)
     const shownLines = (viewed ? lines.filter(l => l.agentId === viewed) : lines).slice(-nLog)
@@ -1413,15 +1664,17 @@ export const register: Register = (on, options) => {
         ? mainPanel(w)
         : p === 'architect'
           ? architectPanel(w)
-          : p === 'gate'
-            ? gatePanel(w)
-            : p === 'agents'
-              ? agentsPanel(w)
-              : p === 'loops'
-                ? loopsPanel(w)
-                : p === 'receipt'
-                  ? receiptPanel(w)
-                  : logPanel(w)
+          : p === 'consult'
+            ? consultPanel(w)
+            : p === 'gate'
+              ? gatePanel(w)
+              : p === 'agents'
+                ? agentsPanel(w)
+                : p === 'loops'
+                  ? loopsPanel(w)
+                  : p === 'receipt'
+                    ? receiptPanel(w)
+                    : logPanel(w)
 
     // Panels with the flow between them; the agents panel draws its own rails.
     const column = (ps: Panel[], w: number) => (
@@ -1429,7 +1682,7 @@ export const register: Register = (on, options) => {
         {ps.map((p, i) => {
           const prev = ps[i - 1]
           const link =
-            i === 0 || p === 'agents' || prev === 'agents' || p === 'log' || p === 'loops' || prev === 'loops'
+            i === 0 || p === 'agents' || prev === 'agents' || p === 'consult' || prev === 'consult' || p === 'log' || p === 'loops' || prev === 'loops'
               ? null
               : rail(`link-${p}`, p === 'architect' ? advising : m.isRunning, p === 'architect' ? C.arch : C.main, w)
           return (
@@ -1557,6 +1810,7 @@ export const register: Register = (on, options) => {
           {column(panels.filter(p => p === 'main' || p === 'architect' || p === 'gate'), colW)}
           {column(panels.filter(p => p === 'agents' || p === 'loops' || p === 'receipt'), colW)}
         </Box>
+        {panels.includes('consult') ? consultPanel(W) : null}
         {panels.includes('log') ? logPanel(W) : null}
       </Box>
     ) : (

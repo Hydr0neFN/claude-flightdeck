@@ -60,6 +60,16 @@ import {
   jobsCost,
   shortWorker,
   workerProbe,
+  CONSULT_HIDE_AFTER_MS,
+  PALETTES,
+  activeConsultLocks,
+  buildConsultGrid,
+  consultProbe,
+  isConsultLive,
+  isConsultShown,
+  parseConsult,
+  ringLayout,
+  shortConsultEngine,
 } from '../hooks/core'
 
 test('a context budget smaller than the window is what the gauge measures against', () => {
@@ -232,7 +242,8 @@ test('consults open, close by id, and draw on a shared timeline', () => {
 
 test('config is read leniently: bad values fall back to defaults', () => {
   const d = parseConfig({})
-  expect([d.maxCards, d.paneColumns, d.layout, d.motion, d.moments, d.panels.length]).toEqual([3, 66, 'auto', true, true, 7])
+  expect([d.maxCards, d.paneColumns, d.layout, d.motion, d.moments, d.panels.length]).toEqual([3, 66, 'auto', true, true, 8])
+  expect(d.panels[2]).toBe('consult')
   expect(d.architect.test('fable-advisor:fable-advisor')).toBe(true)
   const c = parseConfig({ architectPattern: '([', maxCards: 99, layout: 'diagonal', panels: 'log, gate ,nope,gate', motion: 'off' })
   expect(c.architect.test('advisor')).toBe(true) // invalid regex → default
@@ -1569,7 +1580,7 @@ test('parseFeed validates types, caps gem at 2, clamps pct 0-100, and rejects ba
   ]).toEqual([[], [], [], [], [], [], ['node', 'feed.mjs']])
 })
 
-test('external feed polls on start and every 30s, keeps last good on error, skips overlap, and renders in main panel', { options: { feedCommand: '["feed-cmd","--json"]' } }, async ($, on) => {
+test('external feed polls on start and every 30s, keeps last good on error, skips overlap, and renders in main panel', { options: { feedCommand: '["feed-cmd","--json"]', panels: 'main,architect,gate,agents,loops,receipt,log' } }, async ($, on) => {
   const clock = engine(on)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -1688,7 +1699,7 @@ test('external feed polls on start and every 30s, keeps last good on error, skip
   await emptyUi.unmount()
 })
 
-test('when feedCommand is empty, no process is run and no feed lines render', async ($, on) => {
+test('when feedCommand is empty, no process is run and no feed lines render', { options: { panels: 'main,architect,gate,agents,loops,receipt,log' } }, async ($, on) => {
   const clock = engine(on)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -1704,4 +1715,467 @@ test('when feedCommand is empty, no process is run and no feed lines render', as
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
   expect(await ui.find({ text: /DS ¥/ })).toBeUndefined()
   await ui.unmount()
+})
+
+// ---------------------------------------------------------------- consult ring
+
+const ARROWS = new Set(['▲', '▼', '◀', '▶', '◥', '◤', '◣', '◢'])
+
+test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and connects spokes & clockwise arcs', () => {
+  for (const n of [3, 7, 10]) {
+    const rows = n <= 6 ? 11 : 13
+    for (const cols of [40, 62, 116]) {
+      const nodes = Array.from({ length: n }, (_, i) => {
+        const label = `● eng${i} ${10 + i}s`
+        return { label, width: cellWidth(label) }
+      })
+      const L = ringLayout(nodes, cols, rows)
+      expect(L.rows).toBe(rows)
+      expect(L.nodes.length).toBe(n)
+      // Angles start at top (0) and advance clockwise.
+      expect(L.nodes[0]?.angle).toBe(0)
+      expect(L.nodes[0]?.labelY).toBe(0)
+      for (let i = 1; i < n; i += 1) expect(L.nodes[i]!.angle).toBeGreaterThan(L.nodes[i - 1]!.angle)
+
+      // Fit inside cols x rows, right-aligned on left half, left-aligned on right half, no centre overlap.
+      for (const nd of L.nodes) {
+        expect(nd.labelX >= 0 && nd.labelX + nd.width <= cols).toBe(true)
+        expect(nd.labelY >= 0 && nd.labelY < rows).toBe(true)
+        if (nd.align === 'left') expect(nd.labelX).toBeGreaterThan(nd.anchorX)
+        if (nd.align === 'right') expect(nd.labelX + nd.width - 1).toBeLessThan(nd.anchorX)
+        const overlapsCentre =
+          nd.labelY === L.centre.y && !(nd.labelX + nd.width <= L.centre.x || nd.labelX >= L.centre.x + L.centre.width)
+        expect(overlapsCentre).toBe(false)
+      }
+
+      // No two labels overlap.
+      for (let i = 0; i < n; i += 1) {
+        for (let j = i + 1; j < n; j += 1) {
+          const a = L.nodes[i]!
+          const b = L.nodes[j]!
+          if (a.labelY === b.labelY) {
+            expect(a.labelX + a.width <= b.labelX || b.labelX + b.width <= a.labelX).toBe(true)
+          }
+        }
+      }
+
+      // Every spoke fits, stays clear of labels, and ends next to centre with an arrowhead pointing at it.
+      expect(L.spokes.length).toBe(n)
+      for (const sp of L.spokes) {
+        expect(sp.length).toBeGreaterThan(0)
+        const last = sp[sp.length - 1]!
+        expect(ARROWS.has(last.glyph)).toBe(true)
+        const dx =
+          last.x < L.centre.x
+            ? L.centre.x - last.x
+            : last.x >= L.centre.x + L.centre.width
+              ? last.x - (L.centre.x + L.centre.width - 1)
+              : 0
+        const dy = Math.abs(last.y - L.centre.y)
+        expect(Math.max(dx, dy)).toBe(1)
+        // Arrowhead points toward centre.
+        const cMid = L.centre.x + (L.centre.width - 1) / 2
+        if (last.y < L.centre.y) expect(['▼', '◢', '◣'].includes(last.glyph)).toBe(true)
+        else if (last.y > L.centre.y) expect(['▲', '◥', '◤'].includes(last.glyph)).toBe(true)
+        else if (last.x < cMid) expect(last.glyph).toBe('▶')
+        else expect(last.glyph).toBe('◀')
+        for (const c of sp) {
+          expect(c.x >= 0 && c.x < cols && c.y >= 0 && c.y < rows).toBe(true)
+          for (const nd of L.nodes) {
+            expect(c.y === nd.labelY && c.x >= nd.labelX && c.x < nd.labelX + nd.width).toBe(false)
+          }
+        }
+      }
+
+      // Ring arcs connect neighbours clockwise with arrowheads.
+      expect(L.arcs.length).toBe(n)
+      for (let i = 0; i < n; i += 1) {
+        const arc = L.arcs[i]!
+        const curr = L.nodes[i]!
+        const next = L.nodes[(i + 1) % n]!
+        expect(arc.length).toBeGreaterThan(0)
+        expect(arc[0]!.x === curr.anchorX && arc[0]!.y === curr.anchorY).toBe(true)
+        const end = arc[arc.length - 1]!
+        expect(Math.max(Math.abs(end.x - next.anchorX), Math.abs(end.y - next.anchorY))).toBeLessThanOrEqual(1)
+        expect(arc.some(c => ARROWS.has(c.glyph))).toBe(true)
+        for (let k = 1; k < arc.length; k += 1) {
+          const prev = arc[k - 1]!
+          const cur = arc[k]!
+          expect(Math.max(Math.abs(cur.x - prev.x), Math.abs(cur.y - prev.y))).toBeLessThanOrEqual(1)
+        }
+      }
+    }
+  }
+})
+
+const makeRun = (over: Record<string, unknown> = {}) => ({
+  v: 1,
+  id: '1000-42',
+  pid: 42,
+  kind: 'all',
+  startedAt: 10_000,
+  endedAt: null,
+  question: 'Which architecture best separates the parser from IO?',
+  round: 1,
+  rounds: 1,
+  engines: [
+    { name: 'copilot:gpt-5', state: 'ok', startedAt: 10_000, endedAt: 22_000, reason: null, note: null },
+    { name: 'gemini/pro', state: 'running', startedAt: 10_000, endedAt: null, reason: null, note: null },
+    { name: 'codex', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null },
+    { name: 'deepseek', state: 'failed', startedAt: 10_000, endedAt: 15_000, reason: 'HTTP 502 from upstream', note: null },
+    { name: 'qwen:very-long-model-name-here', state: 'skipped', startedAt: null, endedAt: null, reason: 'quota locked', note: null },
+  ],
+  summary: null,
+  ...over,
+})
+
+test('consult probe parsing handles live, ended, stale, missing file and bad JSON', () => {
+  const argv = consultProbe('python3', '/tmp/runs')
+  expect(argv[0]).toBe('python3')
+  expect(argv[3]).toBe('/tmp/runs')
+  expect(argv[2]).toContain('os.kill')
+  expect(argv[2]).toContain('consult-locks.json')
+
+  const live = parseConsult(JSON.stringify({ run: makeRun(), locks: {} }))
+  expect(live?.run?.stale).toBe(false)
+  expect(isConsultLive(live)).toBe(true)
+  expect(shortConsultEngine('copilot:gpt-5')).toBe('copilot')
+  expect(shortConsultEngine('openrouter/deepseek:r1')).toBe('openrouter')
+  expect(shortConsultEngine('superlongenginenamehere')).toBe('superlongen…')
+
+  const ended = parseConsult(JSON.stringify({ run: makeRun({ endedAt: 50_000, summary: '3 ok · 1 failed · 1 skipped' }), locks: {} }))
+  expect(ended?.run?.endedAt).toBe(50_000)
+  expect(ended?.run?.stale).toBe(false)
+  expect(isConsultLive(ended)).toBe(false)
+
+  const stale = parseConsult(JSON.stringify({ run: makeRun({ stale: true }), locks: {} }))
+  expect(stale?.run?.stale).toBe(true)
+  expect(isConsultLive(stale)).toBe(false)
+
+  const missing = parseConsult(JSON.stringify({ run: null, locks: {} }))
+  expect(missing).toEqual({ run: null, locks: {} })
+  expect(isConsultShown(missing, 100_000)).toBe(false)
+
+  expect(parseConsult('not json')).toBeNull()
+  expect(parseConsult('{oops')).toBeNull()
+  expect(parseConsult('[]')).toBeNull()
+  expect(parseConsult('null')).toBeNull()
+  expect(parseConsult('{}')).toBeNull()
+  expect(parseConsult(JSON.stringify({ run: 'bad', locks: {} }))).toBeNull()
+
+  // Active vs expired locks
+  const futureMs = new Date('2026-11-16T22:54:00').getTime()
+  const pastMs = futureMs - 60_000
+  const parsedLocks = parseConsult(
+    JSON.stringify({
+      run: null,
+      locks: {
+        codex: { until: new Date(futureMs).toISOString(), reason: 'rate limit', at: new Date(pastMs).toISOString() },
+        old: { until: new Date(pastMs - 10_000).toISOString(), reason: 'old', at: new Date(pastMs - 20_000).toISOString() },
+      },
+    }),
+  )
+  const active = activeConsultLocks(parsedLocks?.locks ?? {}, futureMs - 30_000)
+  expect(active).toEqual([{ engine: 'codex', hhmm: new Date(futureMs).toTimeString().slice(0, 5), reason: 'rate limit' }])
+})
+
+test('consult panel hides when empty or ended > 10 min ago, and uses narrow fallback below 40 cols or > 10 engines', async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+
+  let payload = JSON.stringify({ run: null, locks: {} })
+  on('process.run', () => ({ value: { exitCode: 0, stdout: payload, stderr: '' } }) as never)
+
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const emptyUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await emptyUi.find({ text: /CONSULT/ })).toBeUndefined()
+  await emptyUi.unmount()
+
+  // Ended run within 10 min is shown; past 10 min is hidden.
+  const endedAt = 100_000
+  await clock.advance(endedAt)
+  payload = JSON.stringify({ run: makeRun({ endedAt, summary: 'all done' }), locks: {} })
+  await clock.advance(15_000) // now = 115_000 (15s since ended)
+  expect(isConsultShown(parseConsult(payload), endedAt + CONSULT_HIDE_AFTER_MS)).toBe(true)
+  expect(isConsultShown(parseConsult(payload), endedAt + CONSULT_HIDE_AFTER_MS + 1)).toBe(false)
+
+  const recentUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await recentUi.find({ text: /CONSULT · consult · R1\/1/ })).toBeDefined()
+  expect(await recentUi.find({ text: /all done/ })).toBeDefined()
+  await recentUi.unmount()
+
+  await clock.advance(CONSULT_HIDE_AFTER_MS)
+  const expiredUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await expiredUi.find({ text: /CONSULT/ })).toBeUndefined()
+  await expiredUi.unmount()
+
+  // Narrow fallback (< 40 cols) renders compact list without ring.
+  const liveRun = makeRun({ startedAt: 700_000 })
+  payload = JSON.stringify({ run: liveRun, locks: {} })
+  await clock.advance(15_000)
+  for (const cols of [24, 36]) {
+    const narrow = await $.ui.mount({ ...pane(cols), surface: 'terminal' })
+    expect(await narrow.find({ text: /CONSULT · consult · R1\/1/ })).toBeDefined()
+    expect(await narrow.find({ key: 'consult-ring' })).toBeUndefined()
+    expect(await narrow.find({ text: /^copilot$/ })).toBeDefined()
+    expect(await narrow.find({ text: /\( MAIN \)/ })).toBeUndefined()
+    await narrow.unmount()
+  }
+
+  // > 10 engines also triggers compact list even at 64 cols.
+  const eleven = Array.from({ length: 11 }, (_, i) => ({
+    name: `eng${i}`,
+    state: i === 0 ? 'ok' : 'queued',
+    startedAt: i === 0 ? 700_000 : null,
+    endedAt: i === 0 ? 705_000 : null,
+    reason: null,
+    note: null,
+  }))
+  payload = JSON.stringify({ run: makeRun({ engines: eleven }), locks: {} })
+  await clock.advance(2_000)
+  const manyUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await manyUi.find({ key: 'consult-ring' })).toBeUndefined()
+  expect(await manyUi.find({ text: /^eng10$/ })).toBeDefined()
+  await manyUi.unmount()
+})
+
+test('consult panel renders consult and debate views, animates ring.tsx, polls 2s/15s, and handles stale, locks, faults & wide layout', { options: { consultDir: '/custom/consult-runs' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+
+  const lockUntil = new Date('2026-11-16T22:54:00').getTime()
+  const expectedHhmm = new Date(lockUntil).toTimeString().slice(0, 5)
+  let pollCount = 0
+  let lastDir = ''
+  let mode: 'consult' | 'debate' | 'stale' | 'ended' | 'error' | 'hang' = 'consult'
+  let releaseHang: () => void = () => {}
+
+  on('process.run', async (_$, e) => {
+    pollCount += 1
+    lastDir = e.argv[3] ?? ''
+    if (mode === 'error') return { value: { exitCode: 1, stdout: '', stderr: 'boom' } } as never
+    if (mode === 'hang') {
+      await new Promise<void>(resolve => {
+        releaseHang = resolve
+      })
+      return { value: { exitCode: 0, stdout: '{bad', stderr: '' } } as never
+    }
+    const lockObj = { codex: { until: new Date(lockUntil).toISOString(), reason: '429', at: new Date(0).toISOString() } }
+    if (mode === 'consult') {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            run: makeRun({ startedAt: 10_000 }),
+            locks: lockObj,
+          }),
+          stderr: '',
+        },
+      } as never
+    }
+    if (mode === 'debate') {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            run: makeRun({
+              kind: 'debate',
+              round: 2,
+              rounds: 3,
+              startedAt: 10_000,
+              engines: [
+                { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 18_000, reason: null, note: null },
+                { name: 'gemini', state: 'running', startedAt: 10_000, endedAt: null, reason: null, note: null },
+                { name: 'codex', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null },
+                { name: 'deepseek', state: 'failed', startedAt: 10_000, endedAt: 14_000, reason: 'timeout', note: null },
+                { name: 'qwen', state: 'ok', startedAt: 10_000, endedAt: 19_000, reason: null, note: null },
+                { name: 'claude', state: 'running', startedAt: 10_000, endedAt: null, reason: null, note: null },
+              ],
+            }),
+            locks: lockObj,
+          }),
+          stderr: '',
+        },
+      } as never
+    }
+    if (mode === 'stale') {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({ run: makeRun({ kind: 'first', stale: true }), locks: {} }),
+          stderr: '',
+        },
+      } as never
+    }
+    return {
+      value: {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          run: makeRun({
+            kind: 'round2',
+            round: 2,
+            rounds: 2,
+            endedAt: 55_000,
+            summary: 'Consensus reached: separate parser from IO',
+            engines: [
+              { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 22_000, reason: null, note: null },
+              { name: 'gemini', state: 'ok', startedAt: 10_000, endedAt: 24_000, reason: null, note: null },
+              { name: 'codex', state: 'ok', startedAt: 10_000, endedAt: 28_000, reason: null, note: null },
+            ],
+          }),
+          locks: {},
+        }),
+        stderr: '',
+      },
+    } as never
+  })
+
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  expect(pollCount).toBe(1)
+  expect(lastDir).toBe('/custom/consult-runs')
+
+  // Verify buildConsultGrid spoke/arc rules directly.
+  const cRun = parseConsult(JSON.stringify({ run: makeRun({ startedAt: 10_000 }), locks: {} }))!.run!
+  const cGrid = buildConsultGrid(cRun, 60, PALETTES.theme, 15_000)
+  expect(cGrid.paths.length).toBe(1) // only the running engine spoke is animated
+  expect(cGrid.spinners.length).toBe(1)
+  const flatC = cGrid.rows.flat().map(r => r.text).join('')
+  expect(flatC).toContain('·') // queued dotted spoke
+  // Failed (index 3) and skipped (index 4) have no spoke cells rendered.
+  for (const idx of [3, 4]) {
+    for (const c of cGrid.layout.spokes[idx] ?? []) {
+      const hit = (cGrid.rows[c.y] ?? []).some(r => c.x >= r.x && c.x < r.x + cellWidth(r.text))
+      expect(hit).toBe(false)
+    }
+  }
+
+  // Consult view (round 1): animated ring, legend, question, failure reason, lock without emoji.
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui.find({ text: /CONSULT · consult · R1\/1/ })).toBeDefined()
+  expect(await ui.find({ text: /^1\/5$/ })).toBeDefined()
+  expect(await ui.find({ text: /“Which architecture best separates/ })).toBeDefined()
+  expect(await ui.find({ text: /done/ })).toBeDefined()
+  expect(await ui.find({ text: /deepseek: HTTP 502/ })).toBeDefined()
+  expect(await ui.find({ text: new RegExp(`⊘ codex locked until ${expectedHhmm}`) })).toBeDefined()
+  expect(await ui.find({ text: /🔒/ })).toBeUndefined()
+  expect((await ui.find({ key: 'consult-ring' }))?.type).toBe('Client')
+
+  // Client ring animates spinner (◐◓◑◒) and packet (●) across 110ms frames.
+  const spinners = new Set<string>()
+  const ringFrames: string[] = []
+  for (let f = 0; f < 6; f += 1) {
+    const ringTree = await ui.drawn({ in: 'consult-ring' })
+    const txt = JSON.stringify(ringTree)
+    ringFrames.push(txt)
+    for (const ch of ['◐', '◓', '◑', '◒']) if (txt.includes(ch)) spinners.add(ch)
+    await ui.advance(110)
+  }
+  expect(spinners.size).toBe(4)
+  expect(new Set(ringFrames).size).toBeGreaterThan(2)
+  await ui.unmount()
+
+  // Live polling runs every 2s, and keeps last good state on error or bad JSON.
+  const beforePoll = pollCount
+  mode = 'error'
+  await clock.advance(2_000)
+  expect(pollCount).toBe(beforePoll + 1)
+  mode = 'hang'
+  await clock.advance(2_000)
+  expect(pollCount).toBe(beforePoll + 2)
+  await clock.advance(2_000)
+  expect(pollCount).toBe(beforePoll + 2) // in-flight probe skipped
+  releaseHang()
+  await Promise.resolve()
+  await Promise.resolve()
+
+  // Still kept consult run after error/bad JSON!
+  const keptUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await keptUi.find({ text: /CONSULT · consult · R1\/1/ })).toBeDefined()
+  await keptUi.unmount()
+
+  // Debate view (round 2/3): centre ⟳ R2/3, answers pass round the ring, clockwise arcs animate.
+  mode = 'debate'
+  await clock.advance(2_000)
+  const debUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await debUi.find({ text: /CONSULT · debate · R2\/3/ })).toBeDefined()
+  expect(await debUi.find({ text: /^answers pass round the ring$/ })).toBeDefined()
+  const debRing = JSON.stringify(await debUi.drawn({ in: 'consult-ring' }))
+  expect(debRing).toContain('⟳')
+  expect(debRing).toContain('R2/3')
+  expect(debRing).toContain('MAIN')
+  await debUi.unmount()
+
+  // Wide layout (W = 120): consult panel takes full width 120, not halved.
+  const wideUi = await $.ui.mount({ ...pane(120), surface: 'terminal' })
+  const consultTitle = await wideUi.find({ text: /CONSULT · debate · R2\/3/ })
+  expect(consultTitle).toBeDefined()
+  expect((await wideUi.find({ key: 'consult-ring' }))?.props.width).toBe(116)
+  await wideUi.unmount()
+
+  // Width check across 24..40, 64, 120 on terminal and desktop (including vscode static fallback).
+  const failures: string[] = []
+  for (const surface of ['terminal', 'desktop', 'vscode'] as const) {
+    for (const cols of [24, 32, 39, 40, 64, 120]) {
+      const wUi = await $.ui.mount({ ...pane(cols), surface })
+      const tree = await wUi.drawn()
+      for (const s of spillsOf(tree, cols)) failures.push(`${surface} ${cols}: ${s}`)
+      if (surface !== 'vscode') for (const f of desktopFaults(tree, [])) failures.push(`${surface} ${cols}: ${f}`)
+      await wUi.unmount()
+    }
+  }
+  expect(failures).toEqual([])
+
+  // Static fallback on surface without Client (vscode) draws ◐ and no packet animation.
+  const staticUi = await $.ui.mount({ ...pane(64), surface: 'vscode' })
+  expect(await staticUi.find({ key: 'consult-ring' })).toBeUndefined()
+  expect(await staticUi.find({ text: /^◐$/ })).toBeDefined()
+  await staticUi.unmount()
+
+  // Ended run stops live polling (switches to 15s) and shows summary.
+  mode = 'ended'
+  await clock.advance(2_000)
+  const pAfterEnd = pollCount
+  await clock.advance(4_000)
+  expect(pollCount).toBe(pAfterEnd) // 2s ticks no longer fire
+  await clock.advance(11_000)
+  expect(pollCount).toBe(pAfterEnd + 1) // 15s tick fires
+
+  const endUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await endUi.find({ text: /CONSULT · round 2 · R2\/2/ })).toBeDefined()
+  expect(await endUi.find({ text: /Consensus reached: separate parser from IO/ })).toBeDefined()
+  await endUi.unmount()
+
+  // Stale run shows `stopped` in warn colour.
+  mode = 'stale'
+  await clock.advance(15_000)
+  const staleUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await staleUi.find({ text: /CONSULT · first-wins · R1\/1/ })).toBeDefined()
+  const stopped = await staleUi.find({ text: /^stopped$/ })
+  expect(stopped?.props.color).toBe(PALETTES.theme.warn)
+  await staleUi.unmount()
+})
+
+test('with motion off, consult ring draws static grid with ◐ and no Client', { options: { motion: 'off' } }, async ($, on) => {
+  engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('process.run', () => ({
+    value: {
+      exitCode: 0,
+      stdout: JSON.stringify({ run: makeRun({ kind: 'debate', round: 2, rounds: 3 }), locks: {} }),
+      stderr: '',
+    },
+  }) as never)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui.find({ key: 'consult-ring' })).toBeUndefined()
+  expect(await ui.find({ text: /^◐$/ })).toBeDefined()
+  expect(await ui.find({ text: /^answers pass round the ring$/ })).toBeDefined()
+  await ui.unmount()
+  expect(faultKey('desktop', 'hooks/ring.tsx')).toBe('desktop:ring.tsx')
 })

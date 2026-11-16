@@ -141,6 +141,44 @@ export type Feed = {
   at: number
 }
 
+export type ConsultEngineState = 'queued' | 'running' | 'ok' | 'failed' | 'skipped'
+
+export type ConsultEngine = {
+  name: string
+  state: ConsultEngineState
+  startedAt: number | null
+  endedAt: number | null
+  reason: string | null
+  note: string | null
+}
+
+export type ConsultRun = {
+  v: number
+  id: string
+  pid: number
+  kind: string
+  startedAt: number
+  endedAt: number | null
+  question: string
+  round: number
+  rounds: number
+  engines: ConsultEngine[]
+  summary: string | null
+  stale?: boolean
+}
+
+export type ConsultLock = {
+  until: string
+  untilMs: number | null
+  reason: string
+  at: string
+}
+
+export type ConsultState = {
+  run: ConsultRun | null
+  locks: Record<string, ConsultLock>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'flightdeck': {
@@ -148,6 +186,7 @@ declare module 'claude-code' {
       main: Main
       usage: Usage
       architect: Architect
+      consult: ConsultState | null
       gate: Gate
       agents: AgentCard[]
       loops: Loop[]

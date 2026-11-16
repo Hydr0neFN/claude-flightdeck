@@ -6,6 +6,11 @@ import type {
   Architect,
   Bucket,
   Check,
+  ConsultEngine,
+  ConsultEngineState,
+  ConsultLock,
+  ConsultRun,
+  ConsultState,
   Feed,
   Gate,
   GemLimit,
@@ -102,8 +107,8 @@ export const normalizeLog = (stored: unknown): LogLine[] =>
 
 // ---------------------------------------------------------------- config
 
-export type Panel = 'main' | 'architect' | 'gate' | 'agents' | 'loops' | 'receipt' | 'log'
-const PANELS: readonly Panel[] = ['main', 'architect', 'gate', 'agents', 'loops', 'receipt', 'log']
+export type Panel = 'main' | 'architect' | 'consult' | 'gate' | 'agents' | 'loops' | 'receipt' | 'log'
+const PANELS: readonly Panel[] = ['main', 'architect', 'consult', 'gate', 'agents', 'loops', 'receipt', 'log']
 
 export type Config = {
   architect: RegExp
@@ -122,6 +127,8 @@ export type Config = {
   feedCommand: string[]
   /** Tokens the context gauge measures against when fewer than the host's window; 0 = the host's window. */
   ctxBudget: number
+  /** Directory holding external consult run files; '' = ~/.claude/state/consult-runs. */
+  consultDir: string
 }
 
 const safeRegExp = (source: string, fallback: string) => {
@@ -172,6 +179,7 @@ export const parseConfig = (o: Readonly<Record<string, unknown>>): Config => {
     statusLine: bool('statusLine', true),
     feedCommand: parseFeedCommand(o.feedCommand),
     ctxBudget: typeof o.ctxBudget === 'number' && Number.isFinite(o.ctxBudget) && o.ctxBudget > 0 ? Math.round(o.ctxBudget) : 0,
+    consultDir: typeof o.consultDir === 'string' ? o.consultDir.trim() : '',
   }
 }
 
@@ -840,3 +848,606 @@ export const adviceLine = (report: string) => {
 }
 
 export const elapsedOf = (c: AgentCard, now: number) => (c.endedAt ?? now) - c.spawnedAt
+
+// ---------------------------------------------------------------- consult ring
+
+export const CONSULT_HIDE_AFTER_MS = 10 * 60_000
+
+/**
+ * The argv that prints `{ run, locks }` from `dir` (or `~/.claude/state/consult-runs` when empty) and
+ * `~/.claude/state/consult-locks.json`. Marks `run.stale = true` when `endedAt` is null and `os.kill(pid, 0)` fails.
+ */
+export const consultProbe = (python: string, dir: string): string[] => [
+  python,
+  '-c',
+  'import json,os,sys\nhome=os.path.expanduser("~")\nd=os.path.expanduser(sys.argv[1]) if len(sys.argv)>1 and sys.argv[1] else os.path.join(home,".claude","state","consult-runs")\nlp=os.path.join(home,".claude","state","consult-locks.json")\nrun=None\ntry:\n files=[os.path.join(d,f) for f in os.listdir(d) if f.endswith(".json") and not f.startswith(".")]\n files=[f for f in files if os.path.isfile(f)]\n if files:\n  files.sort(key=lambda p:(os.stat(p).st_mtime_ns,os.path.basename(p)),reverse=True)\n  with open(files[0],"r",encoding="utf-8") as fh:\n   data=json.load(fh)\n  if isinstance(data,dict): run=data\nexcept Exception:\n run=None\nif isinstance(run,dict) and run.get("endedAt") is None:\n pid=run.get("pid")\n if isinstance(pid,int) and not isinstance(pid,bool) and pid>0:\n  try:\n   os.kill(pid,0)\n  except PermissionError:\n   pass\n  except OSError:\n   run["stale"]=True\n else:\n  run["stale"]=True\nlocks={}\ntry:\n with open(lp,"r",encoding="utf-8") as fh:\n  ld=json.load(fh)\n if isinstance(ld,dict): locks=ld\nexcept Exception:\n locks={}\nprint(json.dumps({"run":run,"locks":locks}))',
+  dir,
+]
+
+const isEngineState = (v: unknown): v is ConsultEngineState =>
+  v === 'queued' || v === 'running' || v === 'ok' || v === 'failed' || v === 'skipped'
+
+const normalizeEngine = (raw: unknown): ConsultEngine | null => {
+  if (!isObject(raw) || typeof raw.name !== 'string' || !raw.name.trim()) return null
+  return {
+    name: raw.name.trim(),
+    state: isEngineState(raw.state) ? raw.state : 'queued',
+    startedAt: typeof raw.startedAt === 'number' && Number.isFinite(raw.startedAt) ? raw.startedAt : null,
+    endedAt: typeof raw.endedAt === 'number' && Number.isFinite(raw.endedAt) ? raw.endedAt : null,
+    reason: typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason.trim() : null,
+    note: typeof raw.note === 'string' && raw.note.trim() ? raw.note.trim() : null,
+  }
+}
+
+const normalizeConsultRun = (raw: unknown): ConsultRun | null => {
+  if (!isObject(raw) || !Array.isArray(raw.engines)) return null
+  const engines = raw.engines.map(normalizeEngine).filter((e): e is ConsultEngine => e !== null)
+  const endedAt = typeof raw.endedAt === 'number' && Number.isFinite(raw.endedAt) ? raw.endedAt : null
+  return {
+    v: typeof raw.v === 'number' && Number.isFinite(raw.v) ? raw.v : 1,
+    id: typeof raw.id === 'string' ? raw.id : '',
+    pid: typeof raw.pid === 'number' && Number.isFinite(raw.pid) ? raw.pid : 0,
+    kind: typeof raw.kind === 'string' && raw.kind.trim() ? raw.kind.trim() : 'all',
+    startedAt: typeof raw.startedAt === 'number' && Number.isFinite(raw.startedAt) ? raw.startedAt : 0,
+    endedAt,
+    question: typeof raw.question === 'string' ? raw.question.replace(/\s+/g, ' ').trim() : '',
+    round: typeof raw.round === 'number' && Number.isFinite(raw.round) && raw.round >= 1 ? Math.round(raw.round) : 1,
+    rounds: typeof raw.rounds === 'number' && Number.isFinite(raw.rounds) && raw.rounds >= 1 ? Math.round(raw.rounds) : 1,
+    engines,
+    summary: typeof raw.summary === 'string' && raw.summary.trim() ? raw.summary.trim() : null,
+    stale: endedAt === null && raw.stale === true,
+  }
+}
+
+const normalizeConsultLocks = (raw: unknown): Record<string, ConsultLock> => {
+  const locks: Record<string, ConsultLock> = {}
+  if (!isObject(raw)) return locks
+  for (const [k, v] of Object.entries(raw)) {
+    if (!isObject(v) || typeof v.until !== 'string') continue
+    const ms = typeof v.untilMs === 'number' && Number.isFinite(v.untilMs) ? v.untilMs : Date.parse(v.until)
+    locks[k] = {
+      until: v.until,
+      untilMs: Number.isFinite(ms) ? ms : null,
+      reason: typeof v.reason === 'string' ? v.reason : '',
+      at: typeof v.at === 'string' ? v.at : '',
+    }
+  }
+  return locks
+}
+
+/** Parse `consultProbe` stdout JSON; returns null on malformed output. */
+export const parseConsult = (stdout: string): ConsultState | null => {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    return null
+  }
+  if (!isObject(raw) || (!('run' in raw) && !('locks' in raw))) return null
+  if (raw.run !== undefined && raw.run !== null && !isObject(raw.run)) return null
+  return {
+    run: raw.run ? normalizeConsultRun(raw.run) : null,
+    locks: normalizeConsultLocks(raw.locks),
+  }
+}
+
+/** Stored consult state normalized safely over defaults, or null when unread. */
+export const normalizeConsult = (stored: unknown): ConsultState | null => {
+  if (!isObject(stored)) return null
+  return {
+    run: normalizeConsultRun(stored.run),
+    locks: normalizeConsultLocks(stored.locks),
+  }
+}
+
+export const isConsultShown = (c: ConsultState | null | undefined, now: number): boolean => {
+  const run = c?.run
+  if (!run) return false
+  return run.endedAt === null || now - run.endedAt <= CONSULT_HIDE_AFTER_MS
+}
+
+export const isConsultLive = (c: ConsultState | null | undefined): boolean =>
+  Boolean(c?.run && c.run.endedAt === null && !c.run.stale)
+
+const KIND_LABELS: Record<string, string> = {
+  all: 'consult',
+  first: 'first-wins',
+  debate: 'debate',
+  round2: 'round 2',
+}
+
+export const consultKindLabel = (kind: string) => KIND_LABELS[kind] ?? (kind || 'consult')
+
+/** Strip `:model` suffix / `/` variant and cap to `max` cells (default 12). */
+export const shortConsultEngine = (name: string, max = 12): string => {
+  const clean = name.trim()
+  if (!clean) return '?'
+  const noModel = clean.split(':')[0] ?? clean
+  const base = noModel.split('/')[0] ?? noModel
+  return shorten(base || clean, max)
+}
+
+export const consultGlyph = (state: ConsultEngineState): string =>
+  state === 'ok' ? '●' : state === 'running' ? '◐' : state === 'failed' ? '✗' : state === 'skipped' ? '⊘' : '○'
+
+export const activeConsultLocks = (
+  locks: Record<string, ConsultLock>,
+  now: number,
+): { engine: string; hhmm: string; reason: string }[] => {
+  const out: { engine: string; hhmm: string; reason: string }[] = []
+  for (const [engine, lock] of Object.entries(locks)) {
+    if (lock.untilMs === null || lock.untilMs <= now) continue
+    out.push({
+      engine: shortConsultEngine(engine),
+      hhmm: new Date(lock.untilMs).toTimeString().slice(0, 5),
+      reason: lock.reason,
+    })
+  }
+  return out
+}
+
+// ---------------------------------------------------------------- ring geometry
+
+export type RingCell = { x: number; y: number; glyph: string }
+export type RingArcCell = RingCell & { lineGlyph: string; arrowGlyph: string; isArrow: boolean }
+export type RingNodePos = {
+  label: string
+  width: number
+  angle: number
+  anchorX: number
+  anchorY: number
+  labelX: number
+  labelY: number
+  align: 'left' | 'right' | 'center'
+}
+export type RingBox = { x: number; y: number; width: number; height: number }
+export type RingLayout = {
+  cols: number
+  rows: number
+  cx: number
+  cy: number
+  rx: number
+  ry: number
+  centre: RingBox
+  nodes: RingNodePos[]
+  spokes: RingCell[][]
+  arcs: RingArcCell[][]
+}
+
+type Pt = { x: number; y: number }
+
+const bresenham = (x0: number, y0: number, x1: number, y1: number): Pt[] => {
+  const pts: Pt[] = []
+  let x = x0
+  let y = y0
+  const dx = Math.abs(x1 - x0)
+  const sx = x0 < x1 ? 1 : -1
+  const dy = -Math.abs(y1 - y0)
+  const sy = y0 < y1 ? 1 : -1
+  let err = dx + dy
+  for (;;) {
+    pts.push({ x, y })
+    if (x === x1 && y === y1) break
+    const e2 = 2 * err
+    if (e2 >= dy) {
+      err += dy
+      x += sx
+    }
+    if (e2 <= dx) {
+      err += dx
+      y += sy
+    }
+  }
+  return pts
+}
+
+const collapseCorners = (pts: Pt[], prot: Set<string>): Pt[] => {
+  const out = [...pts]
+  let changed = true
+  while (changed) {
+    changed = false
+    for (let i = 1; i < out.length - 1; i += 1) {
+      const a = out[i - 1]!
+      const b = out[i]!
+      const c = out[i + 1]!
+      if (prot.has(`${b.x},${b.y}`)) continue
+      if (
+        Math.abs(a.x - c.x) === 1 &&
+        Math.abs(a.y - c.y) === 1 &&
+        Math.abs(a.x - b.x) + Math.abs(a.y - b.y) === 1 &&
+        Math.abs(c.x - b.x) + Math.abs(c.y - b.y) === 1
+      ) {
+        out.splice(i, 1)
+        changed = true
+        break
+      }
+    }
+  }
+  return out
+}
+
+const symRound = (v: number) => (v >= 0 ? Math.round(v) : -Math.round(-v))
+
+const stepGlyph = (dx: number, dy: number) => {
+  if (dx === 0) return '│'
+  if (dy === 0) return '─'
+  return dx * dy > 0 ? '╲' : '╱'
+}
+
+const arrowGlyph = (dx: number, dy: number) => {
+  if (dx === 0 && dy > 0) return '▼'
+  if (dx === 0 && dy < 0) return '▲'
+  if (dy === 0 && dx > 0) return '▶'
+  if (dy === 0 && dx < 0) return '◀'
+  if (dx > 0 && dy > 0) return '◢'
+  if (dx < 0 && dy > 0) return '◣'
+  if (dx > 0 && dy < 0) return '◥'
+  if (dx < 0 && dy < 0) return '◤'
+  return '●'
+}
+
+const arrowFromTangent = (vx: number, vy: number) => {
+  const deg = (Math.atan2(vy, vx) * 180) / Math.PI
+  if (deg >= -22.5 && deg < 22.5) return '▶'
+  if (deg >= 22.5 && deg < 67.5) return '◢'
+  if (deg >= 67.5 && deg < 112.5) return '▼'
+  if (deg >= 112.5 && deg < 157.5) return '◣'
+  if (deg >= 157.5 || deg < -157.5) return '◀'
+  if (deg >= -157.5 && deg < -112.5) return '◤'
+  if (deg >= -112.5 && deg < -67.5) return '▲'
+  return '◥'
+}
+
+/**
+ * Computes balanced ellipse layout for `nodes` on a `cols x rows` cell grid:
+ * `( MAIN )` centre box, clockwise spoke paths from each engine stopping 1 cell before `centre`,
+ * and clockwise neighbour ring arcs.
+ */
+export const ringLayout = (nodes: readonly { label: string; width: number }[], cols: number, rows: number): RingLayout => {
+  const n = nodes.length
+  const x0 = Math.floor((cols - 8) / 2)
+  const cy = Math.floor(rows / 2)
+  const centre: RingBox = { x: x0 - 1, y: cy, width: 10, height: 1 }
+  const cxLeft = x0 + 3
+  const cxRight = x0 + 4
+  const cx = Math.floor(cols / 2)
+  const ry = Math.max(2, cy - 1)
+  const rxMin = 6
+  const rxTarget = Math.min(18, Math.round(ry * 3.0))
+  let rxLimit = rxTarget
+  for (let i = 0; i < n; i += 1) {
+    const theta = (2 * Math.PI * i) / n
+    const s = Math.sin(theta)
+    const w = nodes[i]!.width
+    if (s > 0.05) rxLimit = Math.min(rxLimit, (cols - cxRight - 2 - w) / s)
+    else if (s < -0.05) rxLimit = Math.min(rxLimit, (cxLeft - 2 - w) / -s)
+  }
+  const rx = Math.max(rxMin, Math.min(rxTarget, Math.floor(rxLimit)))
+  const inCentre = (x: number, y: number) => y === centre.y && x >= centre.x && x < centre.x + centre.width
+  const ringX = (s: number) => (Math.abs(s) < 0.05 ? cx : s > 0 ? cxRight + Math.round(rx * s) : cxLeft - Math.round(rx * -s))
+
+  const anchors = nodes.map((node, i) => {
+    const angle = (2 * Math.PI * i) / n
+    const s = Math.sin(angle)
+    const c = Math.cos(angle)
+    return { ...node, angle, s, c, anchorX: ringX(s), anchorY: cy - symRound(ry * c) }
+  })
+
+  const arcs: RingArcCell[][] =
+    n < 2
+      ? nodes.map(() => [])
+      : anchors.map((node, i) => {
+          const t0 = (2 * Math.PI * i) / n
+          const t1 = (2 * Math.PI * (i + 1)) / n
+          const nextAnchor = anchors[(i + 1) % n]!
+          const raw: Pt[] = [{ x: node.anchorX, y: node.anchorY }]
+          const steps = 64
+          for (let k = 1; k < steps; k += 1) {
+            const t = t0 + ((t1 - t0) * k) / steps
+            const x = ringX(Math.sin(t))
+            const y = cy - symRound(ry * Math.cos(t))
+            const prev = raw[raw.length - 1]!
+            if (x !== prev.x || y !== prev.y) {
+              if (Math.abs(x - prev.x) > 1 || Math.abs(y - prev.y) > 1) {
+                const bridge = bresenham(prev.x, prev.y, x, y)
+                for (let b = 1; b < bridge.length; b += 1) raw.push(bridge[b]!)
+              } else {
+                raw.push({ x, y })
+              }
+            }
+          }
+          const prev = raw[raw.length - 1]!
+          if (prev.x !== nextAnchor.anchorX || prev.y !== nextAnchor.anchorY) {
+            if (Math.abs(nextAnchor.anchorX - prev.x) > 1 || Math.abs(nextAnchor.anchorY - prev.y) > 1) {
+              const bridge = bresenham(prev.x, prev.y, nextAnchor.anchorX, nextAnchor.anchorY)
+              for (let b = 1; b < bridge.length; b += 1) raw.push(bridge[b]!)
+            } else {
+              raw.push({ x: nextAnchor.anchorX, y: nextAnchor.anchorY })
+            }
+          }
+          const prot = new Set<string>([`${node.anchorX},${node.anchorY}`, `${nextAnchor.anchorX},${nextAnchor.anchorY}`])
+          for (const pt of raw) if (pt.x === cxLeft - rx || pt.x === cxRight + rx) prot.add(`${pt.x},${pt.y}`)
+          const clean = collapseCorners(raw, prot)
+          if (clean.length > 1) clean.pop()
+          const arrowIdx = Math.floor(clean.length / 2)
+          const cells: RingArcCell[] = []
+          for (let k = 0; k < clean.length; k += 1) {
+            const p = clean[k]!
+            const nxt = k < clean.length - 1 ? clean[k + 1]! : { x: nextAnchor.anchorX, y: nextAnchor.anchorY }
+            const dx = Math.sign(nxt.x - p.x)
+            const dy = Math.sign(nxt.y - p.y)
+            const frac = clean.length > 1 ? k / (clean.length - 1) : 0.5
+            const tk = t0 + (t1 - t0) * frac
+            const aGlyph = arrowFromTangent(rx * Math.cos(tk), ry * Math.sin(tk) * 1.8)
+            const lGlyph = stepGlyph(dx, dy)
+            const isArrow = k === arrowIdx
+            cells.push({ x: p.x, y: p.y, glyph: isArrow ? aGlyph : lGlyph, lineGlyph: lGlyph, arrowGlyph: aGlyph, isArrow })
+          }
+          return cells
+        })
+
+  const rowMinX = Array.from({ length: rows }, () => cxLeft)
+  const rowMaxX = Array.from({ length: rows }, () => cxRight)
+  for (const arc of arcs) {
+    for (const pt of arc) {
+      if (pt.y >= 0 && pt.y < rows) {
+        rowMinX[pt.y] = Math.min(rowMinX[pt.y]!, pt.x)
+        rowMaxX[pt.y] = Math.max(rowMaxX[pt.y]!, pt.x)
+      }
+    }
+  }
+  for (const nd of anchors) {
+    if (nd.anchorY >= 0 && nd.anchorY < rows) {
+      rowMinX[nd.anchorY] = Math.min(rowMinX[nd.anchorY]!, nd.anchorX)
+      rowMaxX[nd.anchorY] = Math.max(rowMaxX[nd.anchorY]!, nd.anchorX)
+    }
+  }
+
+  const placed: RingNodePos[] = anchors.map(nd => {
+    let labelY = nd.anchorY
+    let labelX = 0
+    let align: RingNodePos['align'] = 'center'
+    let label = nd.label
+    let width = nd.width
+    if (Math.abs(nd.s) < 0.05) {
+      labelY = nd.c > 0 ? 0 : rows - 1
+      if (width > cols) {
+        label = shorten(label, cols)
+        width = cellWidth(label)
+      }
+      labelX = Math.max(0, Math.min(cols - width, Math.round(cx - width / 2)))
+      align = 'center'
+    } else if (nd.s > 0) {
+      const base = Math.max(nd.anchorX, rowMaxX[labelY] ?? nd.anchorX)
+      const gap = base + 2 < cols ? 2 : 1
+      const start = Math.min(cols - 1, base + gap)
+      const room = Math.max(1, cols - start)
+      if (width > room) {
+        label = shorten(label, room)
+        width = cellWidth(label)
+      }
+      labelX = start
+      align = 'left'
+    } else {
+      const base = Math.min(nd.anchorX, rowMinX[labelY] ?? nd.anchorX)
+      const gap = base - 2 >= 0 ? 2 : 1
+      const end = Math.max(0, base - gap)
+      const room = Math.max(1, end + 1)
+      if (width > room) {
+        label = shorten(label, room)
+        width = cellWidth(label)
+      }
+      labelX = end - width + 1
+      align = 'right'
+    }
+    return { label, width, angle: nd.angle, anchorX: nd.anchorX, anchorY: nd.anchorY, labelX, labelY, align }
+  })
+
+  const spokes: RingCell[][] = anchors.map(node => {
+    const tx =
+      Math.abs(node.s) < 0.05
+        ? cx
+        : Math.abs(node.c) < 0.45
+          ? node.s > 0
+            ? centre.x + centre.width - 1
+            : centre.x
+          : cx + symRound(3 * node.s)
+    const raw = bresenham(node.anchorX, node.anchorY, tx, cy)
+    const cut: Pt[] = []
+    for (const p of raw) {
+      if (inCentre(p.x, p.y)) break
+      cut.push(p)
+    }
+    const cells: RingCell[] = []
+    for (let k = 0; k < cut.length; k += 1) {
+      const p = cut[k]!
+      if (k === cut.length - 1) {
+        let adx = 0
+        let ady = 0
+        if (Math.abs(node.s) < 0.15) {
+          adx = 0
+          ady = node.c > 0 ? 1 : -1
+        } else if (p.y === cy) {
+          adx = p.x < cx ? 1 : -1
+          ady = 0
+        } else {
+          adx = p.x < cx ? 1 : -1
+          ady = p.y < cy ? 1 : -1
+        }
+        cells.push({ x: p.x, y: p.y, glyph: arrowGlyph(adx, ady) })
+      } else {
+        const next = cut[k + 1]!
+        cells.push({ x: p.x, y: p.y, glyph: stepGlyph(next.x - p.x, next.y - p.y) })
+      }
+    }
+    return cells
+  })
+
+  return { cols, rows, cx, cy, rx, ry, centre, nodes: placed, spokes, arcs }
+}
+
+export type RingGridRun = { x: number; text: string; color: string; bold?: boolean; dim?: boolean }
+export type RingAnimatedPath = { cells: RingCell[]; color: string; baseColor: string; stride: number; closed?: boolean }
+export type RingSpinner = { x: number; y: number; color: string }
+export type RingGrid = {
+  width: number
+  height: number
+  active: boolean
+  isDebate: boolean
+  rows: RingGridRun[][]
+  paths: RingAnimatedPath[]
+  spinners: RingSpinner[]
+  layout: RingLayout
+}
+
+type GridCell = { ch: string; color: string; bold?: boolean; dim?: boolean }
+
+export const consultEngineDuration = (e: ConsultEngine, run: ConsultRun, now: number): string => {
+  if (e.startedAt !== null && e.startedAt > 0) {
+    if (e.endedAt !== null) return fmtDuration(e.endedAt - e.startedAt)
+    if (e.state === 'running' && !run.stale && run.endedAt === null) return fmtDuration(now - e.startedAt)
+  }
+  return ''
+}
+
+/** Builds the coloured cell runs, animated paths and spinners for the consult/debate ring panel. */
+export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, now: number): RingGrid => {
+  const isDebate = run.round >= 2 || run.kind === 'round2'
+  const height = run.engines.length <= 6 ? 11 : 13
+  const maxSide = Math.max(8, Math.floor((cols - 16) / 2))
+  const parts = run.engines.map(e => {
+    const glyph = consultGlyph(e.state)
+    const dur = consultEngineDuration(e, run, now)
+    const nameMax = Math.min(12, Math.max(4, maxSide - 2 - (dur ? cellWidth(dur) + 1 : 0)))
+    const name = shortConsultEngine(e.name, nameMax)
+    const label = dur ? `${glyph} ${name} ${dur}` : `${glyph} ${name}`
+    return { e, glyph, name, dur, label, width: cellWidth(label) }
+  })
+  const layout = ringLayout(
+    parts.map(p => ({ label: p.label, width: p.width })),
+    cols,
+    height,
+  )
+  const buf: (GridCell | null)[][] = Array.from({ length: height }, () => Array.from({ length: cols }, () => null))
+  const put = (x: number, y: number, ch: string, color: string, bold = false, dim = false) => {
+    if (ch === ' ' || y < 0 || y >= height || x < 0 || x >= cols) return
+    buf[y]![x] = { ch, color, bold, dim }
+  }
+  const putStr = (x: number, y: number, s: string, color: string, bold = false, dim = false) => {
+    const chars = [...s]
+    for (let i = 0; i < chars.length; i += 1) put(x + i, y, chars[i]!, color, bold, dim)
+  }
+
+  putStr(layout.centre.x + 1, layout.centre.y, '( MAIN )', colors.main, true)
+  if (isDebate) {
+    const tag = `⟳ R${run.round}/${run.rounds}`
+    const tx = Math.max(0, Math.min(cols - cellWidth(tag), Math.round(layout.cx - cellWidth(tag) / 2)))
+    putStr(tx, layout.centre.y + 1, tag, colors.arch)
+  }
+
+  const paths: RingAnimatedPath[] = []
+  const isRunLive = run.endedAt === null && !run.stale
+
+  if (!isDebate) {
+    for (let i = 0; i < parts.length; i += 1) {
+      const st = parts[i]!.e.state
+      const spoke = layout.spokes[i] ?? []
+      if (st === 'failed' || st === 'skipped' || spoke.length === 0) continue
+      if (st === 'ok') {
+        for (const c of spoke) put(c.x, c.y, c.glyph, colors.gate)
+      } else if (st === 'queued') {
+        for (let k = 0; k < spoke.length; k += 1) {
+          const c = spoke[k]!
+          put(c.x, c.y, k === spoke.length - 1 ? c.glyph : '·', colors.faint)
+        }
+      } else if (st === 'running') {
+        for (const c of spoke) put(c.x, c.y, c.glyph, colors.agent)
+        if (isRunLive) paths.push({ cells: spoke, color: colors.agent, baseColor: colors.dim, stride: Math.max(8, spoke.length + 3), closed: false })
+      }
+    }
+  } else {
+    const n = parts.length
+    const partIdx = parts.map((p, i) => (p.e.state !== 'failed' && p.e.state !== 'skipped' ? i : -1)).filter(i => i >= 0)
+    if (partIdx.length >= 2) {
+      const anyRunning = isRunLive && parts.some(p => p.e.state === 'running')
+      const allOk = partIdx.every(i => parts[i]!.e.state === 'ok')
+      const staticColor = run.stale ? colors.amber : anyRunning ? colors.agent : allOk ? colors.gate : colors.faint
+      const closedCells: RingCell[] = []
+      for (let k = 0; k < partIdx.length; k += 1) {
+        const from = partIdx[k]!
+        const to = partIdx[(k + 1) % partIdx.length]!
+        if (to === (from + 1) % n) {
+          for (const c of layout.arcs[from] ?? []) {
+            put(c.x, c.y, c.glyph, staticColor)
+            closedCells.push({ x: c.x, y: c.y, glyph: c.glyph })
+          }
+        } else {
+          const seg: RingArcCell[] = []
+          for (let j = from; j !== to; j = (j + 1) % n) seg.push(...(layout.arcs[j] ?? []))
+          const mid = Math.floor(seg.length / 2)
+          for (let m = 0; m < seg.length; m += 1) {
+            const c = seg[m]!
+            const g = m === mid ? c.arrowGlyph : c.lineGlyph
+            put(c.x, c.y, g, staticColor)
+            closedCells.push({ x: c.x, y: c.y, glyph: g })
+          }
+        }
+      }
+      if (anyRunning && closedCells.length > 0) {
+        paths.push({ cells: closedCells, color: colors.agent, baseColor: colors.dim, stride: 12, closed: true })
+      }
+    }
+  }
+
+  const spinners: RingSpinner[] = []
+  for (let i = 0; i < parts.length; i += 1) {
+    const p = parts[i]!
+    const nd = layout.nodes[i]!
+    const st = p.e.state
+    const stateColor =
+      st === 'ok' ? colors.gate : st === 'running' ? colors.agent : st === 'failed' ? colors.warn : st === 'skipped' ? colors.amber : colors.faint
+    const nameColor =
+      st === 'queued' ? colors.faint : st === 'failed' ? colors.warn : st === 'skipped' ? colors.amber : colors.text
+    const chars = [...nd.label]
+    const nameEnd = Math.min(chars.length, 2 + cellWidth(p.name))
+    for (let k = 0; k < chars.length; k += 1) {
+      const ch = chars[k]!
+      if (k === 0) put(nd.labelX, nd.labelY, ch, stateColor, st === 'ok' || st === 'running', st === 'queued')
+      else if (k < nameEnd) put(nd.labelX + k, nd.labelY, ch, nameColor, false, st === 'queued')
+      else put(nd.labelX + k, nd.labelY, ch, colors.dim, false, st === 'queued')
+    }
+    if (st === 'running' && isRunLive) spinners.push({ x: nd.labelX, y: nd.labelY, color: colors.agent })
+  }
+
+  const rows: RingGridRun[][] = buf.map(row => {
+    const runs: RingGridRun[] = []
+    for (let x = 0; x < cols; x += 1) {
+      const cell = row[x]
+      if (!cell) continue
+      const last = runs[runs.length - 1]
+      if (
+        last &&
+        last.x + cellWidth(last.text) === x &&
+        last.color === cell.color &&
+        Boolean(last.bold) === Boolean(cell.bold) &&
+        Boolean(last.dim) === Boolean(cell.dim)
+      ) {
+        last.text += cell.ch
+      } else {
+        runs.push({ x, text: cell.ch, color: cell.color, ...(cell.bold ? { bold: true } : {}), ...(cell.dim ? { dim: true } : {}) })
+      }
+    }
+    return runs
+  })
+
+  return {
+    width: cols,
+    height,
+    active: isRunLive && (paths.length > 0 || spinners.length > 0),
+    isDebate,
+    rows,
+    paths,
+    spinners,
+    layout,
+  }
+}
