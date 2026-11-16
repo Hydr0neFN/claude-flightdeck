@@ -2275,6 +2275,45 @@ export const fmtSpan = (ms: number) => {
   return s % 60 === 0 ? `${m}m` : `${m}m${String(s % 60).padStart(2, '0')}s`
 }
 
+const TREE_ITEM = new Set(['leaf', 'step', 'more'])
+
+/**
+ * The tree glyph before each drawn row of a box body: `├` for an item (leaf, step, `+N more`) with a
+ * later sibling, `└` for the last one, `│` or a space before the detail rows under an item, '' for
+ * the other rows (task, box, last, closing). `base` is the shallowest depth that gets a glyph: 0 in
+ * a sub-main's body (its rows sit directly in the box), 1 in main's (a task's workers, not main's
+ * loose ones). Run it on the fitted entries, so the glyphs follow what is drawn.
+ */
+export const treePrefixes = (entries: readonly WorkEntry[], base = 0): string[] => {
+  const isItem = (e: WorkEntry) => TREE_ITEM.has(e.kind) && e.depth >= base
+  const isLast = (i: number) => {
+    const d = entries[i].depth
+    for (let j = i + 1; j < entries.length; j++) {
+      const e = entries[j]
+      if (e.depth < d) return true
+      if (e.depth === d) return !isItem(e)
+    }
+    return true
+  }
+  const out: string[] = []
+  const lastOf: boolean[] = []
+  let owner = -1
+  entries.forEach((e, i) => {
+    lastOf[i] = false
+    if (isItem(e)) {
+      lastOf[i] = isLast(i)
+      owner = i
+      out.push(lastOf[i] ? '└' : '├')
+    } else if ((e.kind === 'detail' || e.kind === 'expand') && owner >= 0 && entries[owner].depth === e.depth - 1) {
+      out.push(lastOf[owner] ? ' ' : '│')
+    } else {
+      if (e.kind !== 'detail' && e.kind !== 'expand') owner = -1
+      out.push('')
+    }
+  })
+  return out
+}
+
 export type WorkTone = 'main' | 'agent' | 'gate' | 'amber' | 'warn' | 'dim' | 'faint' | 'text' | 'arch' | 'cleared'
 
 /** One labelled row of an expanded leaf (stage, now, work, think, last, next, status, tests). */

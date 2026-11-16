@@ -2,7 +2,8 @@
 // `since` and `now` come from the hooks module's $.clock; between redraws it adds its own ticks.
 import type { ClientModule } from 'claude-code'
 
-type Props = { since: number; now: number; endAt: number | null; color: string }
+/** `span`: the work tree's compact form (`16m`, `1m12s`, `1h05m`), as `fmtSpan` in core.ts. */
+type Props = { since: number; now: number; endAt: number | null; color: string; span?: boolean }
 type Ref = { base: number; ticks: number; lastNow: number; isRunning: boolean }
 type State = { ref: Ref }
 
@@ -10,6 +11,14 @@ const fmt = (ms: number) => {
   const s = Math.max(0, Math.floor(ms / 1000))
   const m = Math.floor(s / 60)
   return m < 60 ? `${m}:${String(s % 60).padStart(2, '0')}` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}`
+}
+
+const fmtSpan = (ms: number) => {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  const m = Math.floor(s / 60)
+  if (m === 0) return `${s}s`
+  if (m >= 60) return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
+  return s % 60 === 0 ? `${m}m` : `${m}m${String(s % 60).padStart(2, '0')}s`
 }
 
 const Elapsed: ClientModule<Props, State> = (props, surface) => {
@@ -31,7 +40,7 @@ const Elapsed: ClientModule<Props, State> = (props, surface) => {
       }
     })
   }
-  return <Text color={props.color}>{fmt(ref.base + ref.ticks * 1000)}</Text>
+  return <Text color={props.color}>{(props.span ? fmtSpan : fmt)(ref.base + ref.ticks * 1000)}</Text>
 }
 
 export default Elapsed

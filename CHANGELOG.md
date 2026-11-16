@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.1
+
+- Work tree clocks use the compact form (`16m`, `1m12s`, `1h05m`) in place of the card clock's `16:00`; the cards keep `m:ss`.
+- Box bodies draw as a tree: `├` before an item with a later sibling, `└` before the last, `│` before the detail rows under a non-last item (`treePrefixes`). A sub-main box gets glyphs on every worker, plan step and `+N more` line; main's box on the workers under a task.
+
 ## 0.8.0
 
 - New `work` panel: the whole delegation as one live tree rooted at main. Main's box (`WORK · main's tasks`) holds the mesh tasks with their workers, a box per sub-main and a closing line of the tasks still to do; a sub-main's box (`sub-main · t4`) starts with its checkpoint's last step and holds its workers and `open:` plan steps. Workers are farmer jobs, agy-job calls, consult runs (`◎ panel consult R1  5/7`) and Claude subagents that spawn nothing. Running first, then to-do, then at most two dimmed done lines, then `+N more`. The default `panels` becomes `main,work,consult,architect,loops,receipt` (`agents` stays valid).

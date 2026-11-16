@@ -130,6 +130,7 @@ import {
   checkpointProbe,
   fitWork,
   fmtSpan,
+  treePrefixes,
   isWorkEmpty,
   normalizeCheckpoint,
   orderWorkLeaves,
@@ -3010,6 +3011,32 @@ test('a strip is one glyph per unit, twelve then +N, and done/total always', () 
   expect(fmtSpan(6_000)).toBe('6s')
 })
 
+test('a box body draws as a tree: ├ for an item with a later sibling, └ for the last, │ under a non-last item', () => {
+  const leaf = (depth: number) => ({ kind: 'leaf' as const, depth })
+  const body = [
+    { kind: 'last' as const, depth: 0, text: 'x' },
+    leaf(0),
+    { kind: 'detail' as const, depth: 1 },
+    { kind: 'step' as const, depth: 0, text: 'a' },
+    leaf(0),
+    { kind: 'detail' as const, depth: 1 },
+    { kind: 'more' as const, depth: 0, count: 2 },
+  ]
+  expect(treePrefixes(body as never, 0)).toEqual(['', '├', '│', '├', '├', '│', '└'])
+  // Main's body: a task's workers get glyphs, main's loose workers (depth 0) and the tasks do not.
+  const main = [
+    { kind: 'task' as const, depth: 0, text: 't1' },
+    leaf(1),
+    { kind: 'detail' as const, depth: 2 },
+    leaf(1),
+    { kind: 'detail' as const, depth: 2 },
+    { kind: 'task' as const, depth: 0, text: 't2' },
+    leaf(1),
+    leaf(0),
+  ]
+  expect(treePrefixes(main as never, 1)).toEqual(['', '├', '│', '└', ' ', '', '└', ''])
+})
+
 test('a checkpoint path is read from the brief: a report/handoff line, a .handoffs token, a builder name', () => {
   const cwd = '/w/proj'
   expect(checkpointPath('do it\nreport: .handoffs/sub-main.md', 'sub-main', cwd)).toBe('/w/proj/.handoffs/sub-main.md')
@@ -3583,3 +3610,4 @@ test('checkpoint probes run every 10 s for a card with a checkpoint, one at a ti
   expect(await ui.find({ text: /next {2}edit x/ })).toBeDefined()
   await ui.unmount()
 })
+

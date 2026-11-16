@@ -19,6 +19,8 @@ import {
   parseCheckpoint,
   stripOf,
   stripText,
+  treePrefixes,
+  fmtSpan,
   workGlyph,
   workRows,
   DEFAULT_ARCHITECT,
@@ -1319,13 +1321,14 @@ export const register: Register = (on, options) => {
       )
 
     // A start time of 0 is unknown (state saved before it was recorded): no clock, not decades.
-    const clock = (key: string, since: number, endAt: number | null, color: string) =>
+    // `span`: the work tree's compact form (`16m`, `1m12s`) in place of the card clock's `16:00`.
+    const clock = (key: string, since: number, endAt: number | null, color: string, span = false) =>
       since <= 0 ? (
         <Text color={color}>—</Text>
       ) : hasClock ? (
-        <els.Client key={key} module="./elapsed.tsx" props={{ since, now, endAt, color }} />
+        <els.Client key={key} module="./elapsed.tsx" props={{ since, now, endAt, color, span }} />
       ) : (
-        <Text color={color}>{fmtTimer((endAt ?? now) - since)}</Text>
+        <Text color={color}>{(span ? fmtSpan : fmtTimer)((endAt ?? now) - since)}</Text>
       )
 
     // A work status as its colour: done green, running blue, failed red, waiting dim.
@@ -1860,13 +1863,13 @@ export const register: Register = (on, options) => {
     const fittedWork = fitWork(work, workBudget, workCols)
     const drawnWorkRows = workHas('work') && workBudget > 0 ? Math.min(workBudget, workRows(fittedWork, workCols)) : 0
 
-    const workClock = (key: string, since: number, endAt: number | null) => clock(key, since, endAt, C.dim)
+    const workClock = (key: string, since: number, endAt: number | null) => clock(key, since, endAt, C.dim, true)
 
-    const workLeafView = (l: WorkLeaf, w: number, depth: number, done = false) => {
+    const workLeafView = (l: WorkLeaf, w: number, prefix: string, done = false) => {
       const cost = l.cost === null || l.isLive ? '' : l.cost === 0 ? 'free' : `+${fmtWorkerCost(l.cost)}`
       return (
         <Box key={`work-leaf-${l.id}`} width={w} columnGap={1} overflow="hidden">
-          {depth > 0 ? <Text color={C.faint}>{'└'}</Text> : null}
+          {prefix ? <Text color={C.faint}>{prefix}</Text> : null}
           <Button key={`work-${l.id}`} plain label={l.glyph} onPress={expandOnPress(l.id)} />
           <Box flexShrink={1}>
             <Text dimColor={done} wrap="truncate">{`${l.isRealRepo ? '◇' : ''}${l.name}${l.worker ? ` ▸ ${l.worker}` : ''}`}</Text>
@@ -1879,12 +1882,16 @@ export const register: Register = (on, options) => {
       )
     }
 
-    const workEntryView = (e: WorkEntry, w: number) => {
+    // `p`: the row's tree glyph from treePrefixes (`├`, `└`, `│`, ' ' or '').
+    const workEntryView = (e: WorkEntry, w: number, p = '') => {
+      const lead = p ? `${p} ` : ''
       if (e.kind === 'box' && e.box) return workBoxView(e.box, w - 1)
-      if (e.kind === 'leaf' && e.leaf) return workLeafView(e.leaf, w, e.depth, e.done)
+      if (e.kind === 'leaf' && e.leaf) return workLeafView(e.leaf, w, p, e.done)
       // The one detail line under a running leaf, from 56 columns; the fit drops it when the pane is short.
       if (e.kind === 'detail' && e.leaf) {
-        return workCols >= WORK_DETAIL_COLS && e.leaf.detail ? <Text dimColor wrap="truncate">{`  ${e.leaf.detail}`}</Text> : null
+        return workCols >= WORK_DETAIL_COLS && e.leaf.detail ? (
+          <Text dimColor wrap="truncate">{`${p ? `${p}   ` : '  '}${e.leaf.detail}`}</Text>
+        ) : null
       }
       if (e.kind === 'task') {
         return (
@@ -1898,16 +1905,17 @@ export const register: Register = (on, options) => {
       if (e.kind === 'step') {
         return (
           <Box key={`work-step-${e.text}`} width={w} columnGap={1} overflow="hidden">
+            {p ? <Text color={C.faint}>{p}</Text> : null}
             <Text color={C.faint}>○</Text>
             <Text dimColor wrap="truncate">{e.text}</Text>
           </Box>
         )
       }
-      if (e.kind === 'more') return <Text color={C.faint} wrap="truncate">{`+${e.count ?? 0} more`}</Text>
+      if (e.kind === 'more') return <Text color={C.faint} wrap="truncate">{`${lead}+${e.count ?? 0} more`}</Text>
       if (e.kind === 'expand') {
         return (
           <Text dimColor={e.tone === 'dim'} wrap="truncate">
-            {`  ${e.text ?? ''}`}
+            {`${p ? `${p}   ` : '  '}${e.text ?? ''}`}
           </Text>
         )
       }
@@ -1949,7 +1957,7 @@ export const register: Register = (on, options) => {
             </Box>
             <Box flexShrink={0}>{workClock(`work-box-${b.id}`, b.startedAt, b.endedAt)}</Box>
           </Box>
-          {b.entries.map(e => workEntryView(e, inner))}
+          {(pre => b.entries.map((e, i) => workEntryView(e, inner, pre[i])))(treePrefixes(b.entries, 0))}
         </Box>
       )
     }
@@ -1983,7 +1991,7 @@ export const register: Register = (on, options) => {
             </Box>
             <Box flexShrink={0}>{workClock('work-main', fittedWork.startedAt, fittedWork.endedAt)}</Box>
           </Box>
-          {fittedWork.entries.map(e => workEntryView(e, inner))}
+          {(pre => fittedWork.entries.map((e, i) => workEntryView(e, inner, pre[i])))(treePrefixes(fittedWork.entries, 1))}
           <Text color={C.faint} wrap="truncate">
             {WORK_LEGEND}
           </Text>

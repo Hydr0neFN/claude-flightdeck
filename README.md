@@ -225,20 +225,20 @@ The `work` panel is the whole delegation as one tree rooted at main: the plan's 
 
 ```
 ╭────────────────────────────────────────────────────────────────╮
-│ ◐ WORK · main's tasks ●●◐○○ 2/5                          16:00 │
+│ ◐ WORK · main's tasks ●●◐○○ 2/5                            20m │
 │ ◐ t3 flightdeck 0.7.0                                          │
-│ └ ◐ ring-panel ▸ Hydrogen xhigh                          16:00 │
-│   edit hooks/register.tsx · 4 files · 83 st                    │
+│ └ ◐ ring-panel ▸ Hydrogen xhigh                            16m │
+│     edit hooks/register.tsx · 4 files · 83 st                  │
 │  ╭───────────────────────────────────────────────────────────╮ │
-│  │ ◐ sub-main · t4 ●●◐○○○ 2/6                           6:00 │ │
+│  │ ◐ sub-main · t4 ●●◐○○○ 2/6                             6m │ │
 │  │ last ✔ step 2 jobs probe (exit 0)                         │ │
-│  │ ◐ builder                                            2:10 │ │
-│  │   next edit hooks/core.ts                                 │ │
-│  │ ○ receipt rows                                            │ │
-│  │ ○ tests                                                   │ │
-│  │ ○ docs                                                    │ │
+│  │ ├ ◐ builder                                         2m10s │ │
+│  │ │   next edit hooks/core.ts                               │ │
+│  │ ├ ○ receipt rows                                          │ │
+│  │ ├ ○ tests                                                 │ │
+│  │ └ ○ docs                                                  │ │
 │  ╰───────────────────────────────────────────────────────────╯ │
-│ ● receipt ▸ sol free                                      4:06 │
+│ ● receipt ▸ sol free                                       15m │
 │ ○ t4 receipt · ○ t5 docs                                       │
 │ ● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel       │
 ╰────────────────────────────────────────────────────────────────╯
@@ -261,10 +261,10 @@ Claude subagents (`sub-main`, `builder`, `builder-lite`) already write a checkpo
 A farmer job (`ds-job.py run`, `agy-job.py run`) is not a Claude subagent, so the agent cards never saw it. Flightdeck reads `jobsDir` (default `~/.claude/state/ds-jobs`) with a local python probe every 3 s while a job is live and every 20 s otherwise: live jobs, and jobs that ended in the last 30 minutes, newest first, at most 8. A live job whose recorded pid is gone is marked `⊘`. Each job is a line in the [work tree](#work-tree):
 
 ```
-◐ ring-panel ▸ Hydrogen xhigh           2:04
+◐ ring-panel ▸ Hydrogen xhigh          2m04s
   edit hooks/register.tsx · 4 files · 83 st
-● receipt ▸ sol free                    4:06
-◇verify ▸ agy Sonnet high               0:41  verify pending
+● receipt ▸ sol free                   4m06s
+◇verify ▸ agy Sonnet high                41s  verify pending
 ```
 
 `◇` marks an agy-job: it runs on your real repo, with no scrubbed copy. `verify pending` shows while `~/.claude/state/agy-verify-pending/<job>.json` exists, and its thought is never read: those jobs are private.
