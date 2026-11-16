@@ -545,6 +545,9 @@ export const fmtUsd = (n: number) => (n >= 100 ? `$${Math.round(n)}` : `$${n.toF
 export const fmtCny = (n: number) => `¥${Number(n.toFixed(2)) + 0}`
 
 /** Parse external feed stdout JSON; returns null if invalid JSON or not an object. */
+/** The most quota meters a feed may carry: two rows of two. */
+export const MAX_GEM = 4
+
 export const parseFeed = (stdout: string, at = 0): Feed | null => {
   let raw: unknown
   try {
@@ -569,7 +572,7 @@ export const parseFeed = (stdout: string, at = 0): Feed | null => {
         pct: Math.max(0, Math.min(100, item.pct)),
         resetsAt: Number.isFinite(parsedAt) ? parsedAt : null,
       })
-      if (gem.length >= 2) break
+      if (gem.length >= MAX_GEM) break
     }
   }
   return { task, cwd, branch, dsCny, gem, at }
@@ -580,7 +583,7 @@ export const normalizeFeed = (stored: unknown): Feed | null => {
   if (!isObject(stored)) return null
   const gem = listOf<unknown>(stored.gem)
     .filter((g): g is Record<string, unknown> => isObject(g) && typeof g.label === 'string' && g.label.trim() !== '' && typeof g.pct === 'number' && Number.isFinite(g.pct))
-    .slice(0, 2)
+    .slice(0, MAX_GEM)
     .map(g => ({
       label: (g.label as string).trim(),
       pct: Math.max(0, Math.min(100, g.pct as number)),
@@ -706,14 +709,19 @@ export const fmtResetIn = (resetsAt: number | null | undefined, now: number) => 
   return h > 0 ? `${h}h${String(m % 60).padStart(2, '0')}m` : `${m}m`
 }
 
-/** A feed quota's name cut to the 3 cells of the main card's meters: `gem` → `gem`, `gem pro` → `pro`, `agy claude weekly` → `cl`. */
+/**
+ * A feed quota's name cut to the 3 cells of the main card's meters: `gem` / `gem weekly` → `gem`, `gem 5h` → `g5h`,
+ * `gem pro` → `pro`, `gem argon weekly` → `arg`, `agy claude weekly` → `cl`, `agy claude 5h` → `cl5`.
+ */
 export const feedLabel = (label: string) => {
   const s = label.trim().toLowerCase()
-  if (/claude/.test(s)) return 'cl'
-  const gem = /^gem(?:ini)?\s+(\S+)/.exec(s)
+  const five = /\b5h\b/.test(s)
+  const core = s.replace(/\s*\b(?:weekly|5h)\b/g, '').trim()
+  if (/claude/.test(core)) return five ? 'cl5' : 'cl'
+  const gem = /^gem(?:ini)?\s+(\S+)/.exec(core)
   if (gem?.[1]) return gem[1].slice(0, 3)
-  if (/^gem/.test(s)) return 'gem'
-  return s.slice(0, 3)
+  if (/^gem/.test(core)) return five ? 'g5h' : 'gem'
+  return core.slice(0, 3)
 }
 
 /** A rate-limit window's short name: `five_hour` → `5h`, `seven_day_opus` → `7d opus`. */

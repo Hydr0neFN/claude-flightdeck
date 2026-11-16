@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.4
+
+- The feed may carry four quota meters (`MAX_GEM`, was two), drawn as two `agy` rows of two. `feedLabel` keeps weekly and 5h apart: `gem`, `g5h`, `arg`, `cl`, `cl5`.
+
 ## 0.9.3
 
 - The `work` box draws one row per consult run. Older consult calls with no bound run also matched the newest run, so one run showed as four `◎ consult` rows; the bound call now wins.

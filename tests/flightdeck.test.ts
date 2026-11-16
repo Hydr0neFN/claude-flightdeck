@@ -3,6 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Plugin, TestBody } from 'claude-code/testing'
 
 import {
+  feedLabel,
   DEFAULT_ARCHITECT,
   DEFAULT_GATE,
   DEFAULT_TURN,
@@ -1626,7 +1627,11 @@ test('with motion off, the still connector keeps the face from 2.1.299', { plugi
 
 // ---------------------------------------------------------------- external feed
 
-test('parseFeed validates types, caps gem at 2, clamps pct 0-100, and rejects bad JSON', () => {
+test('feedLabel keeps weekly and 5h meters apart in 3 cells', () => {
+  expect(['gem weekly','gem 5h','gem argon weekly','agy claude weekly','agy claude 5h','gem','gem pro'].map(feedLabel)).toEqual(['gem','g5h','arg','cl','cl5','gem','pro'])
+})
+
+test('parseFeed validates types, caps gem at 4, clamps pct 0-100, and rejects bad JSON', () => {
   const good = parseFeed(
     JSON.stringify({
       task: 'step 2/4 build feed',
@@ -1638,6 +1643,8 @@ test('parseFeed validates types, caps gem at 2, clamps pct 0-100, and rejects ba
         { label: 'gem pro', pct: 38, resets_at: '1970-01-01T03:10:00.000Z' },
         { label: 'gem flash', pct: 120, resets_at: 'bad-date' },
         { label: 'gem third', pct: 50 },
+        { label: 'gem fourth', pct: 60 },
+        { label: 'gem fifth', pct: 70 },
       ],
     }),
     1234,
@@ -1650,6 +1657,8 @@ test('parseFeed validates types, caps gem at 2, clamps pct 0-100, and rejects ba
     gem: [
       { label: 'gem pro', pct: 38, resetsAt: 11_400_000 },
       { label: 'gem flash', pct: 100, resetsAt: null },
+      { label: 'gem third', pct: 50, resetsAt: null },
+      { label: 'gem fourth', pct: 60, resetsAt: null },
     ],
     at: 1234,
   })

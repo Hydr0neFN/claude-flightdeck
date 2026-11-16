@@ -101,6 +101,7 @@ import {
   limitOf,
   fmtResetIn,
   feedLabel,
+  MAX_GEM,
   listOf,
   logRows,
   marksIn,
@@ -1524,12 +1525,15 @@ export const register: Register = (on, options) => {
         )
       }
       if (hasFeedA && f && f.gem.length > 0) {
-        rows.push(
-          frame(
-            'main-agy',
-            row(w, 'agy', f.gem.slice(0, 2).map((gm, i) => meter(feedLabel(gm.label), gm.pct, gm.resetsAt, w, i > 0 ? 2 : 0))),
-          ),
-        )
+        // Two meters to a row; the label sits on the first row only.
+        for (let r = 0; r < Math.ceil(Math.min(f.gem.length, MAX_GEM) / 2); r++) {
+          rows.push(
+            frame(
+              `main-agy-${r}`,
+              row(w, r === 0 ? 'agy' : '', f.gem.slice(r * 2, r * 2 + 2).map((gm, i) => meter(feedLabel(gm.label), gm.pct, gm.resetsAt, w, i > 0 ? 2 : 0))),
+            ),
+          )
+        }
       }
       if (meshTasks.length > 0) {
         rows.push(frame('main-plan', row(w, 'plan', [{ spans: [{ text: `${planDone}/${meshTasks.length}`, bold: true }] }])))
@@ -1879,7 +1883,7 @@ export const register: Register = (on, options) => {
       let n = 1 // the pane's header
       if (workHas('main')) {
         n += 2 + 1 + 1 // border, ctx/effort, windows/spend
-        if (hasFeedA && f && f.gem.length > 0) n += 1
+        if (hasFeedA && f) n += Math.ceil(Math.min(f.gem.length, MAX_GEM) / 2)
         if (meshTasks.length > 0) n += 1 + planFit.rows.length + (planFit.more > 0 ? 1 : 0)
         else if (hasFeedB && f && f.task) n += 1
       }
@@ -2314,7 +2318,7 @@ export const register: Register = (on, options) => {
     const used =
       1 +
       4 +
-      (hasFeedA && f && f.gem.length > 0 ? 1 : 0) +
+      (hasFeedA && f ? Math.ceil(Math.min(f.gem.length, MAX_GEM) / 2) : 0) +
       (meshTasks.length > 0 ? 1 + planFit.rows.length + (planFit.more > 0 ? 1 : 0) : hasFeedB && f && f.task ? 1 : 0) +
       1 +
       (showArchitect ? 6 : 0) +
