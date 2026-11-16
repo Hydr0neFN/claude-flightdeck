@@ -61,7 +61,13 @@ import {
   normalizeFeed,
   normalizeGate,
   normalizeLog,
+  fmtWorkerCost,
+  jobsCost,
+  noteJob,
   noteTool,
+  parseJobText,
+  shortWorker,
+  workerProbe,
   PALETTES,
   SVG_COLORS,
   parseConfig,
@@ -295,6 +301,39 @@ async function pollFeed($: EngineInterface, argv: string[], lock: { inFlight: bo
   }
 }
 
+const WORKER_INTERVAL_MS = 10_000
+const WORKER_TIMEOUT_MS = 5_000
+
+/**
+ * Asks each running card's job dir which model works on it now (a job runner falls back from model to
+ * model, so this can change mid-run). Runs nothing when no running card has a job dir.
+ */
+async function pollWorkers($: EngineInterface, lock: { inFlight: boolean; python: string }) {
+  if (lock.inFlight) return
+  lock.inFlight = true
+  try {
+    const todo = (await getCards($)).filter(c => c.status === 'running' && c.jobdir)
+    for (const c of todo) {
+      let res: { exitCode: number; stdout: string } | null = null
+      for (const py of lock.python ? [lock.python] : ['python3', 'python']) {
+        res = await $.process.run(workerProbe(py, c.jobdir), { timeoutMs: WORKER_TIMEOUT_MS }).catch(() => null)
+        if (res && res.exitCode === 0) {
+          lock.python = py
+          break
+        }
+      }
+      const found = res && res.exitCode === 0 ? parseJobText(`backend: ${res.stdout.trim()}`).backend : ''
+      if (found && found !== c.worker) {
+        await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(x => (x.id === c.id ? { ...x, worker: found } : x)))
+      }
+    }
+  } catch {
+    // Silent: the card keeps the last worker it knew.
+  } finally {
+    lock.inFlight = false
+  }
+}
+
 export const register: Register = (on, options) => {
   const cfg = parseConfig(options)
   const C = PALETTES[cfg.palette]
@@ -302,6 +341,8 @@ export const register: Register = (on, options) => {
   const callLoop = new Map<string, string | null>()
   const feedLock = { inFlight: false }
   let stopFeedTimer: (() => void) | undefined
+  const workerLock = { inFlight: false, python: '' }
+  let stopWorkerTimer: (() => void) | undefined
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -335,6 +376,11 @@ export const register: Register = (on, options) => {
       await readCompactWindow($, resumedWindow)
       await refreshStatus($, cfg)
     }
+    stopWorkerTimer?.()
+    const stopW: unknown = $.clock.every(WORKER_INTERVAL_MS, () => {
+      void pollWorkers($, workerLock)
+    })
+    stopWorkerTimer = typeof stopW === 'function' ? (stopW as () => void) : undefined
     if (cfg.feedCommand.length > 0) {
       stopFeedTimer?.()
       const stop: unknown = $.clock.every(FEED_INTERVAL_MS, () => {
@@ -602,7 +648,7 @@ export const register: Register = (on, options) => {
       await update($, agents, list =>
         listOf<unknown>(list)
           .map(normalizeCard)
-          .map(c => (c.id === id ? noteTool(c, { tool: e.tool, text, isError: hasFailed || ran.deny !== undefined }) : c)),
+          .map(c => (c.id === id ? noteJob(noteTool(c, { tool: e.tool, text, isError: hasFailed || ran.deny !== undefined }), didRun ? ran.text : '') : c)),
       )
     }
     // The log keeps what is worth a glance: refusals, errors and edits; the rest is on the cards.
@@ -761,6 +807,11 @@ export const register: Register = (on, options) => {
       $.clock.now(),
       (monoRead ??= readMono($)),
     ])
+    // What the turn's job runners cost on their own models, beside Claude's own spend: `· jobs +$0.05` / `· jobs free`.
+    const jobsLabel = (x: { since?: number }) => {
+      const n = typeof x.since === 'number' ? jobsCost(cards, x.since) : null
+      return n === null ? '' : ` · jobs ${n === 0 ? 'free' : `+${fmtWorkerCost(n)}`}`
+    }
     // The body's own width, down to the narrowest dock Claude Code seats (24): a wider drawing is cut off at the frame.
     const W = Math.max(24, e.props.bodyColumns)
     const layout = v.layout ?? cfg.layout
@@ -1178,7 +1229,9 @@ export const register: Register = (on, options) => {
                     {titleLines(cardTitle(c), cardW - 7, cardW - 4)[1]}
                   </Text>
                   <Text color={C.dim} wrap="truncate">
-                    {sameModel ? c.type : `${c.type} · ${prettyModel(c.model)}`}
+                    {c.worker
+                      ? `${c.type} ▸ ${shortWorker(c.worker)}${c.workerCost !== null ? ` · ${fmtWorkerCost(c.workerCost)}` : ''}`
+                      : sameModel ? c.type : `${c.type} · ${prettyModel(c.model)}`}
                   </Text>
                   <Text dimColor wrap="truncate">
                     {c.steps > 0 ? `ctx ${kTokens(c.ctx)} · out ${kTokens(c.out)} · ${c.steps} st` : 'starting…'}
@@ -1205,7 +1258,7 @@ export const register: Register = (on, options) => {
           <Text bold wrap="wrap">
             {expandedCard.description || expandedCard.type}
           </Text>
-          <Text dimColor wrap="truncate">{`${expandedCard.type} · ${prettyModel(expandedCard.model)} · ${expandedCard.status} · ${expandedCard.steps} steps`}</Text>
+          <Text dimColor wrap="truncate">{`${expandedCard.type} · ${prettyModel(expandedCard.model)}${expandedCard.worker ? ` ▸ ${expandedCard.worker}` : ''} · ${expandedCard.status} · ${expandedCard.steps} steps`}</Text>
           {expandedCard.tools.length === 0 ? <Text color={C.faint}>no tool calls yet</Text> : null}
           {expandedCard.tools.map(n => (
             <Text color={n.isError ? C.warn : C.text} wrap="truncate">
@@ -1260,6 +1313,7 @@ export const register: Register = (on, options) => {
                   fill: true,
                 },
                 r.costDelta !== null ? { spans: [{ text: `· +${fmtUsd(r.costDelta)}`, color: C.main }] } : null,
+                jobsLabel(r) ? { spans: [{ text: jobsLabel(r), color: C.agent }] } : null,
               ],
               w - 4,
             )
@@ -1434,7 +1488,7 @@ export const register: Register = (on, options) => {
           {lp.length > 0 ? <Text dimColor wrap="truncate">{`other loops ${lp.length} · ${lp.filter(l => isLoopActive(l, now)).length} active`}</Text> : null}
           {!m.isRunning && r ? (
             <Text dimColor wrap="truncate">
-              {`last turn ${fmtDuration(r.durationMs)} · ${plural(r.agents, 'agent')} · ${plural(r.edits, 'edit')} · ${plural(r.errors, 'error')}${r.costDelta !== null ? ` · +${fmtUsd(r.costDelta)}` : ''}`}
+              {`last turn ${fmtDuration(r.durationMs)} · ${plural(r.agents, 'agent')} · ${plural(r.edits, 'edit')} · ${plural(r.errors, 'error')}${r.costDelta !== null ? ` · +${fmtUsd(r.costDelta)}` : ''}${jobsLabel(r)}`}
             </Text>
           ) : null}
         </Box>

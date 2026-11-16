@@ -84,6 +84,9 @@ export const normalizeCard = (stored: unknown): AgentCard =>
       lastStop: null,
       tools: [],
       answer: '',
+      worker: '',
+      jobdir: '',
+      workerCost: null,
     },
     stored,
   )
@@ -231,6 +234,92 @@ export const shorten = (s: string, n: number) => {
   const one = s.replace(/\s+/g, ' ').trim()
   return n <= 0 ? '' : one.length > n ? `${one.slice(0, Math.max(0, n - 1)).trimEnd()}…` : one
 }
+
+// ---------------------------------------------------------------- delegated workers
+
+/**
+ * A job runner's backend label as a short model name for a narrow card: `agy:gemini-4-hydrogen-high` →
+ * `Gemini 4`, `agy:claude-sonnet-5-5-high` → `Sonnet 5.5`, `azure:gpt-6.1-sol` → `GPT 6.1`,
+ * `paid-flash` → `DS Flash`, `opencode:opencode/qwen3-coder-free` → `qwen3-coder`. '' for ''.
+ */
+export const shortWorker = (backend: string): string => {
+  const b = backend.trim()
+  if (!b) return ''
+  const model = b.includes(':') ? b.slice(b.indexOf(':') + 1) : b
+  const id = (model.split('/').pop() ?? model).toLowerCase()
+  if (id === 'paid-flash' || /deepseek/.test(id)) return 'DS Flash'
+  if (/claude-/.test(id)) return prettyModel(id)
+  const gem = /^gemini-(\d+(?:\.\d+)?)/.exec(id)
+  if (gem?.[1]) return `Gemini ${gem[1]}`
+  const gpt = /^gpt-(\d+(?:\.\d+)?)/.exec(id)
+  if (gpt?.[1]) return `GPT ${gpt[1]}`
+  return shorten(id.replace(/[:-]free$/, ''), 12)
+}
+
+/** The last `key: value` of `key` in a job runner's printed block, '' when none. */
+const lastField = (text: string, key: string) => {
+  let found = ''
+  for (const m of text.matchAll(new RegExp(`^${key}: *(\\S.*)$`, 'gm'))) found = (m[1] ?? '').trim()
+  return found
+}
+
+/**
+ * What a job runner's output says about the worker: its `backend:` (the model that did the work) and
+ * its `jobdir:` (where the running job keeps its state). Either is '' when the text does not say.
+ */
+export const parseJobText = (text: unknown): { backend: string; jobdir: string } => {
+  const t = typeof text === 'string' ? text : ''
+  const backend = lastField(t, 'backend')
+  return { backend: /^[\w.:/@-]{2,80}$/.test(backend) ? backend : '', jobdir: lastField(t, 'jobdir') }
+}
+
+/** USD per CNY for a job runner's CNY estimate (DeepSeek bills in CNY). An estimate, as the runner's own figure is. */
+export const CNY_USD = 0.14
+
+/**
+ * A job's cost in USD from its report's `cost_cny_est=`: `0 (agy subscription quota)` → 0,
+ * `0.392 (assumed price …)` → CNY × CNY_USD, `USD 0.0123 (Azure credit …)` → 0.0123. null when unsaid or `?`.
+ */
+export const parseJobCost = (text: unknown): number | null => {
+  const t = typeof text === 'string' ? text : ''
+  let found: number | null = null
+  for (const m of t.matchAll(/cost_cny_est[=:] *(USD +)?(\d+(?:\.\d+)?)/g)) {
+    const n = Number(m[2])
+    if (Number.isFinite(n)) found = m[1] ? n : n * CNY_USD
+  }
+  return found
+}
+
+/** A card after one of its tool calls printed job runner output: the newest worker, job dir and cost win. */
+export const noteJob = (c: AgentCard, text: unknown): AgentCard => {
+  const j = parseJobText(text)
+  const cost = j.backend ? parseJobCost(text) : null
+  if (!j.backend && !j.jobdir) return c
+  return { ...c, worker: j.backend || c.worker, jobdir: j.jobdir || c.jobdir, workerCost: cost ?? c.workerCost }
+}
+
+/** A worker's cost as a card shows it: `free`, `$0.05`, `<$0.01`; '' while unknown. */
+export const fmtWorkerCost = (n: number | null) => (n === null ? '' : n === 0 ? 'free' : n < 0.005 ? '<$0.01' : fmtUsd(n))
+
+/**
+ * What the workers of the cards spawned since `since` cost, in USD: null when no card there knows its
+ * worker's cost, so a turn without job runners shows nothing.
+ */
+export const jobsCost = (cards: AgentCard[], since: number): number | null => {
+  const known = cards.filter(c => c.spawnedAt >= since && c.workerCost !== null)
+  return known.length === 0 ? null : known.reduce((s, c) => s + (c.workerCost ?? 0), 0)
+}
+
+/**
+ * The argv that prints a running job's worker: its `trying` file (the attempt now running), else the
+ * `backend` its `state.json` holds. Prints nothing when neither says.
+ */
+export const workerProbe = (python: string, jobdir: string): string[] => [
+  python,
+  '-c',
+  'import json,os,sys\nd=sys.argv[1]\ntry:\n print(open(os.path.join(d,"trying")).read().strip())\nexcept Exception:\n try:\n  print(json.load(open(os.path.join(d,"state.json"))).get("backend") or "")\n except Exception:\n  pass',
+  jobdir,
+]
 
 export const kTokens = (n: number) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
@@ -573,6 +662,7 @@ export const receiptOf = (t: Turn, o: { durationMs: number; agentsSince: number;
   errors: t.errors,
   costDelta: o.costNow !== null && t.costAtStart !== null && o.costNow - t.costAtStart >= 0.005 ? o.costNow - t.costAtStart : null,
   reason: o.reason,
+  since: t.startedAt,
 })
 
 // ---------------------------------------------------------------- agents and loops

@@ -79,6 +79,12 @@ export type AgentCard = {
   lastStop: string | null
   tools: ToolNote[]
   answer: string
+  /** The model doing the agent's work for it, as a job runner names it (`agy:gemini-4-hydrogen-high`); '' when it does the work itself. */
+  worker: string
+  /** The job directory whose `trying` / `state.json` names that model while the job runs; '' when none was seen. */
+  jobdir: string
+  /** What that model's job cost in USD (0 = free or a subscription quota); null until the job's report says. */
+  workerCost: number | null
 }
 
 /** A model loop whose id matches no card: a workflow agent, a compaction or a memory fork. */
@@ -108,6 +114,8 @@ export type Receipt = {
   errors: number
   costDelta: number | null
   reason: string
+  /** When the turn started: the cards spawned since then add their workers' cost to the receipt. */
+  since: number
 }
 
 export type Layout = 'auto' | 'compact' | 'wide' | 'mini'

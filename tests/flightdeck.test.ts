@@ -52,7 +52,49 @@ import {
   trimRecent,
   startConsult,
   stepSpeed,
+  noteJob,
+  parseJobText,
+  parseJobCost,
+  CNY_USD,
+  fmtWorkerCost,
+  jobsCost,
+  shortWorker,
 } from '../hooks/core'
+
+test('a job runner backend reads as a short model name', () => {
+  expect(shortWorker('agy:gemini-4-hydrogen-high')).toBe('Gemini 4')
+  expect(shortWorker('agy:claude-sonnet-5-5-high')).toBe('Sonnet 5.5')
+  expect(shortWorker('azure:gpt-6.1-sol')).toBe('GPT 6.1')
+  expect(shortWorker('paid-flash')).toBe('DS Flash')
+  expect(shortWorker('opencode:opencode/qwen3-coder-free')).toBe('qwen3-coder')
+  expect(shortWorker('')).toBe('')
+})
+
+test("a card learns its worker and job dir from job runner output; the newest wins", () => {
+  let c = normalizeCard({ id: 'a', type: 'farmer', model: 'claude-haiku-5-5' })
+  c = noteJob(c, 'ds_status: running\nphase: launcher\njobdir: /x/ds-jobs/j1\nnext: poll')
+  expect(c.jobdir).toBe('/x/ds-jobs/j1')
+  expect(c.worker).toBe('')
+  c = noteJob(c, 'ds_status: done\nagy: failed (quota)\nbackend: azure:gpt-6.1-sol\njobdir: /x/ds-jobs/j1')
+  expect(c.worker).toBe('azure:gpt-6.1-sol')
+  expect(noteJob(c, 'plain output')).toBe(c)
+  expect(parseJobText('backend: rm -rf / ; echo').backend).toBe('')
+})
+
+test("a job's cost follows its worker: free on a quota, CNY converted, USD as given", () => {
+  expect(parseJobCost('ds: turns=1 cost_cny_est=0 (agy subscription quota)')).toBe(0)
+  expect(Math.round(parseJobCost('ds: turns=69 cost_cny_est=0.5 (assumed price)')! * 1e6)).toBe(Math.round(0.5 * CNY_USD * 1e6))
+  expect(Math.round(parseJobCost('ds: turns=3 cost_cny_est=USD 0.0420 (Azure credit)')! * 1e6)).toBe(Math.round(0.042 * 1e6))
+  expect(parseJobCost('ds: turns=? cost_cny_est=?')).toBeNull()
+  let c = normalizeCard({ id: 'a', type: 'farmer', spawnedAt: 10 })
+  c = noteJob(c, 'backend: paid-flash\nds: cost_cny_est=1.0 (x)\njobdir: /j')
+  expect(fmtWorkerCost(c.workerCost)).toBe('$0.14')
+  const free = noteJob(normalizeCard({ id: 'b', spawnedAt: 10 }), 'backend: agy:gemini-4-hydrogen-high\nds: cost_cny_est=0 (agy)')
+  expect(fmtWorkerCost(free.workerCost)).toBe('free')
+  expect(Math.round(jobsCost([c, free], 5)! * 100)).toBe(14)
+  expect(jobsCost([c, free], 20)).toBeNull()
+  expect(jobsCost([free], 5)).toBe(0)
+})
 import type { Check } from '../types'
 
 // ---------------------------------------------------------------- pure behaviour

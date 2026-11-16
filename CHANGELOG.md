@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.4 (yu)
+
+- An agent card names the model that does its work, not only the agent's own model. A wrapper agent that hands its job to a job runner (`ds-job.py`) shows `farmer ▸ Gemini 4`, `▸ DS Flash`, `▸ GPT 6.1` and so on. The card reads the runner's `backend:` line, and while the job runs, the job dir's `trying` file (polled every 10 s), so a fallback to the next model shows. The expanded card shows the full backend label.
+- The card shows that job's cost when its report gives `cost_cny_est` (`free` for a subscription quota, CNY at 0.14 USD, Azure in USD). The turn receipt adds `jobs +$0.05` (or `jobs free`) beside Claude's own spend; it follows the cards, so a job that ends after the turn still counts.
+
 ## 0.6.1
 
 - On Claude Code before 2.1.299 the pane no longer empties, session log and all, once the first prompt is sent. Since 0.5.1 the connectors between panels asked for `Text`'s monospaced face (`mono`), which Claude Code has only from 2.1.299, and the first connector is drawn when a turn starts. Flightdeck now asks for that face only where `$.session.version()` reports 2.1.299 or later. Older versions draw the connectors in the default face, so on a graphical surface a running connector's right end may jitter again, as before 0.5.1. ([#29](https://github.com/scasella/claude-flightdeck/pull/29); [#28](https://github.com/scasella/claude-flightdeck/issues/28), thanks @Bexxs75 for tracing it to 0.5.1)
