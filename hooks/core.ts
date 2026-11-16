@@ -499,9 +499,9 @@ export const afterResponse = (u: Usage): Usage => (u.hasFill ? u : { ...u, hasFi
 export const afterCompactHooked = (u: Usage): Usage =>
   u.isCompactHooked ? u : { ...u, isCompactHooked: true, ...(u.isCompactEstimate ? { compactions: 0, lastCompactAt: null, isCompactEstimate: false } : {}) }
 
-/** The compaction count as the pane marks it: `⟲2`, or `⟲~2` when estimated; empty before the first. */
+/** The compaction count as the pane marks it: `↺2`, or `↺~2` when estimated; empty before the first. */
 export const compactMark = (u: Pick<Usage, 'compactions' | 'isCompactEstimate'>) =>
-  u.compactions > 0 ? `⟲${u.isCompactEstimate ? '~' : ''}${u.compactions}` : ''
+  u.compactions > 0 ? `↺${u.isCompactEstimate ? '~' : ''}${u.compactions}` : ''
 
 /** A gauge of `width` cells: ▰ filled, ▱ empty. */
 export const gauge = (pct: number, width: number) => {

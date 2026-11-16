@@ -987,7 +987,7 @@ const fillHost = ($: Parameters<TestBody>[0], on: On) => {
     /** The compaction mark the main box shows, whether it says `(estimated)`, and how many log lines say compacted. */
     shown: async () => {
       const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
-      const mark = (await ui.find({ type: 'Text', text: /^⟲/ }))?.text ?? null
+      const mark = (await ui.find({ type: 'Text', text: /^↺/ }))?.text ?? null
       const isEstimated = (await ui.find({ type: 'Text', text: /^\(estimated\)$/ })) !== undefined
       const logged = (await ui.findAll({ type: 'Text', text: /^context compacted/ })).map(n => n.text)
       await ui.unmount()
@@ -1003,11 +1003,11 @@ test('under the built-in guard a request that finds the context emptied counts a
   await h.request(60_000)
   expect(await h.shown()).toEqual({ mark: null, isEstimated: false, logged: [] })
   await h.request(undefined)
-  expect(await h.shown()).toEqual({ mark: '⟲~1', isEstimated: true, logged: ['context compacted (estimated)'] })
+  expect(await h.shown()).toEqual({ mark: '↺~1', isEstimated: true, logged: ['context compacted (estimated)'] })
   // Compacted again after one response, as auto-compaction can within a turn; a subagent's own window is not the main one.
   await h.request(undefined)
   await h.request(undefined, 'sub1')
-  expect((await h.shown()).mark).toBe('⟲~2')
+  expect((await h.shown()).mark).toBe('↺~2')
   // The label is left out where the line is short; nothing spills.
   const spills: string[] = []
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -1024,11 +1024,11 @@ test('under the built-in guard a request that finds the context emptied counts a
   await $.session.end({ reason: 'clear', sessionId: 's' } as never)
   await h.request(undefined)
   await h.measure(30_000)
-  expect((await h.shown()).mark).toBe('⟲~2')
+  expect((await h.shown()).mark).toBe('↺~2')
   // So can a /resume into another conversation, before its first response.
   await $.session.end({ reason: 'resume', sessionId: 's' } as never)
   await h.request(undefined)
-  expect((await h.shown()).mark).toBe('⟲~2')
+  expect((await h.shown()).mark).toBe('↺~2')
 })
 
 test('once session.compact reaches Flightdeck its count is the real one: estimates before it are dropped, none after', async ($, on) => {
@@ -1036,12 +1036,12 @@ test('once session.compact reaches Flightdeck its count is the real one: estimat
   await h.measure(60_000)
   await h.request(60_000)
   await h.request(undefined) // a rewind to the first prompt reads like a compaction
-  expect((await h.shown()).mark).toBe('⟲~1')
+  expect((await h.shown()).mark).toBe('↺~1')
   await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'the summary', toolUses: [] }] })
   await h.request(undefined)
   await h.request(60_000)
   await h.request(undefined)
-  expect(await h.shown()).toEqual({ mark: '⟲1', isEstimated: false, logged: ['context compacted (estimated)', 'context compacted (auto)'] })
+  expect(await h.shown()).toEqual({ mark: '↺1', isEstimated: false, logged: ['context compacted (estimated)', 'context compacted (auto)'] })
 })
 
 test('a compaction that comes back skipped is neither counted nor logged', async ($, on) => {
@@ -1053,7 +1053,7 @@ test('a compaction that comes back skipped is neither counted nor logged', async
   expect(await h.shown()).toEqual({ mark: null, isEstimated: false, logged: [] })
   h.vetoCompactions(undefined)
   await compact()
-  expect(await h.shown()).toEqual({ mark: '⟲1', isEstimated: false, logged: ['context compacted (manual)'] })
+  expect(await h.shown()).toEqual({ mark: '↺1', isEstimated: false, logged: ['context compacted (manual)'] })
 })
 
 test("a surface module's fault key is the same for the hook's path, either separator, and the drawing's name", () => {
