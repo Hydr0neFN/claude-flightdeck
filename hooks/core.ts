@@ -2701,10 +2701,18 @@ export const buildWork = (input: WorkInput): WorkTree => {
 
   const rawLeaves: WorkLeaf[] = []
   for (const j of orderJobs(input.jobs, now)) rawLeaves.push(jobWorkLeaf(j, input.issued))
+  // One row per consult run: older unbound calls also match the newest run, and the bound call wins.
+  const consultRows = new Map<string, { leaf: WorkLeaf; bound: boolean }>()
   for (const i of input.issued) {
     if (i.kind === 'agy' && (i.endedAt === null || now - i.endedAt <= DONE_KEEP_MS)) rawLeaves.push(agyWorkLeaf(i))
-    if (i.kind === 'consult' && consultShown(i, input.run, now)) rawLeaves.push(consultWorkLeaf(i, input.run))
+    if (i.kind === 'consult' && consultShown(i, input.run, now)) {
+      const leaf = consultWorkLeaf(i, input.run)
+      const bound = !!input.run && i.runId === input.run.id
+      const prev = consultRows.get(leaf.id)
+      if (!prev || (bound && !prev.bound)) consultRows.set(leaf.id, { leaf, bound })
+    }
   }
+  for (const { leaf } of consultRows.values()) rawLeaves.push(leaf)
   for (const c of cards) if (!hasKids(c.id)) rawLeaves.push(cardWorkLeaf(c, now))
 
   const leaves = rawLeaves.filter(keepLeaf)

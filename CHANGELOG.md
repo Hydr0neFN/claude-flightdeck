@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.3
+
+- The `work` box draws one row per consult run. Older consult calls with no bound run also matched the newest run, so one run showed as four `◎ consult` rows; the bound call now wins.
+
 ## 0.9.2
 
 - The consult ring shows the whole model name under each engine (owner): the vendor path, `:free` and `-preview` are dropped (`shortModel`), and the name may take up to 26 cells on a pane of 56 columns or more. A narrow pane keeps the label width + 4 limit.

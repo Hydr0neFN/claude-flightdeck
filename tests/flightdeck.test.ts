@@ -4122,3 +4122,14 @@ test('9-engine consult ring at 64 columns grows a 5-row hub so opencode and agy 
     expect([opencodeEnd.x, mat[opencodeEnd.y]![opencodeEnd.x]]).toEqual([c.x - 1, '→'])
   }
 })
+
+test('three consult calls that match the same run draw one consult row', () => {
+  const mk = (callId: string, at: number) => ({ kind: 'consult' as const, name: '', repo: '', model: '', effort: '', handoff: '', callId, agentId: '', at, task: '' })
+  let issued = issueCall([], mk('c1', 1_000))
+  issued = issueCall(issued, mk('c2', 2_000))
+  issued = issueCall(issued, mk('c3', 3_000))
+  const run = { ...makeRun({ startedAt: 3_500 }), id: 'r' } as never
+  issued = bindConsultRun(issued, run)
+  const tree = buildWork({ jobs: [], issued, cards: [], tasks: [], run, now: 10_000 })
+  expect(JSON.stringify(tree).split('"id":"consult:r"').length - 1).toBe(1)
+})
