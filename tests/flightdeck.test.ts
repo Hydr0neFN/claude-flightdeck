@@ -1952,8 +1952,8 @@ test('consult ring keeps mirror symmetry, 1-cell side margins, and drops duratio
         return { label, width: cellWidth(label), glyph, name, dur }
       })
       const L = ringLayout(nodes, cols, rows)
-      // Aspect ratio rx ≈ 2.2 · ry when width does not clamp.
-      if (cols >= 46) expect(Math.abs(L.rx / L.ry - 2.2)).toBeLessThan(0.3)
+      // Aspect ratio rx ≈ 2.2 · ry is the minimum when width does not clamp.
+      if (cols >= 46) expect(L.rx / L.ry).toBeGreaterThanOrEqual(1.9)
       for (let i = 1; i < n / 2; i += 1) {
         const r = L.nodes[i]!
         const l = L.nodes[n - i]!
@@ -2011,6 +2011,95 @@ test('consult ring keeps mirror symmetry, 1-cell side margins, and drops duratio
   expect(g42.layout.nodes[2]!.label).not.toContain('24s')
 })
 
+test('ring spokes never share or touch cells except neighbouring arrowheads, at 46 and 70 cols', () => {
+  for (const n of [4, 6, 7, 9, 10]) {
+    for (const cols of [46, 70]) {
+      const nodes = Array.from({ length: n }, (_, i) => {
+        const label = `● engine${i} 12s`
+        return { label, width: cellWidth(label) }
+      })
+      const L = ringLayout(nodes, cols, n <= 6 ? 11 : 13)
+      for (let i = 0; i < n; i += 1) {
+        const sp = L.spokes[i]!
+        expect(sp.length).toBeGreaterThanOrEqual(2)
+        const from = sp[0]!
+        const to = sp[sp.length - 1]!
+        const dx = to.x - from.x
+        const dy = to.y - from.y
+        // All raster cells stay within one cell of their own straight line.
+        for (const p of sp) {
+          expect(Math.abs((p.x - from.x) * dy - (p.y - from.y) * dx)).toBeLessThanOrEqual(Math.max(Math.abs(dx), Math.abs(dy)))
+        }
+        for (let j = i + 1; j < n; j += 1) {
+          const other = L.spokes[j]!
+          for (let a = 0; a < sp.length; a += 1) {
+            for (let b = 0; b < other.length; b += 1) {
+              const d = Math.abs(sp[a]!.x - other[b]!.x) + Math.abs(sp[a]!.y - other[b]!.y)
+              const arrowPair = a === sp.length - 1 && b === other.length - 1
+              expect(d > 1 || (d === 1 && arrowPair)).toBe(true)
+            }
+          }
+        }
+      }
+      for (let i = 1; i < n / 2; i += 1) {
+        expect(L.spokes[n - i]).toEqual(L.spokes[i]!.map(p => ({
+          x: cols - 1 - p.x,
+          y: p.y,
+          glyph: p.glyph === '·' ? '·' : expected8WayArrow(p.x - (cols - 1) / 2, L.cy - p.y),
+        })))
+      }
+      if (n >= 6) {
+        // The first upper diagonals meet the top corners, not the side rows.
+        for (const i of [1, n - 1]) expect(L.spokes[i]![L.spokes[i]!.length - 1]!.y).toBe(L.centre.y - 1)
+      }
+    }
+  }
+})
+
+test('wide ring radius grows with room after the longest side labels and keeps their margins', () => {
+  for (const n of [4, 6, 7, 9, 10]) {
+    const nodes = Array.from({ length: n }, (_, i) => {
+      const label = `● engine${i} 12s`
+      return { label, width: cellWidth(label) }
+    })
+    const narrow = ringLayout(nodes, 46, n <= 6 ? 11 : 13)
+    const wide = ringLayout(nodes, 70, n <= 6 ? 11 : 13)
+    expect(wide.rx).toBeGreaterThan(narrow.rx)
+    expect(wide.rx).toBe(19)
+    for (const nd of wide.nodes) {
+      expect(nd.label).toBe(nodes[wide.nodes.indexOf(nd)]!.label)
+      expect(nd.labelX).toBeGreaterThanOrEqual(1)
+      expect(nd.labelX + nd.width).toBeLessThanOrEqual(69)
+    }
+  }
+})
+
+test('consult grid has no blank first or last drawing row; debate includes its dim centred caption', () => {
+  for (const n of [4, 6, 7, 9, 10]) {
+    const engines = Array.from({ length: n }, (_, i) => ({ name: `engine${i}`, state: 'ok', startedAt: 10_000, endedAt: 22_000 }))
+    for (const cols of [46, 70]) {
+      for (const round of [1, 2]) {
+        const run = parseConsult(JSON.stringify({ run: makeRun({ engines, round, rounds: 3 }), locks: {} }))!.run!
+        const grid = buildConsultGrid(run, cols, PALETTES.theme, 34_000)
+        expect(grid.rows.length).toBe(grid.height)
+        expect(grid.rows[0]!.length).toBeGreaterThan(0)
+        expect(grid.rows[grid.height - 1]!.length).toBeGreaterThan(0)
+        const captions = grid.rows.flat().filter(r => r.text === 'answers pass round the ring')
+        expect(captions.length).toBe(round === 2 ? 1 : 0)
+        if (round === 2) {
+          const caption = captions[0]!
+          expect(grid.rows[grid.height - 1]).toEqual([caption])
+          expect(grid.rows[grid.height - 2]!.length).toBeGreaterThan(0)
+          expect(caption.x).toBe(Math.floor((cols - cellWidth(caption.text)) / 2))
+          expect(caption.color).toBe(PALETTES.theme.dim)
+          expect(caption.dim).toBe(true)
+          expect(grid.paths.some(path => path.cells.some(p => p.y === grid.height - 1))).toBe(false)
+        }
+      }
+    }
+  }
+})
+
 test('debate ring has 4-row hub, clockwise arrows, and closed 8-connected loop except where labels cut it', () => {
   const arrowAngle = (g: string) => ['→', '↘', '↓', '↙', '←', '↖', '↑', '↗'].indexOf(g) * 45
 
@@ -2043,10 +2132,11 @@ test('debate ring has 4-row hub, clockwise arrows, and closed 8-connected loop e
         grid.layout.nodes.some(nd => y === nd.labelY && x >= nd.labelX && x < nd.labelX + nd.width)
       const inBox = (x: number, y: number) => x >= cx.x && x < cx.x + cx.width && y >= cx.y && y < cx.y + cx.height
 
-      // No stray cells (spokes) outside labels, hub box, and ellipse loop.
+      // No stray cells (spokes) outside labels, hub box, ellipse loop, and caption.
       const loop = grid.layout.arcs.flat()
       const loopSet = new Set(loop.map(p => `${p.x},${p.y}`))
-      for (let y = 0; y < grid.height; y += 1) {
+      expect(grid.rows[grid.height - 1]![0]!.text).toBe('answers pass round the ring')
+      for (let y = 0; y < grid.height - 1; y += 1) {
         for (let x = 0; x < grid.width; x += 1) {
           const ch = mat[y]![x]!
           if (ch !== ' ' && !isLabel(x, y) && !inBox(x, y)) {

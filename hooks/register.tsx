@@ -1524,8 +1524,11 @@ export const register: Register = (on, options) => {
       const answered = run.engines.filter(eng => eng.state === 'ok').length
       const total = run.engines.length
       const isNarrow = w < 40 || total > 10
-      const isDebate = run.round >= 2 || run.kind === 'round2'
       const grid = isNarrow ? null : buildConsultGrid(run, innerW, C, now)
+      // Keep the caption outside the animated Client, as one centred text line.
+      const caption = grid?.isDebate ? grid.rows[grid.height - 1]?.[0] : null
+      const ringHeight = grid ? grid.height - (caption ? 1 : 0) : 0
+      const ringRows = grid?.rows.slice(0, ringHeight) ?? []
       const reasons = run.engines.filter(eng => (eng.state === 'failed' || eng.state === 'skipped') && eng.reason).slice(0, 3)
       const locks = activeConsultLocks(cs?.locks ?? {}, now)
       return (
@@ -1568,24 +1571,24 @@ export const register: Register = (on, options) => {
                       key="consult-ring"
                       module="./ring.tsx"
                       width={innerW}
-                      height={grid.height}
+                      height={ringHeight}
                       props={{
                         active: grid.active,
                         width: innerW,
-                        height: grid.height,
+                        height: ringHeight,
                         mono,
-                        rows: grid.rows,
+                        rows: ringRows,
                         paths: grid.paths,
                         spinners: grid.spinners,
                       }}
                     />
                   )
-                : staticRing(grid.rows, innerW, grid.height)
+                : staticRing(ringRows, innerW, ringHeight)
               : null}
-          {!isNarrow && isDebate ? (
+          {caption ? (
             <Box justifyContent="center" width={innerW}>
-              <Text color={C.dim} wrap="truncate">
-                answers pass round the ring
+              <Text color={caption.color} dimColor wrap="truncate">
+                {caption.text}
               </Text>
             </Box>
           ) : null}

@@ -1042,6 +1042,29 @@ const bresenham = (x0: number, y0: number, x1: number, y1: number): Pt[] => {
   return pts
 }
 
+// A straight raster line can round to either side to leave a cell between close spokes.
+const spokeLines = (from: Pt, to: Pt): Pt[][] => {
+  const paths = [bresenham(from.x, from.y, to.x, to.y)]
+  const dx = to.x - from.x
+  const dy = to.y - from.y
+  const steps = Math.max(Math.abs(dx), Math.abs(dy))
+  if (steps > 0) {
+    for (const round of [Math.floor, Math.ceil]) {
+      paths.push(Array.from({ length: steps + 1 }, (_, k) => ({
+        x: Math.abs(dx) >= Math.abs(dy) ? from.x + Math.sign(dx) * k : round(from.x + dx * k / steps),
+        y: Math.abs(dx) >= Math.abs(dy) ? round(from.y + dy * k / steps) : from.y + Math.sign(dy) * k,
+      })))
+    }
+  }
+  const seen = new Set<string>()
+  return paths.filter(path => {
+    const key = path.map(p => `${p.x},${p.y}`).join(';')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
 const collapseCorners = (pts: Pt[], prot: Set<string>): Pt[] => {
   const out = [...pts]
   let changed = true
@@ -1161,8 +1184,11 @@ export const ringLayout = (
   const cxRight = boxX + Math.floor(boxW / 2)
   const cx = cxRight
   const ry = Math.max(2, cy - 1)
-  // Terminal glyphs are roughly twice as tall as wide (~2.2 aspect); cap only when cols is very narrow.
-  const rx = Math.max(7, Math.min(Math.round(ry * 2.2), Math.floor((cols - 20) / 2)))
+  // Keep the terminal's ~2.2 aspect as a minimum; wider panels leave room for longer spokes.
+  const minRx = Math.max(7, Math.min(Math.round(ry * 2.2), Math.floor((cols - 20) / 2)))
+  const rightW = Math.max(0, ...nodes.filter((_, i) => i > 0 && i < n / 2).map(nd => nd.width))
+  const leftW = Math.max(0, ...nodes.filter((_, i) => i > n / 2).map(nd => nd.width))
+  const rx = Math.max(minRx, Math.min(cxLeft - leftW - 2, cols - cxRight - rightW - 3))
 
   type RawAnchor = {
     angle: number
@@ -1324,56 +1350,60 @@ export const ringLayout = (
   for (let y = by0; y <= by1; y += 1) outerRing.push({ x: bx1 + 1, y })
   for (let x = bx1 + 1; x >= bx0 - 1; x -= 1) outerRing.push({ x, y: by1 + 1 })
   for (let y = by1; y >= by0; y -= 1) outerRing.push({ x: bx0 - 1, y })
-  const outerRingIdx = new Map(outerRing.map((p, idx) => [`${p.x},${p.y}`, idx]))
   const inCentre = (x: number, y: number) => x >= bx0 && x <= bx1 && y >= by0 && y <= by1
 
-  const usedArrows = new Set<string>()
-  const spokes: RingCell[][] = rawAnchors.map((a, i) => {
+  const separate = (a: readonly Pt[], b: readonly Pt[]): boolean =>
+    a.every((p, i) => b.every((q, j) => {
+      const d = Math.abs(p.x - q.x) + Math.abs(p.y - q.y)
+      return d > 1 || (d === 1 && i === a.length - 1 && j === b.length - 1)
+    }))
+  const spokePts: Pt[][] = nodes.map(() => [])
+  const groups: { indices: number[]; candidates: Pt[][][] }[] = []
+  // Choose right-hand endpoints and mirror whole paths, not just their arrowheads.
+  for (let i = 0; i <= n / 2 && i < n; i += 1) {
     const nd = placed[i]!
-    const tx = a.align === 'center' ? nd.anchorX : a.align === 'left' ? cxRight : cxLeft
-    const raw = bresenham(nd.anchorX, nd.anchorY, tx, cy)
-    const prefix: Pt[] = []
-    let hit: Pt | null = null
-    for (const p of raw) {
-      if (inCentre(p.x, p.y)) break
-      prefix.push(p)
-      if (outerRingIdx.has(`${p.x},${p.y}`)) {
-        hit = p
-        break
-      }
-    }
-    let pts = prefix
-    if (hit && usedArrows.has(`${hit.x},${hit.y}`)) {
-      const rIdx = outerRingIdx.get(`${hit.x},${hit.y}`)!
-      for (let step = 1; step < outerRing.length; step += 1) {
-        const cand = outerRing[(rIdx + step) % outerRing.length]!
-        if (usedArrows.has(`${cand.x},${cand.y}`)) continue
-        const direct = bresenham(nd.anchorX, nd.anchorY, cand.x, cand.y)
-        if (!direct.some((p, k) => inCentre(p.x, p.y) || (k < direct.length - 1 && usedArrows.has(`${p.x},${p.y}`)))) {
-          pts = direct
-          break
-        }
-      }
-      if (pts === prefix) {
-        for (let step = 1; step < outerRing.length; step += 1) {
-          const cand = outerRing[(rIdx + step) % outerRing.length]!
-          if (usedArrows.has(`${cand.x},${cand.y}`)) continue
-          const direct = bresenham(nd.anchorX, nd.anchorY, cand.x, cand.y)
-          if (!direct.some(p => inCentre(p.x, p.y))) {
-            pts = direct
-            break
-          }
-        }
-      }
-    }
-    const last = pts[pts.length - 1]
-    if (last) usedArrows.add(`${last.x},${last.y}`)
-    return pts.map((p, k) =>
-      k === pts.length - 1
-        ? { x: p.x, y: p.y, glyph: arrowFromVec(cxMid - p.x, cyMid - p.y) }
-        : { x: p.x, y: p.y, glyph: '·' },
+    const indices = nd.align === 'center' ? [i] : [i, n - i]
+    const vx = nd.anchorX - cxMid
+    const vy = nd.anchorY - cyMid
+    const targets = outerRing.filter(p => {
+      if (nd.align === 'center') return p.x === nd.anchorX && (p.y - cyMid) * vy > 0
+      if (p.x < cxRight) return false
+      if (nd.anchorY < by0) return p.y === by0 - 1 || (p.x === bx1 + 1 && p.y === by0)
+      if (nd.anchorY > by1) return p.y === by1 + 1 || (p.x === bx1 + 1 && p.y === by1)
+      return p.x === bx1 + 1 && p.y >= by0 && p.y <= by1
+    })
+    // Diagonals meet the top/bottom corners; side corner cells are a clearance fallback.
+    const distance = (p: Pt) => Math.abs((p.x - cxMid) * vy - (p.y - cyMid) * vx)
+    const sideCorner = (p: Pt) =>
+      nd.align !== 'center' && (nd.anchorY < by0 || nd.anchorY > by1) && p.y >= by0 && p.y <= by1
+    targets.sort((a, b) => Number(sideCorner(a)) - Number(sideCorner(b)) || distance(a) - distance(b))
+    const candidates = targets.flatMap(p => spokeLines({ x: nd.anchorX, y: nd.anchorY }, p).map(right =>
+      indices.length === 1 ? [right] : [right, right.map(q => ({ x: 2 * cxMid - q.x, y: q.y }))],
+    )).filter(paths =>
+      paths.every(path => path.length >= 2 && path.every(p => !inCentre(p.x, p.y) && !isNodeLabelCell(placed, p.x, p.y))) &&
+      (paths.length === 1 || separate(paths[0]!, paths[1]!)),
     )
-  })
+    groups.push({ indices, candidates })
+  }
+  // Constrained spokes claim their corners before spokes with more choices.
+  groups.sort((a, b) => a.candidates.length - b.candidates.length)
+  const placeSpokes = (g: number): boolean => {
+    if (g === groups.length) return true
+    const group = groups[g]!
+    for (const paths of group.candidates) {
+      if (!paths.every(path => spokePts.every(other => separate(path, other)))) continue
+      group.indices.forEach((idx, k) => { spokePts[idx] = paths[k]! })
+      if (placeSpokes(g + 1)) return true
+      group.indices.forEach(idx => { spokePts[idx] = [] })
+    }
+    return false
+  }
+  placeSpokes(0)
+  const spokes: RingCell[][] = spokePts.map(pts => pts.map((p, k) => ({
+    x: p.x,
+    y: p.y,
+    glyph: k === pts.length - 1 ? arrowFromVec(cxMid - p.x, cyMid - p.y) : '·',
+  })))
 
   return { cols, rows, cx, cy, rx, ry, centre, nodes: placed, spokes, arcs }
 }
@@ -1405,7 +1435,7 @@ export const consultEngineDuration = (e: ConsultEngine, run: ConsultRun, now: nu
 /** Builds the coloured cell runs, animated paths and spinners for the consult/debate ring panel. */
 export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, now: number): RingGrid => {
   const isDebate = run.round >= 2 || run.kind === 'round2'
-  const height = run.engines.length <= 6 ? 11 : 13
+  const ringHeight = run.engines.length <= 6 ? 11 : 13
   const parts = run.engines.map(e => {
     const glyph = consultGlyph(e.state)
     const dur = consultEngineDuration(e, run, now)
@@ -1417,12 +1447,12 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
   const layout = ringLayout(
     parts.map(p => ({ label: p.label, width: p.width, glyph: p.glyph, name: p.name, dur: p.dur })),
     cols,
-    height,
+    ringHeight,
     { isDebate, tagWidth: cellWidth(tag) },
   )
-  const buf: (GridCell | null)[][] = Array.from({ length: height }, () => Array.from({ length: cols }, () => null))
+  const buf: (GridCell | null)[][] = Array.from({ length: ringHeight }, () => Array.from({ length: cols }, () => null))
   const put = (x: number, y: number, ch: string, color: string, bold = false, dim = false) => {
-    if (ch === ' ' || y < 0 || y >= height || x < 0 || x >= cols) return
+    if (ch === ' ' || y < 0 || y >= ringHeight || x < 0 || x >= cols) return
     buf[y]![x] = { ch, color, bold, dim }
   }
   const putStr = (x: number, y: number, s: string, color: string, bold = false, dim = false) => {
@@ -1545,10 +1575,16 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
     }
     return runs
   })
+  // Odd engine counts have no south-pole label; do not reserve an unused bottom row.
+  while (rows.length > 0 && rows[rows.length - 1]!.length === 0) rows.pop()
+  const caption = 'answers pass round the ring'
+  if (isDebate && cols >= cellWidth(caption) + 2) {
+    rows.push([{ x: Math.floor((cols - cellWidth(caption)) / 2), text: caption, color: colors.dim, dim: true }])
+  }
 
   return {
     width: cols,
-    height,
+    height: rows.length,
     active: isRunLive && (paths.length > 0 || spinners.length > 0),
     isDebate,
     rows,
