@@ -1531,7 +1531,7 @@ export const register: Register = (on, options) => {
           rows.push(
             frame(
               `main-agy-${r}`,
-              row(w, r === 0 ? 'agy' : '', f.gem.slice(r * 2, r * 2 + 2).map((gm, i) => meter(feedLabel(gm.label), gm.pct, gm.resetsAt, w, i > 0 ? 2 : 0))),
+              row(w, r === 0 ? 'agy' : '', f.gem.slice(r * 2, r * 2 + 2).map((gm, i) => meter(feedLabel(gm.label), gm.pct, null, w, i > 0 ? 2 : 0))),
             ),
           )
         }

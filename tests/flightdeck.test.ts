@@ -1747,11 +1747,12 @@ test('external feed polls on start and every 30s, keeps last good on error, skip
     model: { display_name: 'Opus 5.5' },
   })
 
-  // Renders line A and line B at >= 58 with `↻ 1h49m`; narrow omits reset time and drops pieces cleanly.
+  // Renders line A and line B; agy meters never draw a reset timer, even at >= 58; narrow drops pieces cleanly.
   const ui = await $.ui.mount({ ...pane(70), surface: 'terminal' })
   expect(await ui.find({ text: /DS ¥57\.7/ })).toBeDefined()
-  expect(await ui.find({ text: /85% ↻ 1h49m/ })).toBeDefined()
-  expect(await ui.find({ text: /38% ↻ 1h05m/ })).toBeDefined()
+  expect(await ui.find({ text: /85%/ })).toBeDefined()
+  expect(await ui.find({ text: /38%/ })).toBeDefined()
+  expect(await ui.find({ text: /↻ 1h49m|↻ 1h05m/ })).toBeUndefined()
   const gauges = await ui.findAll({ type: 'Text', text: /^▰+$/ })
   expect(gauges.map(g => g.props.color)).toEqual(['error', 'claude'])
   expect(await ui.find({ text: /step 2\/4 build feed/ })).toBeDefined()

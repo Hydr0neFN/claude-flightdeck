@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.6
+
+- The `agy` feed meters draw no reset timer (`↻`). The Claude 5h / weekly meters keep it.
+
 ## 0.9.5
 
 - The external feed starts before `next(e)` and the resume seed in `session.start`, so its rows show with the pane instead of one start-up later (about 20 s). The first poll no longer blocks the start.
