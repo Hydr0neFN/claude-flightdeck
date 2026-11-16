@@ -6,6 +6,8 @@ import type {
   Architect,
   Bucket,
   Check,
+  CheckpointStep,
+  CheckpointTail,
   ConsultEngine,
   ConsultEngineState,
   ConsultLock,
@@ -99,6 +101,8 @@ export const normalizeCard = (stored: unknown): AgentCard =>
       worker: '',
       jobdir: '',
       workerCost: null,
+      checkpoint: '',
+      check: null,
     },
     stored,
   )
@@ -114,8 +118,11 @@ export const normalizeLog = (stored: unknown): LogLine[] =>
 
 // ---------------------------------------------------------------- config
 
-export type Panel = 'main' | 'architect' | 'consult' | 'gate' | 'agents' | 'loops' | 'receipt' | 'log'
-const PANELS: readonly Panel[] = ['main', 'architect', 'consult', 'gate', 'agents', 'loops', 'receipt', 'log']
+export type Panel = 'main' | 'work' | 'architect' | 'consult' | 'gate' | 'agents' | 'loops' | 'receipt' | 'log'
+const PANELS: readonly Panel[] = ['main', 'work', 'architect', 'consult', 'gate', 'agents', 'loops', 'receipt', 'log']
+
+/** The panels a session shows unless its options say otherwise. */
+export const DEFAULT_PANELS = 'main,work,consult,architect,loops,receipt'
 
 export type Config = {
   architect: RegExp
@@ -164,7 +171,7 @@ export const parseFeedCommand = (raw: unknown): string[] => {
 export const parseConfig = (o: Readonly<Record<string, unknown>>): Config => {
   const str = (k: string, d: string) => (typeof o[k] === 'string' && o[k] !== '' ? (o[k] as string) : d)
   const bool = (k: string, d: boolean) => (typeof o[k] === 'boolean' ? (o[k] as boolean) : d)
-  const panels = str('panels', PANELS.join(','))
+  const panels = str('panels', DEFAULT_PANELS)
     .split(',')
     .map(s => s.trim())
     .filter((p): p is Panel => (PANELS as readonly string[]).includes(p))
@@ -1135,7 +1142,7 @@ export const elapsedOf = (c: AgentCard, now: number) => (c.endedAt ?? now) - c.s
 
 export const CONSULT_HIDE_AFTER_MS = 10 * 60_000
 
-const CONSULT_PY = String.raw`import json, os, sys
+export const CONSULT_PY = String.raw`import json, os, sys
 
 HOME = os.path.expanduser("~")
 
@@ -1960,7 +1967,7 @@ export const ownerOfJob = (list: readonly Issued[], jobid: string): string => li
 /** The mesh task a job serves: its issuer's `task:` line, else the `doing` item, else ''. */
 export const taskOfJob = (list: readonly Issued[], jobid: string): string => list.find(x => x.jobid === jobid)?.task ?? ''
 
-const MESH_PY = String.raw`import json, os, sys
+export const MESH_PY = String.raw`import json, os, sys
 home = os.environ.get("MESH_HOME") or os.path.join(os.path.expanduser("~"), ".agent-mesh")
 path = os.path.join(home, "tasks", (sys.argv[1] if len(sys.argv) > 1 else "") + ".json")
 try:
@@ -2037,6 +2044,735 @@ export const normalizeIssued = (stored: unknown): Issued[] =>
       work: strOf(x.work),
       verifyPending: x.verifyPending === true,
     }))
+
+// ---------------------------------------------------------------- checkpoints
+
+/** Rule 8: a Claude subagent's checkpoint file is read only while it is at most this big. */
+export const CHECKPOINT_MAX_BYTES = 256 * 1024
+
+/** Only the last 8 KB of a checkpoint are read. */
+export const CHECKPOINT_TAIL_BYTES = 8 * 1024
+
+export const CHECKPOINT_PY = String.raw`import json, os, sys
+p = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "")
+try:
+ size = os.path.getsize(p)
+except Exception:
+ size = -1
+if size < 0 or size > 262144:
+ print(json.dumps({}))
+else:
+ try:
+  with open(p, "r", encoding="utf-8", errors="replace") as fh:
+   fh.seek(max(0, size - 8192))
+   text = fh.read()
+ except Exception:
+  text = ""
+ print(json.dumps({"text": text} if text else {}))`
+
+/** The argv that prints the last 8 KB of a checkpoint file; `{}` when it is missing or over 256 KB. */
+export const checkpointProbe = (python: string | readonly string[], path: string): string[] => [
+  ...(typeof python === 'string' ? [python] : python),
+  '-c',
+  CHECKPOINT_PY,
+  path,
+]
+
+const STEP_LINE = /^(?:[-*]\s+)?(?:✔|✓|✗|✘)?\s*(step\b.*)$/i
+
+/** A checkpoint tail, parsed from its text: the last step, next command, open bullets, status and tests. */
+export const parseCheckpointText = (text: string): CheckpointTail => {
+  const steps: CheckpointStep[] = []
+  const open: string[] = []
+  let next = ''
+  let status = ''
+  let tests = ''
+  let inOpen = false
+  let current: CheckpointStep | null = null
+  for (const raw of text.split('\n')) {
+    const s = raw.trim()
+    if (!s) {
+      inOpen = false
+      continue
+    }
+    const low = s.toLowerCase()
+    const field = /^(status|tests|next|commits)\s*:/.exec(low)
+    if (field) {
+      const value = s.slice(s.indexOf(':') + 1).trim()
+      if (field[1] === 'next') next = value
+      else if (field[1] === 'status') status = value
+      else if (field[1] === 'tests') tests = value
+      // A step's own status and command follow its step line (`status: failed`, `cmd: … (exit 1)`).
+      if (current && (field[1] === 'status' ? /^(failed|failure|error|partial)\b/i.test(value) : /exit\s*[1-9]\d*/.test(value))) current.ok = false
+      inOpen = false
+      continue
+    }
+    if (/^(?:cmd|command|run)\s*:/.test(low)) {
+      if (current && /exit\s*[1-9]\d*/.test(s)) current.ok = false
+      inOpen = false
+      continue
+    }
+    if (/^open\s*:/.test(low)) {
+      inOpen = true
+      const value = s.slice(s.indexOf(':') + 1).trim()
+      if (value) open.push(value.replace(/^[-*•]\s*/, ''))
+      current = null
+      continue
+    }
+    if (inOpen && /^[-*•]\s+/.test(s)) {
+      open.push(s.replace(/^[-*•]\s+/, ''))
+      continue
+    }
+    const m = STEP_LINE.exec(s)
+    if (m?.[1]) {
+      const body = m[1].trim()
+      const bad = /^(?:✗|✘)/.test(s) || /\b(?:failed|failure|exit\s*[1-9]\d*)\b/i.test(body)
+      current = { text: body, ok: !bad }
+      steps.push(current)
+    }
+  }
+  const last = steps[steps.length - 1]
+  return {
+    last: last ? `${last.ok ? '✔' : '✗'} ${last.text}` : '',
+    next,
+    open: open.slice(0, 4),
+    status,
+    tests,
+    steps: steps.slice(-20),
+  }
+}
+
+/** `checkpointProbe` stdout as a checkpoint tail; null when the file is missing, huge or unreadable. */
+export const parseCheckpoint = (stdout: string): CheckpointTail | null => {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    return null
+  }
+  if (!isObject(raw) || typeof raw.text !== 'string' || !raw.text.trim()) return null
+  return parseCheckpointText(raw.text)
+}
+
+/** Stored checkpoint tails read back safely. */
+export const normalizeCheckpoint = (raw: unknown): CheckpointTail | null => {
+  if (!isObject(raw)) return null
+  return {
+    last: strOf(raw.last),
+    next: strOf(raw.next),
+    open: listOf<unknown>(raw.open).filter((x): x is string => typeof x === 'string').slice(0, 4),
+    status: strOf(raw.status),
+    tests: strOf(raw.tests),
+    steps: listOf<unknown>(raw.steps)
+      .filter(isObject)
+      .map(s => ({ text: strOf(s.text), ok: s.ok === true }))
+      .filter(s => s.text !== '')
+      .slice(-20),
+  }
+}
+
+/** A brief's relative path resolved against the session cwd; absolute paths (either system) kept as given. */
+export const resolvePath = (path: string, cwd: string): string => {
+  const p = typeof path === 'string' ? path.trim() : ''
+  if (!p) return ''
+  if (/^[A-Za-z]:[\\/]/.test(p) || p.startsWith('/') || p.startsWith('\\\\')) return p
+  const base = typeof cwd === 'string' ? cwd.replace(/\\/g, '/').replace(/\/+$/, '') : ''
+  return `${base ? `${base}/` : ''}${p.replace(/\\/g, '/').replace(/^\.\//, '')}`
+}
+
+/**
+ * The checkpoint file a subagent's brief names (rule 8): a `report:` / `handoff:` line, else the first
+ * `.handoffs/<name>.md` token, else for a builder `.handoffs/<agent name>.md`; '' when the brief names none.
+ */
+export const checkpointPath = (brief: string, name: string, cwd: string): string => {
+  const b = typeof brief === 'string' ? brief : ''
+  const line = /^[ \t]*(?:report|handoff)[ \t]*:[ \t]*(\S.*)$/im.exec(b)
+  const token = line?.[1]?.trim().split(/\s+/)[0]?.replace(/^[`"'(<]+|[`"')>,.;]+$/g, '') ?? ''
+  if (token) return resolvePath(token, cwd)
+  const hand = /\.handoffs[\\/][\w.-]+\.md/.exec(b)
+  if (hand?.[0]) return resolvePath(hand[0], cwd)
+  if (/builder/i.test(name)) return resolvePath(`.handoffs/${name.replace(/[^\w.-]/g, '')}.md`, cwd)
+  return ''
+}
+
+/** The checkpoint path an ended agent's final message names, through its `HANDOFF:` / `REPORT:` line. */
+export const checkpointOfAnswer = (answer: string, cwd: string): string => {
+  const m = /^[ \t]*(?:HANDOFF|REPORT)[ \t]*:[ \t]*(\S.*)$/im.exec(typeof answer === 'string' ? answer : '')
+  const token = m?.[1]?.trim().split(/\s+/)[0]?.replace(/^[`"'(<]+|[`"')>,.;]+$/g, '') ?? ''
+  return token ? resolvePath(token, cwd) : ''
+}
+
+// ---------------------------------------------------------------- work tree
+
+/** A box whose work is all done collapses to its header line this long after the last end. */
+export const COLLAPSE_AFTER_MS = 60_000
+
+/** Under 56 columns the tree leaves out its live detail lines. */
+export const WORK_DETAIL_COLS = 56
+
+/** Under 40 columns every box is one line: header, strip and clock. */
+export const WORK_NARROW = 40
+
+/** At most 12 glyphs in a strip, then `+N`. */
+export const WORK_STRIP_MAX = 12
+
+/** The tree's own legend, under the last box. */
+export const WORK_LEGEND = '● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel'
+
+const WORK_RUNNING = new Set(['running', 'parked', 'need_tool', 'doing', 'queued'])
+
+export const isRunningStatus = (status: string) => WORK_RUNNING.has(status)
+
+/** `●` done ok · `◑` partial · `✗` failed · `◐` running · `○` to do; `◎` for a consult panel. */
+export const workGlyph = (status: string): string =>
+  status === 'done' || status === 'ok'
+    ? '●'
+    : status === 'partial' || status === 'stopped'
+      ? '◑'
+      : status === 'failed' || status === 'refused' || status === 'blocked'
+        ? '✗'
+        : isRunningStatus(status)
+          ? '◐'
+          : '○'
+
+/** Only to-do and blocked units wait their turn; done, failed and partial are behind. */
+export const isTodoStatus = (status: string) => status === 'todo' || status === 'blocked' || status === '' || status === 'queued' || status === 'dry'
+
+/** The one status a box of units adds up to. */
+export const sumStatus = (statuses: readonly string[]): string =>
+  statuses.some(isRunningStatus)
+    ? 'running'
+    : statuses.some(s => s === 'failed' || s === 'refused')
+      ? 'failed'
+      : statuses.some(s => s === 'partial')
+        ? 'partial'
+        : statuses.length > 0 && statuses.every(s => s === 'done' || s === 'ok')
+          ? 'done'
+          : 'todo'
+
+export type WorkStrip = { glyphs: string[]; more: number; done: number; total: number }
+
+/** One glyph per unit, at most 12 then `+N`, and `<done>/<total>` always. */
+export const stripOf = (statuses: readonly string[], max = WORK_STRIP_MAX): WorkStrip => {
+  const glyphs = statuses.slice(0, max).map(workGlyph)
+  return {
+    glyphs,
+    more: Math.max(0, statuses.length - glyphs.length),
+    done: statuses.filter(s => s === 'done' || s === 'ok').length,
+    total: statuses.length,
+  }
+}
+
+/** A strip as text: `●●◐○○ 2/5`, `●●◐○○+3 2/8`. */
+export const stripText = (s: WorkStrip) => `${s.glyphs.join('')}${s.more > 0 ? `+${s.more}` : ''} ${s.done}/${s.total}`
+
+/** A compact duration as the tree draws it: `16m`, `1m12s`, `2s`, `1h05m`. */
+export const fmtSpan = (ms: number) => {
+  const s = Math.max(0, Math.round(ms / 1000))
+  const m = Math.floor(s / 60)
+  if (m === 0) return `${s}s`
+  if (m >= 60) return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
+  return s % 60 === 0 ? `${m}m` : `${m}m${String(s % 60).padStart(2, '0')}s`
+}
+
+export type WorkTone = 'main' | 'agent' | 'gate' | 'amber' | 'warn' | 'dim' | 'faint' | 'text' | 'arch' | 'cleared'
+
+/** One labelled row of an expanded leaf (stage, now, work, think, last, next, status, tests). */
+export type WorkRow = { label: string; text: string; tone?: WorkTone }
+
+/** A worker: a farmer job, an agy-job call, a consult run or a Claude subagent that spawns nothing. */
+export type WorkLeaf = {
+  id: string
+  kind: 'job' | 'agy' | 'consult' | 'card'
+  glyph: string
+  name: string
+  worker: string
+  /** A short note after the name (`5/7` for a consult, a strip for a deeper coordinator). */
+  note: string
+  status: string
+  startedAt: number
+  endedAt: number | null
+  isLive: boolean
+  isRealRepo: boolean
+  verifyPending: boolean
+  /** The card whose box holds it; '' for main. */
+  owner: string
+  /** The mesh task it serves, '' when none. */
+  task: string
+  /** The one detail line under a running leaf. */
+  detail: string
+  /** Its rows when selected. */
+  rows: WorkRow[]
+  cost: number | null
+}
+
+/** One row of a box's body. */
+export type WorkEntry = {
+  kind: 'task' | 'leaf' | 'detail' | 'step' | 'more' | 'last' | 'closing' | 'box' | 'expand'
+  /** 1 under a task row, 0 directly under the box. */
+  depth: number
+  leaf?: WorkLeaf
+  box?: WorkBox
+  text?: string
+  /** The task row's status, or a step's. */
+  status?: string
+  tone?: WorkTone
+  done?: boolean
+  todo?: boolean
+  count?: number
+}
+
+export type WorkBox = {
+  id: string
+  title: string
+  glyph: string
+  strip: WorkStrip
+  startedAt: number
+  endedAt: number | null
+  isLive: boolean
+  last: string
+  entries: WorkEntry[]
+  collapsed: boolean
+}
+
+export type WorkTree = {
+  title: string
+  glyph: string
+  strip: WorkStrip
+  startedAt: number
+  endedAt: number | null
+  isLive: boolean
+  entries: WorkEntry[]
+  boxes: WorkBox[]
+  collapsed: boolean
+}
+
+export type WorkInput = {
+  jobs: readonly Job[]
+  issued: readonly Issued[]
+  cards: readonly AgentCard[]
+  tasks: readonly MeshTask[]
+  run: ConsultRun | null
+  now: number
+  /** The selected leaf (`view.expanded`), whose rows expand under it. */
+  expanded?: string | null
+}
+
+const jobWorkLeaf = (j: Job, issued: readonly Issued[]): WorkLeaf => {
+  const live = isJobLive(j)
+  const worker = live ? j.trying || j.backend : j.handoffBackend || j.backend || j.trying
+  const stage = j.stage ? `stage ${j.stage}${j.attempts > 1 ? ` ×${j.attempts}` : ''}` : ''
+  return {
+    id: `job:${j.jobid}`,
+    kind: 'job',
+    glyph: jobGlyph(j),
+    name: j.job || j.jobid,
+    worker: workerDisplay(worker),
+    note: '',
+    status: j.status,
+    startedAt: j.ts * 1000,
+    endedAt: live ? null : j.endedAt,
+    isLive: live,
+    isRealRepo: false,
+    verifyPending: false,
+    owner: ownerOfJob(issued, j.jobid),
+    task: taskOfJob(issued, j.jobid),
+    detail: live && j.status === 'running' ? [j.now, j.work].filter(Boolean).join(' · ') : '',
+    rows: [
+      ...(stage ? [{ label: 'stage', text: stage }] : []),
+      ...(j.now ? [{ label: 'now', text: j.now }] : []),
+      ...(j.work ? [{ label: 'work', text: j.work }] : []),
+      ...(j.think ? [{ label: 'think', text: j.think, tone: 'dim' as const }] : []),
+    ],
+    cost: j.cost,
+  }
+}
+
+const agyWorkLeaf = (i: Issued): WorkLeaf => {
+  const live = i.endedAt === null
+  return {
+    id: `agy:${i.callId}`,
+    kind: 'agy',
+    glyph: live ? '◐' : i.ok === false ? '✗' : '●',
+    name: `${i.name || 'agy job'}`,
+    worker: agyWorker(i.worker, i.model, i.effort),
+    note: '',
+    status: live ? 'running' : i.ok === false ? 'failed' : 'done',
+    startedAt: i.at,
+    endedAt: i.endedAt,
+    isLive: live,
+    isRealRepo: true,
+    verifyPending: i.verifyPending,
+    owner: i.agentId,
+    task: i.task,
+    detail: live ? [i.now, i.work].filter(Boolean).join(' · ') : '',
+    rows: [
+      ...(i.now ? [{ label: 'now', text: i.now }] : []),
+      ...(i.work ? [{ label: 'work', text: i.work }] : []),
+    ],
+    cost: live ? null : 0,
+  }
+}
+
+/** The run a consult call started: the one it was bound to, or the newest started after it. */
+const consultRunOf = (i: Issued, run: ConsultRun | null): ConsultRun | null =>
+  run && (i.runId === run.id || (!i.runId && run.startedAt >= i.at)) ? run : null
+
+/** A consult call stays in the tree while its run is live and 10 minutes after it ends, as its panel does. */
+export const consultShown = (i: Issued, run: ConsultRun | null, now: number): boolean => {
+  const bound = consultRunOf(i, run)
+  if (bound) return bound.endedAt === null || now - bound.endedAt <= CONSULT_HIDE_AFTER_MS
+  return i.endedAt === null || now - i.at <= CONSULT_HIDE_AFTER_MS
+}
+
+const consultWorkLeaf = (i: Issued, run: ConsultRun | null): WorkLeaf => {
+  const bound = consultRunOf(i, run)
+  const live = bound ? bound.endedAt === null && !bound.stale : i.endedAt === null
+  const answered = bound ? bound.engines.filter(e => e.state === 'ok').length : 0
+  const total = bound ? bound.engines.length : 0
+  const failed = bound ? bound.engines.some(e => e.state === 'failed') : i.ok === false
+  return {
+    id: `consult:${bound?.id || i.callId}`,
+    kind: 'consult',
+    glyph: '◎',
+    name: bound ? `panel ${consultKindLabel(bound.kind)} R${bound.round}` : 'panel',
+    worker: '',
+    note: bound ? `${answered}/${total}` : '',
+    status: live ? 'running' : failed ? 'partial' : 'done',
+    startedAt: bound ? bound.startedAt : i.at,
+    endedAt: bound ? bound.endedAt : i.endedAt,
+    isLive: live,
+    isRealRepo: false,
+    verifyPending: false,
+    owner: i.agentId,
+    task: i.task,
+    detail: '',
+    rows: bound ? [{ label: 'engines', text: `${answered}/${total} answered` }] : [],
+    cost: null,
+  }
+}
+
+const cardWorkLeaf = (c: AgentCard): WorkLeaf => {
+  const live = c.status === 'running'
+  return {
+    id: c.id,
+    kind: 'card',
+    glyph: workGlyph(c.status),
+    name: cardTitle(c),
+    worker: c.worker ? workerDisplay(c.worker) : '',
+    note: '',
+    status: c.status,
+    startedAt: c.spawnedAt,
+    endedAt: c.endedAt,
+    isLive: live,
+    isRealRepo: false,
+    verifyPending: false,
+    owner: c.parentId,
+    task: c.task,
+    detail: live && c.check?.next ? `next ${c.check.next}` : '',
+    rows: [
+      ...(c.check?.last ? [{ label: 'last', text: c.check.last }] : []),
+      ...(c.check?.next ? [{ label: 'next', text: c.check.next }] : []),
+      ...(c.check?.status && !live ? [{ label: 'status', text: c.check.status }] : []),
+      ...(c.check?.tests ? [{ label: 'tests', text: c.check.tests }] : []),
+    ],
+    cost: c.workerCost,
+  }
+}
+
+/** A coordinator that is not a root box draws as a line with its own strip. */
+const coordWorkLeaf = (c: AgentCard, workers: readonly WorkLeaf[]): WorkLeaf => {
+  const statuses = workers.map(l => l.status)
+  const status = sumStatus(statuses)
+  const live = workers.some(l => l.isLive)
+  const ends = workers.map(l => l.endedAt).filter((n): n is number => n !== null)
+  return {
+    id: c.id,
+    kind: 'card',
+    glyph: workGlyph(status),
+    name: cardTitle(c),
+    worker: '',
+    note: stripText(stripOf(statuses)),
+    status,
+    startedAt: c.spawnedAt,
+    endedAt: live || ends.length !== workers.length ? null : Math.max(...ends),
+    isLive: live,
+    isRealRepo: false,
+    verifyPending: false,
+    owner: c.parentId,
+    task: c.task,
+    detail: live && c.check?.next ? `next ${c.check.next}` : '',
+    rows: [],
+    cost: null,
+  }
+}
+
+const leafRank = (l: { isLive: boolean; status: string }) => (l.isLive ? 0 : isTodoStatus(l.status) ? 1 : 2)
+
+/** Running first, then to-do, then done, newest first inside a rank. */
+export const orderWorkLeaves = <T extends { isLive: boolean; status: string; startedAt: number }>(leaves: readonly T[]): T[] =>
+  [...leaves].sort((a, b) => leafRank(a) - leafRank(b) || b.startedAt - a.startedAt)
+
+const entriesOf = (l: WorkLeaf, depth: number, detail: boolean, expanded?: string | null): WorkEntry[] => [
+  { kind: 'leaf', depth, leaf: l, done: !l.isLive && !isTodoStatus(l.status) },
+  ...(detail && l.detail ? [{ kind: 'detail' as const, depth: depth + 1, leaf: l }] : []),
+  ...(expanded === l.id
+    ? l.rows.map(r => ({ kind: 'expand' as const, depth: depth + 1, text: `${r.label}  ${r.text}`, tone: r.tone }))
+    : []),
+]
+
+/**
+ * The whole delegation as one tree (rule 2): main's box holds the mesh tasks with their workers, its
+ * sub-main boxes and its loose workers; each sub-main box holds its checkpoint plan and its workers.
+ */
+export const buildWork = (input: WorkInput): WorkTree => {
+  const now = input.now
+  const exp = input.expanded ?? null
+  const cards = input.cards
+  const byId = new Map(cards.map(c => [c.id, c]))
+  const hasKids = (id: string) => Boolean(id) && cards.some(c => c.parentId === id)
+
+  /** A card and its ancestors, nearest first. */
+  const chainOf = (owner: string): string[] => {
+    const out: string[] = []
+    let cur = owner
+    for (let i = 0; i < 16 && cur; i += 1) {
+      const c = byId.get(cur)
+      if (!c) break
+      out.push(cur)
+      cur = c.parentId
+    }
+    return out
+  }
+  /** The outermost coordinator an owner hangs under, '' for main. */
+  const boxOf = (owner: string): string => {
+    const chain = chainOf(owner)
+    for (let i = chain.length - 1; i >= 0; i -= 1) if (hasKids(chain[i]!)) return chain[i]!
+    return ''
+  }
+
+  const leaves: WorkLeaf[] = []
+  for (const j of orderJobs(input.jobs, now)) leaves.push(jobWorkLeaf(j, input.issued))
+  for (const i of input.issued) {
+    if (i.kind === 'agy' && (i.endedAt === null || now - i.endedAt <= AGY_SHOW_MS)) leaves.push(agyWorkLeaf(i))
+    if (i.kind === 'consult' && consultShown(i, input.run, now)) leaves.push(consultWorkLeaf(i, input.run))
+  }
+  for (const c of cards) if (!hasKids(c.id)) leaves.push(cardWorkLeaf(c))
+
+  const directOf = (id: string) => leaves.filter(l => l.owner === id)
+  /** A deeper coordinator's workers: its own and its descendants', not the root box's direct ones. */
+  const underOf = (id: string, root: string) => leaves.filter(l => l.owner !== root && chainOf(l.owner).includes(id))
+
+  const roots = cards.filter(c => hasKids(c.id) && boxOf(c.id) === c.id)
+  const deeps = cards.filter(c => hasKids(c.id) && boxOf(c.id) !== c.id)
+
+  const endedAtOf = (ls: readonly WorkLeaf[]): number | null => {
+    const ends = ls.map(l => l.endedAt).filter((n): n is number => n !== null)
+    return ls.length > 0 && ends.length === ls.length ? Math.max(...ends) : null
+  }
+  const collapsedOf = (ls: readonly WorkLeaf[]) => {
+    const end = endedAtOf(ls)
+    return end !== null && ls.length > 0 && now - end > COLLAPSE_AFTER_MS
+  }
+
+  const subBox = (c: AgentCard): WorkBox => {
+    const workers = orderWorkLeaves(directOf(c.id))
+    const check = c.check
+    const steps = check?.steps ?? []
+    const open = check?.open ?? []
+    // The plan in order: steps done, the worker on the current one, then the open items.
+    const statuses = [...steps.map(s => (s.ok ? 'done' : 'failed')), ...workers.map(l => l.status), ...open.map(() => 'todo')]
+    const entries: WorkEntry[] = []
+    if (check?.last) entries.push({ kind: 'last', depth: 0, text: check.last })
+    // An ended sub-main's own report: `status DONE · tests 72/72`.
+    if (c.status !== 'running' && (check?.status || check?.tests)) {
+      entries.push({ kind: 'closing', depth: 0, text: [check?.status ? `status ${check.status}` : '', check?.tests ? `tests ${check.tests}` : ''].filter(Boolean).join(' · ') })
+    }
+    for (const l of workers.filter(w => w.isLive)) entries.push(...entriesOf(l, 0, true, exp))
+    for (const o of open) entries.push({ kind: 'step', depth: 0, text: o, status: 'todo', todo: true })
+    const behind = workers.filter(w => !w.isLive)
+    const doneWorkers = behind.filter(w => !isTodoStatus(w.status))
+    for (const l of behind.filter(w => isTodoStatus(w.status))) entries.push(...entriesOf(l, 0, false, exp))
+    for (const l of doneWorkers.slice(0, 2)) entries.push(...entriesOf(l, 0, false, exp))
+    const moreDone = Math.max(0, doneWorkers.length - 2)
+    const moreSteps = Math.max(0, steps.length - 2)
+    if (moreDone + moreSteps > 0) entries.push({ kind: 'more', depth: 0, count: moreDone + moreSteps })
+    for (const d of deeps.filter(x => boxOf(x.id) === c.id)) {
+      const dl = coordWorkLeaf(d, underOf(d.id, c.id))
+      entries.push({ kind: 'leaf', depth: 0, leaf: dl, done: !dl.isLive })
+    }
+    const startedEnds = [c.spawnedAt, ...workers.map(w => w.startedAt)].filter(n => n > 0)
+    const end = endedAtOf(workers)
+    const status = sumStatus(statuses)
+    return {
+      id: c.id,
+      title: `${c.type || 'sub-main'}${c.task ? ` · ${c.task}` : ''}`,
+      glyph: workGlyph(status),
+      strip: stripOf(statuses),
+      startedAt: startedEnds.length > 0 ? Math.min(...startedEnds) : 0,
+      endedAt: end,
+      isLive: workers.some(w => w.isLive) || c.status === 'running',
+      last: check?.last ?? '',
+      entries,
+      collapsed: collapsedOf(workers),
+    }
+  }
+
+  const plan = input.tasks.filter(t => t.id)
+  const taskById = new Map(plan.map(t => [t.id, t]))
+  const rank: Record<string, number> = { doing: 0, running: 0, todo: 1, blocked: 1, done: 2 }
+  const tasks = [...plan].sort((a, b) => (rank[a.status] ?? 1) - (rank[b.status] ?? 1))
+
+  const mainLeaves = orderWorkLeaves(leaves.filter(l => boxOf(l.owner) === ''))
+  const groups = new Map<string, WorkLeaf[]>()
+  const loose: WorkLeaf[] = []
+  for (const l of mainLeaves) {
+    if (l.task && taskById.has(l.task)) {
+      const list = groups.get(l.task)
+      if (list) list.push(l)
+      else groups.set(l.task, [l])
+    } else loose.push(l)
+  }
+
+  const entries: WorkEntry[] = []
+  const used = new Set<string>()
+  for (const t of tasks) {
+    const ls = groups.get(t.id) ?? []
+    if (ls.length === 0 && t.status !== 'doing') continue
+    used.add(t.id)
+    entries.push({ kind: 'task', depth: 0, text: `${t.id}${t.subject ? ` ${t.subject}` : ''}`, status: t.status })
+    for (const l of orderWorkLeaves(ls)) entries.push(...entriesOf(l, 1, true, exp))
+  }
+  const boxes = [...roots]
+    .sort((a, b) => (rank[taskById.get(a.task)?.status ?? ''] ?? 1) - (rank[taskById.get(b.task)?.status ?? ''] ?? 1) || a.spawnedAt - b.spawnedAt)
+    .map(subBox)
+    .filter(b => b.entries.length > 0 || b.collapsed)
+  for (const b of boxes) entries.push({ kind: 'box', depth: 0, box: b })
+  for (const l of loose) entries.push(...entriesOf(l, 0, true, exp))
+  const rest = tasks.filter(t => !used.has(t.id) && (t.status === 'todo' || t.status === 'blocked'))
+  if (rest.length > 0) entries.push({ kind: 'closing', depth: 0, text: rest.map(t => `○ ${t.id}${t.subject ? ` ${shorten(t.subject, 18)}` : ''}`).join(' · ') })
+
+  const all = [...leaves]
+  const starts = all.map(l => l.startedAt).filter(n => n > 0)
+  const stripStatuses = plan.length > 0 ? plan.map(t => t.status) : mainLeaves.map(l => l.status)
+  return {
+    title: "WORK · main's tasks",
+    glyph: workGlyph(sumStatus(stripStatuses)),
+    strip: stripOf(stripStatuses),
+    startedAt: starts.length > 0 ? Math.min(...starts) : 0,
+    endedAt: endedAtOf(all),
+    isLive: all.some(l => l.isLive),
+    entries,
+    boxes,
+    // Main keeps its plan visible while a task is still to do, however long its workers have been gone.
+    collapsed: collapsedOf(all) && !plan.some(t => isTodoStatus(t.status) || isRunningStatus(t.status)),
+  }
+}
+
+/** Whether the tree has anything to draw: no worker and no task takes no room. */
+export const isWorkEmpty = (w: WorkTree) => w.entries.length === 0 && w.boxes.length === 0
+
+const isLiveEntry = (e: WorkEntry) => (e.kind === 'leaf' ? Boolean(e.leaf?.isLive) : false)
+
+/** A box's rows when selected: every leaf and step row, the last row and the closing line, in order. */
+const bodyRows = (entries: readonly WorkEntry[], cols: number): WorkEntry[] => {
+  const out: WorkEntry[] = []
+  for (const e of entries) {
+    if (e.kind === 'detail' && cols < WORK_DETAIL_COLS) continue
+    out.push(e)
+  }
+  return out
+}
+
+/** A box entry costs no row of its own: the nested box draws them. */
+const entryRows = (e: WorkEntry): number => (e.kind === 'box' ? 0 : 1)
+
+/** How many rows a box takes when drawn: header and border, plus a line per body entry. */
+export const workBoxRows = (b: WorkBox, cols: number): number =>
+  b.collapsed || cols < WORK_NARROW ? 1 : 2 + 1 + bodyRows(b.entries, cols).reduce((n, e) => n + entryRows(e), 0)
+
+/** How many rows the whole tree takes at `cols`, nested boxes included. */
+export const workRows = (w: WorkTree, cols: number): number =>
+  w.collapsed || cols < WORK_NARROW
+    ? 1 + w.boxes.reduce((n, b) => n + 1, 0)
+    : 4 + bodyRows(w.entries, cols).reduce((n, e) => n + entryRows(e), 0) + w.boxes.reduce((n, b) => n + workBoxRows(b, cols), 0)
+
+/**
+ * The tree at most `budget` rows tall, dropping in the rule 6 order and across all boxes evenly
+ * (largest box first): detail lines, dimmed done lines, deeper to-do lines into `+N more`, then
+ * nested box bodies down to header + strip + running lines.
+ */
+export const fitWork = (w: WorkTree, budget: number, cols: number): WorkTree => {
+  const next: WorkTree = { ...w, entries: [...w.entries], boxes: w.boxes.map(b => ({ ...b, entries: [...b.entries] })) }
+  const total = () => workRows(next, cols)
+  if (total() <= budget) return next
+  const lists = (): WorkEntry[][] => [next.entries, ...next.boxes.map(b => b.entries)]
+  const drop = (kind: WorkEntry['kind'], doneOnly = false): boolean => {
+    let best: WorkEntry[] | null = null
+    for (const list of lists()) {
+      const n = list.filter(e => e.kind === kind && (!doneOnly || e.done)).length
+      if (n > 0 && (!best || n > best.filter(e => e.kind === kind).length)) best = list
+    }
+    if (!best) return false
+    const idx = doneOnly ? best.findIndex(e => e.kind === kind && e.done) : best.findIndex(e => e.kind === kind)
+    if (idx < 0) return false
+    best.splice(idx, 1)
+    return true
+  }
+  const fold = (): boolean => {
+    let best: WorkEntry[] | null = null
+    let bestN = 0
+    for (const list of lists()) {
+      const n = list.filter(e => e.todo).length
+      if (n > bestN) {
+        bestN = n
+        best = list
+      }
+    }
+    if (!best) return false
+    const idx = best.map(e => Boolean(e.todo)).lastIndexOf(true)
+    if (idx < 0) return false
+    best.splice(idx, 1)
+    const more = best.find(e => e.kind === 'more')
+    if (more) more.count = (more.count ?? 0) + 1
+    else best.push({ kind: 'more', depth: 0, count: 1 })
+    return true
+  }
+  const shrinkBoxes = (): boolean => {
+    const box = next.boxes.filter(b => !b.collapsed && b.entries.some(e => !isLiveEntry(e) || e.kind === 'detail')).sort((a, b) => b.entries.length - a.entries.length)[0]
+    if (!box) return false
+    box.entries = box.entries.filter(isLiveEntry)
+    return true
+  }
+  const collapseThem = (): boolean => {
+    const box = next.boxes.filter(b => !b.collapsed && b.entries.length > 0).sort((a, b) => b.entries.length - a.entries.length)[0]
+    if (!box) return false
+    box.collapsed = true
+    box.entries = []
+    return true
+  }
+  let guard = 0
+  while (total() > budget && guard < 400) {
+    guard += 1
+    if (drop('detail')) continue
+    if (drop('leaf', true)) continue
+    if (fold()) continue
+    if (shrinkBoxes()) continue
+    if (drop('last')) continue
+    if (drop('closing')) continue
+    if (drop('leaf')) continue
+    if (collapseThem()) continue
+    break
+  }
+  // Still too tall: drop nested boxes from the end, then every row, then the box itself to its line.
+  while (total() > budget && next.boxes.length > 0) {
+    const gone = next.boxes.pop()!
+    next.entries = next.entries.filter(e => e.box !== gone)
+  }
+  if (total() > budget) next.entries = []
+  if (total() > budget) next.collapsed = true
+  return next
+}
 
 const isEngineState = (v: unknown): v is ConsultEngineState =>
   v === 'queued' || v === 'running' || v === 'ok' || v === 'failed' || v === 'skipped'

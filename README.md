@@ -61,16 +61,17 @@ https://github.com/user-attachments/assets/9ad0fcc3-c81c-427a-a743-f7b6c49f5885
 
 | Panel | Shows | From |
 | --- | --- | --- |
-| **main** | model, effort, permission mode, request count; a context gauge with compactions (↺, or ↺~ when [estimated](#what-is-inferred-not-measured)), measured against the compaction window when the session compacts in a smaller one than the model's (`autoCompactWindow`, or Claude Code's own); cost and the first two rate-limit windows when your plan reports them, with the time to each reset (↻) from 56 columns; the last main-loop request's time to first token | `turn.step`, `session.measure`, `session.compact`, `$.session.usage()` (at each main-loop request, and its local `summary` breakdown, once per model, for the compaction window); the permission mode from `classic.UserPromptSubmit` and `agent.spawn` |
+| **main** | model, effort, permission mode, request count; a context gauge with compactions (↺, or ↺~ when [estimated](#what-is-inferred-not-measured)), measured against the compaction window when the session compacts in a smaller one than the model's (`autoCompactWindow`, or Claude Code's own); cost and the first two rate-limit windows when your plan reports them, with the time to each reset (↻) from 56 columns; the last main-loop request's time to first token; when mesh tasks exist, one `tasks` row with the plan's strip and the task being done now | `turn.step`, `session.measure`, `session.compact`, `$.session.usage()` (at each main-loop request, and its local `summary` breakdown, once per model, for the compaction window); the permission mode from `classic.UserPromptSubmit` and `agent.spawn`; the mesh task cache |
+| **work** | one live tree of the whole delegation: main's mesh tasks with the workers under them, a box per sub-main with its checkpoint plan and workers, and a closing line of the tasks still to do. Strips, live clocks, one detail line under a running leaf, and the selected leaf's rows; fits the pane's height | `jobsDir` (farmer jobs), the agy conversation store, `consultDir` and the run file, `agent.spawn` and `tool.call` (who issued what), mesh tasks, and each Claude subagent's checkpoint file |
 | **architect** | consults on a timeline, whether one is running, how long the last took; optionally the moment of each consult; the first line of a subagent architect's advice | a spawn of a matching agent type, or a matching server tool in the assistant's rows |
 | **consult** | external multi-engine consults and debates in a ring around `MAIN`, with live spinners, travelling packets, question, legend, failure reasons, active locks and summary | `~/.claude/state/consult-runs/` (or `consultDir`) and `~/.claude/state/consult-locks.json` |
 | **gate** | one cell per permission check: green allowed without asking, blue decided by the auto-mode classifier or you and then run, amber pending, red ✗ denied, dim if made inside a subagent. Totals, and a drill-down per tool family with credentials masked | `tool.check`, settled by the `tool.call` around it |
-| **agents** | cards side by side while they fit: the task, type, live context and output tokens, steps, a running clock, `max_tokens` in red. Beyond that, swimlanes on one time axis. Until the `work` tree lands, one line per farmer job or agy-job call, with a live `now · work` detail line while it runs | `agent.spawn`, `turn.step`, `tool.call`, `turn.complete`; `jobsDir` for the jobs |
+| **agents** | cards side by side while they fit: the task, type, live context and output tokens, steps, a running clock, `max_tokens` in red. Beyond that, swimlanes on one time axis. Farmer jobs and agy-job calls live in the `work` tree | `agent.spawn`, `turn.step`, `tool.call`, `turn.complete` |
 | **loops** | model loops that match no card: workflow agents, compactions, memory forks | `turn.step` ids no card claims |
 | **receipt** | the running turn, or the last one: duration, agents, edits, errors, cost added | `turn.start`, `turn.complete` |
 | **log** | prompts, spawns, completions, consults, edits, errors and denials; filtered to one agent while you view its transcript | all of the above |
 
-Connectors animate only while work flows: a turn is running, an agent is running, or a consult is open. Panels with nothing to show take no room, so a session without subagents shows just the main box and the log.
+Connectors animate only while work flows: a turn is running, an agent is running, or a consult is open. Panels with nothing to show take no room, so a session with no agents, no plan and no workers shows just the main box.
 
 ## Use
 
@@ -135,7 +136,7 @@ In `/config`, or under `pluginConfigs[<id>].options` in your user `settings.json
 | `matchDescriptions` | `false` | also match agent descriptions, not just type names |
 | `architectLabel` | `ARCHITECT` | the architect's name in the pane |
 | `gateLabel` | `GATE` | the permission panel's name |
-| `panels` | `main,architect,consult,gate,agents,loops,receipt,log` | which panels show, in order |
+| `panels` | `main,work,consult,architect,loops,receipt` | which panels show, in order; `agents`, `gate` and `log` are still valid names |
 | `layout` | `auto` | `mini`, `compact`, `wide`, or `auto` (mini inline, wide from 110 columns docked) |
 | `maxCards` | `3` | cards side by side before swimlanes (1–6); fewer if the pane is too narrow |
 | `paneColumns` | `66` | columns the docked pane asks for, 40 or more. Claude Code caps the dock at 45% of the terminal, and a width you dragged it to, in this session or an earlier one, wins. The wide layout starts at 110, so it needs a terminal of about 245 columns, or `layout: wide` |
@@ -218,20 +219,55 @@ Debate (round 2+, answers circulate clockwise around the ring):
 ╰──────────────────────────────────────────────────────────────╯
 ```
 
+## Work tree
+
+The `work` panel is the whole delegation as one tree rooted at main: the plan's tasks, the workers under the task each serves, and a box per sub-main. Farmer jobs and agy-job calls are workers here, not on the `agents` panel (which is cards and lanes again). This is a real render at 66 columns:
+
+```
+╭────────────────────────────────────────────────────────────────╮
+│ ◐ WORK · main's tasks ●●◐○○ 2/5                          16:00 │
+│ ◐ t3 flightdeck 0.7.0                                          │
+│ └ ◐ ring-panel ▸ Hydrogen xhigh                          16:00 │
+│   edit hooks/register.tsx · 4 files · 83 st                    │
+│  ╭───────────────────────────────────────────────────────────╮ │
+│  │ ◐ sub-main · t4 ●●◐○○○ 2/6                           6:00 │ │
+│  │ last ✔ step 2 jobs probe (exit 0)                         │ │
+│  │ ◐ builder                                            2:10 │ │
+│  │   next edit hooks/core.ts                                 │ │
+│  │ ○ receipt rows                                            │ │
+│  │ ○ tests                                                   │ │
+│  │ ○ docs                                                    │ │
+│  ╰───────────────────────────────────────────────────────────╯ │
+│ ● receipt ▸ sol free                                      4:06 │
+│ ○ t4 receipt · ○ t5 docs                                       │
+│ ● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel       │
+╰────────────────────────────────────────────────────────────────╯
+```
+
+Main's box is titled `WORK · main's tasks`; every sub-main (any agent that spawns agents) is a box titled with its brief's `task: t<N>`. A box's header carries its glyph, name, strip and elapsed; its body is a `├ └` tree of running workers first, then to-do plan steps, then at most two dimmed done lines, then `+N more`. Main lists the tasks with no row of their own on one closing line (`○ t4 receipt · ○ t5 docs`).
+
+The strip is one glyph per unit and `<done>/<total>`: mesh task items for main (`todo`, `doing`, `done`, `blocked`), plan steps plus workers for a sub-main. It holds at most 12 glyphs, then `+N`. A worker line names its farmer model (`▸ Hydrogen xhigh`), keeps a live clock, and a running leaf gets one detail line from 56 columns (`edit hooks/register.tsx · 4 files · 83 st`, or a builder's `next`). Select a leaf with its glyph to expand its `stage`, `now`, `work`, `think`, `last`, `next` and `status`/`tests` rows. Ended leaves keep one line. A box whose work is all done collapses to its header line 60 s after the last end.
+
+Who issued what comes from the events, not a guess: `agent.spawn`'s `parentAgentId`; a Bash call running `ds-job.py run|batch`, `agy-job.py run` or `consult-cli.js` binds its job or consult run to the agent whose call it was, and the result's `jobid:` line binds the job dir. A job the probe sees but nothing bound belongs to main. Main's direct workers hang under the mesh task that was `doing` when they were issued; a sub-main's under its brief's `task:` line. A consult-cli run is one `◎` line that points at the `consult` panel.
+
+The pane is the hard limit. On every render the tree takes the rows the other shown panels leave (`e.props.scroll.bodyRows`), and drops detail lines, dimmed done lines, to-do lines (folded into `+N more`) and then nested box bodies until the pane fits. Below 56 columns it leaves detail lines out; below 40 every box is one line: header, strip and clock. Boxes nest two levels at most: a coordinator under a sub-main draws as a line with its own strip. Nothing wraps.
+
+The top `main` card keeps one `tasks` row of its own (`tasks  ●●◐○○ 2/5 ▸ t3 flightdeck 0.7.0`), so the plan stays visible when the tree is cut by height.
+
+Claude subagents (`sub-main`, `builder`, `builder-lite`) already write a checkpoint after every step. The tree finds the file from the brief (`report:` / `handoff:`, a `.handoffs/<name>.md` token, or `.handoffs/<agent name>.md` for a builder), or from an ended agent's `HANDOFF:` / `REPORT:` line, and reads its last 8 KB with a local python probe every 10 s: the last step (`last ✔ step 2 jobs probe (exit 0)`), the `next` command, the `open:` bullets, `status:` and `tests:`. Those rows show on the expanded card and on a sub-main's box; a file over 256 KB is left alone.
+
 ## Farmer jobs
 
-A farmer job (`ds-job.py run`, `agy-job.py run`) is not a Claude subagent, so the agent cards never saw it. Flightdeck now reads `jobsDir` (default `~/.claude/state/ds-jobs`) with a local python probe every 3 s while a job is live and every 20 s otherwise: live jobs, and jobs that ended in the last 30 minutes, newest first, at most 8. A live job whose recorded pid is gone is marked `⊘`.
-
-Until the `work` tree lands, the `agents` panel lists each job and each agy-job call as one line under the agents, with one detail line under a running one:
+A farmer job (`ds-job.py run`, `agy-job.py run`) is not a Claude subagent, so the agent cards never saw it. Flightdeck reads `jobsDir` (default `~/.claude/state/ds-jobs`) with a local python probe every 3 s while a job is live and every 20 s otherwise: live jobs, and jobs that ended in the last 30 minutes, newest first, at most 8. A live job whose recorded pid is gone is marked `⊘`. Each job is a line in the [work tree](#work-tree):
 
 ```
-◐ ring-panel ▸ Hydrogen xhigh          2:04
+◐ ring-panel ▸ Hydrogen xhigh           2:04
   edit hooks/register.tsx · 4 files · 83 st
-● receipt ▸ sol                       4:06
-◐ ◇verify ▸ agy Sonnet high            0:41  verify pending
+● receipt ▸ sol free                    4:06
+◇verify ▸ agy Sonnet high               0:41  verify pending
 ```
 
-The detail line is left out below 56 columns. `◇` marks an agy-job: it runs on your real repo, with no scrubbed copy. `verify pending` shows while `~/.claude/state/agy-verify-pending/<job>.json` exists, and its thought is never read: those jobs are private.
+`◇` marks an agy-job: it runs on your real repo, with no scrubbed copy. `verify pending` shows while `~/.claude/state/agy-verify-pending/<job>.json` exists, and its thought is never read: those jobs are private.
 
 No model is called. For an agy worker the pane opens that conversation's SQLite store read-only and reads the latest tool call (`edit hooks/register.tsx`, `run npm test`), the edited files and the step count; a locked, missing or unreadable store leaves those rows out. Other workers fall back to the newest file in the job's work tree against `<jobdir>/base`. The turn receipt counts a job the turn started (`2 jobs`) and gives each one a row with its worker, duration, tokens from the handoff `ds:` line and cost, or `free`.
 

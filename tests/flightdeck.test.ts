@@ -117,6 +117,30 @@ import {
   turnConsults,
   turnJobs,
   workerDisplay,
+  CHECKPOINT_PY,
+  COLLAPSE_AFTER_MS,
+  CONSULT_PY,
+  MESH_PY,
+  WORK_DETAIL_COLS,
+  WORK_NARROW,
+  WORK_STRIP_MAX,
+  buildWork,
+  checkpointOfAnswer,
+  checkpointPath,
+  checkpointProbe,
+  fitWork,
+  fmtSpan,
+  isWorkEmpty,
+  normalizeCheckpoint,
+  orderWorkLeaves,
+  parseCheckpoint,
+  parseCheckpointText,
+  resolvePath,
+  stripOf,
+  stripText,
+  sumStatus,
+  workGlyph,
+  workRows,
 } from '../hooks/core'
 
 test('a context budget smaller than the window is what the gauge measures against', () => {
@@ -289,7 +313,8 @@ test('consults open, close by id, and draw on a shared timeline', () => {
 
 test('config is read leniently: bad values fall back to defaults', () => {
   const d = parseConfig({})
-  expect([d.maxCards, d.paneColumns, d.layout, d.motion, d.moments, d.panels.length]).toEqual([3, 66, 'auto', true, true, 8])
+  expect([d.maxCards, d.paneColumns, d.layout, d.motion, d.moments, d.panels.length]).toEqual([3, 66, 'auto', true, true, 6])
+  expect(d.panels).toEqual(['main', 'work', 'consult', 'architect', 'loops', 'receipt'])
   expect(d.panels[2]).toBe('consult')
   expect(d.architect.test('fable-advisor:fable-advisor')).toBe(true)
   const c = parseConfig({ architectPattern: '([', maxCards: 99, layout: 'diagonal', panels: 'log, gate ,nope,gate', motion: 'off' })
@@ -394,7 +419,10 @@ const spawn = (subagentType: string, description: string) => ({
   fork: false,
 })
 
-test('a fresh session draws on every surface and width, empty panels hidden', async ($, on) => {
+// The panels a session showed before 0.8.0 gave the tree its own panel: a test that draws one asks for it.
+const LEGACY_PANELS = { options: { panels: 'main,architect,consult,gate,agents,loops,receipt,log' } }
+
+test('a fresh session draws on every surface and width, empty panels hidden', LEGACY_PANELS, async ($, on) => {
   engine(on)
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     for (const cols of [40, 60, 86, 120]) {
@@ -454,7 +482,7 @@ test('pastel keeps the fixed dark-terminal colours', { options: { palette: 'past
   await ui.unmount()
 })
 
-test('subagents become cards, then swimlanes past the card limit; a card expands on its hotkey', async ($, on) => {
+test('subagents become cards, then swimlanes past the card limit; a card expands on its hotkey', { options: { panels: 'main,agents' } }, async ($, on) => {
   engine(on)
   let n = 0
   on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: `ag${++n}` }))
@@ -529,7 +557,7 @@ test('the server-side advisor is read only from rows that come in by the respons
   await after.unmount()
 })
 
-test('the gate strip fills from checks and a row opens its redacted drill-down', async ($, on) => {
+test('the gate strip fills from checks and a row opens its redacted drill-down', { options: { panels: 'main,gate' } }, async ($, on) => {
   engine(on)
   on('tool.check', (_$, e) => ({ decision: e.tool === 'Read' ? 'allow' : 'ask' }))
   await $.tool.check({ tool: 'Read', input: { file_path: '/a/b.ts' }, tool_use_id: 'k1' })
@@ -592,7 +620,7 @@ test('with no architect anywhere, the panel, legend entry and status field stay 
   await ui.unmount()
 })
 
-test('cards that cannot fit the pane fall back to lanes', async ($, on) => {
+test('cards that cannot fit the pane fall back to lanes', { options: { panels: 'main,agents' } }, async ($, on) => {
   engine(on)
   let n = 0
   on('agent.spawn', () => ({ model: 'claude-opus-5-5', agentId: `w${++n}` }))
@@ -681,7 +709,7 @@ test("the main box shows the last request's time to first token, and no tokens p
   }
 })
 
-test('on a graphical surface, rows of marks hold fewer marks, keep the newest and clip at their box', async ($, on) => {
+test('on a graphical surface, rows of marks hold fewer marks, keep the newest and clip at their box', { options: { panels: 'main,architect,gate,loops' } }, async ($, on) => {
   engine(on)
   // The newest check is the one refused: its ✗ must stay in sight.
   on('tool.check', (_$, e) => ({ decision: e.tool_use_id === 'g29' ? 'deny' : 'allow' }))
@@ -747,7 +775,7 @@ test('a draw that fails says why instead of leaving the pane empty', async ($, o
   }
 })
 
-test('a finished agent that takes another step (resumed by SendMessage) runs again, in the pane and the status line', async ($, on) => {
+test('a finished agent that takes another step (resumed by SendMessage) runs again, in the pane and the status line', { options: { panels: 'main,agents,log' } }, async ($, on) => {
   // engine(on), with a status line that keeps what it was told
   mock.clock(on)
   const status: (string | undefined)[] = []
@@ -1043,7 +1071,7 @@ const fillHost = ($: Parameters<TestBody>[0], on: On) => {
   }
 }
 
-test('under the built-in guard a request that finds the context emptied counts an estimated compaction', async ($, on) => {
+test('under the built-in guard a request that finds the context emptied counts an estimated compaction', { options: { panels: 'main,log' } }, async ($, on) => {
   const h = fillHost($, on)
   await h.measure(60_000)
   await h.request(undefined) // a new session's first request: nothing to have emptied
@@ -1078,7 +1106,7 @@ test('under the built-in guard a request that finds the context emptied counts a
   expect((await h.shown()).mark).toBe('↺~2')
 })
 
-test('once session.compact reaches Flightdeck its count is the real one: estimates before it are dropped, none after', async ($, on) => {
+test('once session.compact reaches Flightdeck its count is the real one: estimates before it are dropped, none after', { options: { panels: 'main,log' } }, async ($, on) => {
   const h = fillHost($, on)
   await h.measure(60_000)
   await h.request(60_000)
@@ -1091,7 +1119,7 @@ test('once session.compact reaches Flightdeck its count is the real one: estimat
   expect(await h.shown()).toEqual({ mark: '↺1', isEstimated: false, logged: ['context compacted (estimated)', 'context compacted (auto)'] })
 })
 
-test('a compaction that comes back skipped is neither counted nor logged', async ($, on) => {
+test('a compaction that comes back skipped is neither counted nor logged', { options: { panels: 'main,log' } }, async ($, on) => {
   const h = fillHost($, on)
   await h.measure(60_000)
   const compact = () => $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'the summary', toolUses: [] }] })
@@ -1161,7 +1189,7 @@ test('switching to another model with the same window reads its compaction windo
   await ui.unmount()
 })
 
-test('a resume through agent.spawn logs once, whether its spawn or its first step lands first; "done" times the run', async ($, on) => {
+test('a resume through agent.spawn logs once, whether its spawn or its first step lands first; "done" times the run', { options: { panels: 'main,agents,log' } }, async ($, on) => {
   const clock = mock.clock(on)
   on('ui.status', () => ({ value: undefined }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
@@ -1211,7 +1239,7 @@ test('a resume through agent.spawn logs once, whether its spawn or its first ste
   expect(await lines(/^done · 1m30s$/)).toBe(1)
 })
 
-test("a subagent's turn start is its own: no prompt line, and the main turn keeps its count", async ($, on) => {
+test("a subagent's turn start is its own: no prompt line, and the main turn keeps its count", { options: { panels: 'main,agents,receipt,log' } }, async ($, on) => {
   engine(on)
   on('tool.call', () => ({ result: {}, text: 'ok' }))
   await $.turn.start({ text: 'refactor it', turnId: 'T1' })
@@ -1296,6 +1324,21 @@ const spillsOf = (tree: unknown, columns: number) => {
   return out
 }
 
+/**
+ * The rows a drawn tree takes, as a column layout would give them: a column Box adds its children's
+ * rows, a row Box takes the tallest, a border adds two and padding its own.
+ */
+const heightOf = (n: unknown): number => {
+  if (typeof n === 'string' || typeof n === 'number') return 1
+  if (!isDrawn(n)) return 0
+  const p = n.props ?? {}
+  if (n.type !== 'Box') return 1
+  const kids = (n.children ?? []).filter(c => c !== null && c !== undefined && c !== false && c !== '')
+  const isColumn = p.flexDirection === 'column' || p.flexDirection === 'column-reverse'
+  const inner = isColumn ? kids.reduce((a: number, k) => a + heightOf(k), 0) : Math.max(0, ...kids.map(heightOf))
+  return inner + (p.borderStyle ? 2 : 0) + 2 * spaceOf(p.paddingY ?? p.padding) + spaceOf(p.marginTop) + spaceOf(p.marginBottom)
+}
+
 /** A session with every panel busy: a compaction window, limits, consults with advice, checks of every kind, agents, a loop. */
 const busySession = async ($: Parameters<TestBody>[0], on: On) => {
   const clock = engine(on)
@@ -1349,7 +1392,7 @@ const busySession = async ($: Parameters<TestBody>[0], on: On) => {
   return clock
 }
 
-test('every panel fits the pane at every width from 24 columns, on every surface and placement, in lines a graphical surface keeps whole', { timeoutMs: 60_000 }, async ($, on) => {
+test('every panel fits the pane at every width from 24 columns, on every surface and placement, in lines a graphical surface keeps whole', { timeoutMs: 60_000, options: { panels: 'main,work,consult,architect,gate,agents,loops,receipt,log' } }, async ($, on) => {
   await busySession($, on)
   const failures: string[] = []
   const check = async (label: string) => {
@@ -1448,7 +1491,7 @@ const kitHasMono = async ($: Parameters<TestBody>[0]): Promise<boolean> => {
   }
 }
 
-test('a running connector keeps its length every frame: one face, clipped at its width, the dot still moving', { plugins: [monoProbe] }, async ($, on) => {
+test('a running connector keeps its length every frame: one face, clipped at its width, the dot still moving', { plugins: [monoProbe], options: { panels: 'main,gate,receipt' } }, async ($, on) => {
   engine(on)
   // The monospaced face where the engine running the tests has it; before 2.1.299 an engine of that age, and none.
   let hasMono = false
@@ -1540,7 +1583,7 @@ const facesAt = async ($: Parameters<TestBody>[0], on: On, version: string | nul
 }
 
 // #28: on 2.1.295 the pane went empty at the first prompt, when the first connector was drawn with `mono`.
-test('on an engine before 2.1.299 nothing asks for the monospaced face, and the connectors still run', async ($, on) => {
+test('on an engine before 2.1.299 nothing asks for the monospaced face, and the connectors still run', { options: { panels: 'main,gate,receipt' } }, async ($, on) => {
   const { named, lines } = await facesAt($, on, '2.1.295')
   expect(named).toEqual([])
   // Both connectors, on both surfaces, every frame: still animated, still clipped at 64 from 68 cells.
@@ -1553,13 +1596,13 @@ test('an engine that will not say its version gets no monospaced face either', a
   expect((await facesAt($, on, null)).named).toEqual([])
 })
 
-test('with motion off, the still connector is drawn without the face before 2.1.299', { options: { motion: 'off' } }, async ($, on) => {
+test('with motion off, the still connector is drawn without the face before 2.1.299', { options: { motion: 'off', panels: 'main,gate,receipt' } }, async ($, on) => {
   const { named, lines } = await facesAt($, on, '2.1.295')
   expect(named).toEqual([])
   expect(lines.length).toBe(2 * 2 * 3)
 })
 
-test('with motion off, the still connector keeps the face from 2.1.299', { plugins: [monoProbe], options: { motion: 'off' } }, async ($, on) => {
+test('with motion off, the still connector keeps the face from 2.1.299', { plugins: [monoProbe], options: { motion: 'off', panels: 'main,gate,receipt' } }, async ($, on) => {
   // An engine running the tests that predates the face refuses it: there, one of that age, and no face.
   const { named, lines, hasMono } = await facesAt($, on, kit => (kit ? '2.1.299' : '2.1.295'))
   expect(lines.length).toBe(2 * 2 * 3)
@@ -2950,6 +2993,232 @@ test('a receipt row carries the job, its worker, tokens and cost; a running one 
   )
 })
 
+// ---------------------------------------------------------------- work tree
+
+test('a strip is one glyph per unit, twelve then +N, and done/total always', () => {
+  expect(['done', 'partial', 'failed', 'running', 'todo', 'blocked', 'stopped', 'dry'].map(workGlyph)).toEqual(['●', '◑', '✗', '◐', '○', '✗', '◑', '○'])
+  expect(stripText(stripOf(['done', 'done', 'doing', 'todo', 'todo']))).toBe('●●◐○○ 2/5')
+  const many = stripOf(Array.from({ length: 15 }, () => 'todo'))
+  expect([many.glyphs.length, many.more, stripText(many)]).toEqual([WORK_STRIP_MAX, 3, '○○○○○○○○○○○○+3 0/15'])
+  expect(stripOf([])).toEqual({ glyphs: [], more: 0, done: 0, total: 0 })
+  expect(sumStatus(['done', 'running'])).toBe('running')
+  expect(sumStatus(['done', 'failed'])).toBe('failed')
+  expect(sumStatus(['done', 'done'])).toBe('done')
+  expect(sumStatus([])).toBe('todo')
+  expect(fmtSpan(960_000)).toBe('16m')
+  expect(fmtSpan(72_000)).toBe('1m12s')
+  expect(fmtSpan(6_000)).toBe('6s')
+})
+
+test('a checkpoint path is read from the brief: a report/handoff line, a .handoffs token, a builder name', () => {
+  const cwd = '/w/proj'
+  expect(checkpointPath('do it\nreport: .handoffs/sub-main.md', 'sub-main', cwd)).toBe('/w/proj/.handoffs/sub-main.md')
+  expect(checkpointPath('do it\nREPORT: "/w/out/r.md"', 'builder', cwd)).toBe('/w/out/r.md')
+  expect(checkpointPath('HANDOFF: C:\\w\\h.md', 'builder', cwd)).toBe('C:\\w\\h.md')
+  expect(checkpointPath('see .handoffs/fix-probe.md for the report', 'builder', cwd)).toBe('/w/proj/.handoffs/fix-probe.md')
+  expect(checkpointPath('no path here', 'builder-lite', cwd)).toBe('/w/proj/.handoffs/builder-lite.md')
+  expect(checkpointPath('no path here', 'sub-main', cwd)).toBe('')
+  expect(checkpointPath('', 'Explore', cwd)).toBe('')
+  // An ended agent without a brief path may name it in its final message instead.
+  expect(checkpointOfAnswer('done\nHANDOFF: .handoffs/b1.md', cwd)).toBe('/w/proj/.handoffs/b1.md')
+  expect(checkpointOfAnswer('no handoff line', cwd)).toBe('')
+  expect(resolvePath('./.handoffs/x.md', cwd)).toBe('/w/proj/.handoffs/x.md')
+  expect(resolvePath('.handoffs/x.md', '')).toBe('.handoffs/x.md')
+})
+
+test("a sub-main's report tail and a builder handoff parse into the card rows", () => {
+  const report = [
+    '# sub-main report',
+    'status: DONE',
+    'commits: abc123',
+    'tests: 72/72',
+    '✔ step 1 copy the fixture (exit 0)',
+    '✔ step 2 jobs probe (exit 0)',
+    'open:',
+    '- receipt rows',
+    '- tests',
+    '- docs',
+    '- polish',
+    '- a fifth is dropped',
+    'next: claude plugin test .',
+  ].join('\n')
+  const tail = parseCheckpointText(report)
+  expect([tail.status, tail.tests, tail.last, tail.next, tail.steps.length]).toEqual(['DONE', '72/72', '✔ step 2 jobs probe (exit 0)', 'claude plugin test .', 2])
+  expect(tail.open).toEqual(['receipt rows', 'tests', 'docs', 'polish'])
+
+  const handoff = ['step 1 read the probe', '  status: done', '  cmd: read (exit 0)', '  next: edit hooks/core.ts', 'step 2 edit', '  status: failed', '  cmd: npm test (exit 1)'].join('\n')
+  const b = parseCheckpointText(handoff)
+  expect([b.last, b.next, b.steps.map(s => s.ok)]).toEqual(['✗ step 2 edit', 'edit hooks/core.ts', [true, false]])
+
+  // A missing, empty, unreadable or huge file leaves the rows out.
+  expect(parseCheckpoint('{}')).toBe(null)
+  expect(parseCheckpoint('')).toBe(null)
+  expect(parseCheckpoint('{"text":""}')).toBe(null)
+  expect(parseCheckpoint('not json')).toBe(null)
+  expect(parseCheckpoint(JSON.stringify({ text: report }))).toEqual(tail)
+  const argv = checkpointProbe('python3', '/h/x.md')
+  expect(argv.slice(0, 3)).toEqual(['python3', '-c', CHECKPOINT_PY])
+  expect(argv[3]).toBe('/h/x.md')
+  expect(CHECKPOINT_PY).toContain('262144')
+  expect(CHECKPOINT_PY).toContain('8192')
+  expect(normalizeCheckpoint({ last: 'x', open: ['a', 'b', 'c', 'd', 'e'], steps: [{ text: 's', ok: true }] })).toEqual({
+    last: 'x',
+    next: '',
+    open: ['a', 'b', 'c', 'd'],
+    status: '',
+    tests: '',
+    steps: [{ text: 's', ok: true }],
+  })
+  expect(normalizeCheckpoint('nope')).toBe(null)
+})
+
+const workTasks = [
+  { id: 't1', status: 'done', subject: 'consult ring' },
+  { id: 't2', status: 'done', subject: 'mesh tasks' },
+  { id: 't3', status: 'doing', subject: 'flightdeck 0.7.0' },
+  { id: 't4', status: 'todo', subject: 'receipt' },
+  { id: 't5', status: 'todo', subject: 'docs' },
+]
+
+const workTreeInput = (now: number) => {
+  const cards = [
+    {
+      ...normalizeCard({ id: 'sub-main', type: 'sub-main', status: 'running', spawnedAt: now - 360_000, task: 't4' }),
+      check: parseCheckpointText(['✔ step 1 copy the fixture (exit 0)', '✔ step 2 jobs probe (exit 0)', 'open:', '- receipt rows', '- tests', '- docs'].join('\n')),
+    },
+    {
+      ...normalizeCard({ id: 'builder', type: 'builder', status: 'running', spawnedAt: now - 130_000, parentId: 'sub-main', checkpoint: '/w/.handoffs/builder.md' }),
+      check: parseCheckpointText('step 1 edit the probe\nnext: edit hooks/core.ts'),
+    },
+  ]
+  const jobs = [
+    normalizeJob({
+      jobid: 'j1',
+      job: 'ring-panel',
+      status: 'running',
+      ts: (now - 960_000) / 1000,
+      pid: 42,
+      trying: 'agy:gemini-4-hydrogen-xhigh',
+      stageLines: ['copied 2 files', 'trying: agy:gemini-4-hydrogen-xhigh', 'trying: agy:gemini-4-hydrogen-high'],
+      hasTrying: true,
+      tree: '/x',
+      steps: [
+        { type: 132, runs: ['call_1', 'edit_file', '{"Path":"/x/hooks/core.ts"}'] },
+        { type: 132, runs: ['call_2', 'edit_file', '{"Path":"/x/hooks/ring.tsx"}'] },
+        { type: 132, runs: ['call_3', 'edit_file', '{"Path":"/x/hooks/register.tsx"}'] },
+      ],
+      stepsTotal: 83,
+      dbs: [{ path: '/c.db', mtime: now, matched: true }],
+    }),
+    normalizeJob({
+      jobid: 'j2',
+      job: 'receipt',
+      status: 'done',
+      ts: (now - 600_000) / 1000,
+      endedAt: now - 300_000,
+      handoff: { backend: 'azure:gpt-6.1-sol', files_changed: '4', ds: 'wall=246s cost_cny_est=0' },
+    }),
+  ]
+  const issued = normalizeIssued([
+    { callId: 'c1', kind: 'job', agentId: '', at: now - 970_000, task: 't3', jobid: 'j1' },
+    { callId: 'c2', kind: 'job', agentId: '', at: now - 610_000, task: 't3', jobid: 'j2' },
+  ])
+  return { jobs, issued, cards, tasks: workTasks, run: null as never, now }
+}
+
+test('the tree hangs work under its task, running first then to-do then done, and caps boxes at two levels', () => {
+  const now = 2_000_000
+  const tree = buildWork(workTreeInput(now))
+  expect(tree.title).toBe("WORK · main's tasks")
+  expect(stripText(tree.strip)).toBe('●●◐○○ 2/5')
+  const rows = tree.entries.map(e => (e.kind === 'leaf' && e.leaf ? `${e.kind}:${e.leaf.name}` : `${e.kind}:${e.text ?? ''}`))
+  // t3's task row, its running worker (with its live detail), then its done worker: running first.
+  expect(rows.filter(r => !r.startsWith('detail:'))).toEqual([
+    'task:t3 flightdeck 0.7.0',
+    'leaf:ring-panel',
+    'leaf:receipt',
+    'box:',
+    'closing:○ t4 receipt · ○ t5 docs',
+  ])
+  // The sub-main box follows, then the closing line for the tasks with no row of their own.
+  expect(rows[2]).toBe('detail:')
+  expect(tree.boxes.length).toBe(1)
+  expect(tree.boxes[0]?.title).toBe('sub-main · t4')
+  expect(stripText(tree.boxes[0]!.strip)).toBe('●●◐○○○ 2/6')
+  expect(tree.boxes[0]!.entries[0]).toMatchObject({ kind: 'last', text: '✔ step 2 jobs probe (exit 0)' })
+  expect(tree.boxes[0]!.entries.some(e => e.kind === 'leaf' && e.leaf?.id === 'builder')).toBe(true)
+  expect(rows[rows.length - 1]).toBe('closing:○ t4 receipt · ○ t5 docs')
+  expect(isWorkEmpty(tree)).toBe(false)
+  expect(isWorkEmpty(buildWork({ jobs: [], issued: [], cards: [], tasks: [], run: null, now }))).toBe(true)
+
+  // A coordinator under a coordinator is a line with its own strip, not a third box.
+  const cards = [
+    { ...normalizeCard({ id: 'a', type: 'sub-main', status: 'running', spawnedAt: now - 1_000 }), check: null },
+    { ...normalizeCard({ id: 'b', type: 'sub-main', status: 'running', spawnedAt: now - 900, parentId: 'a' }), check: null },
+    normalizeCard({ id: 'c', type: 'builder', status: 'running', spawnedAt: now - 800, parentId: 'b' }),
+  ]
+  const nested = buildWork({ jobs: [], issued: [], cards, tasks: [], run: null, now })
+  expect(nested.boxes.length).toBe(1)
+  expect(nested.boxes[0]!.entries.some(e => e.kind === 'leaf' && e.leaf?.id === 'b' && e.leaf.note.includes('/'))).toBe(true)
+  expect(orderWorkLeaves([
+    { isLive: false, status: 'done', startedAt: 1 },
+    { isLive: true, status: 'running', startedAt: 2 },
+    { isLive: false, status: 'todo', startedAt: 3 },
+  ]).map(x => x.status)).toEqual(['running', 'todo', 'done'])
+
+  // With no mesh plan, main's strip is its direct workers, running first.
+  const input = workTreeInput(now)
+  const noPlan = buildWork({ jobs: input.jobs, issued: input.issued, cards: [], tasks: [], run: null, now })
+  expect(stripText(noPlan.strip)).toBe('◐● 1/2')
+  // A bound consult-cli run is one ◎ line: its kind and round, and how many engines answered.
+  const run = makeRun({ kind: 'all', round: 1, startedAt: now - 72_000, endedAt: now - 1_000 }) as never
+  const consulted = buildWork({
+    jobs: [],
+    issued: normalizeIssued([{ callId: 'cc', kind: 'consult', agentId: '', at: now - 72_000, runId: '1000-42', task: 't3' }]),
+    cards: [],
+    tasks: workTasks,
+    run,
+    now,
+  })
+  const consultLeaf = consulted.entries.find(e => e.kind === 'leaf')?.leaf
+  expect([consultLeaf?.glyph, consultLeaf?.name, consultLeaf?.note]).toEqual(['◎', 'panel consult R1', '1/5'])
+})
+
+test('a box whose work is all done collapses 60 s after the last end, and a selected leaf expands', () => {
+  const now = 3_000_000
+  const ended = (id: string, parentId = '') => normalizeCard({ id, type: 'builder', status: 'done', spawnedAt: now - 300_000, endedAt: now - 61_000, parentId })
+  const sub = normalizeCard({ id: 'sm', type: 'sub-main', status: 'done', spawnedAt: now - 400_000, endedAt: now - 61_000 })
+  const cards = [sub, ended('b', 'sm')]
+  const collapsed = buildWork({ jobs: [], issued: [], cards, tasks: [], run: null, now })
+  expect([COLLAPSE_AFTER_MS, collapsed.boxes[0]?.collapsed]).toEqual([60_000, true])
+  const open = buildWork({ jobs: [], issued: [], cards, tasks: [], run: null, now: now - 1_000 })
+  expect(open.boxes[0]?.collapsed).toBe(false)
+  // Selected: the leaf's own rows (stage, now, work, think, last, next, status/tests) join its box.
+  const selected = buildWork({ ...workTreeInput(now), expanded: 'job:j1' })
+  expect(selected.entries.some(e => e.kind === 'expand' && /stage  stage model/.test(e.text ?? ''))).toBe(true)
+  expect(selected.entries.some(e => e.kind === 'expand' && /now  edit hooks\/register\.tsx/.test(e.text ?? ''))).toBe(true)
+})
+
+test('the tree fits a given pane height by dropping details, done lines, to-do lines and box bodies in order', () => {
+  const now = 2_000_000
+  const tree = buildWork(workTreeInput(now))
+  const count = (t: typeof tree, kind: string) => t.entries.filter(e => e.kind === kind).length + t.boxes.reduce((n, b) => n + b.entries.filter(e => e.kind === kind).length, 0)
+  const full = workRows(tree, 100)
+  const noDetail = fitWork(tree, full - 2, 100)
+  expect([workRows(noDetail, 100) <= full - 2, count(noDetail, 'detail'), count(noDetail, 'leaf') > 0]).toEqual([true, 0, true])
+  const tighter = fitWork(tree, full - 4, 100)
+  expect(workRows(tighter, 100) <= full - 4).toBe(true)
+  for (const budget of [24, 16, 10, 6, 3, 2]) {
+    const fitted = fitWork(tree, budget, 100)
+    expect([budget, workRows(fitted, 100) <= budget]).toEqual([budget, true])
+  }
+  // The width modes: no detail lines under 56 columns, one line per box under 40.
+  expect(workRows(tree, 100)).toBeGreaterThan(workRows(tree, 50))
+  expect(workRows(tree, 30)).toBe(1 + tree.boxes.length)
+  const narrow = fitWork(tree, 8, 30)
+  expect(workRows(narrow, 30) <= 8).toBe(true)
+})
+
 const JOBS_PANELS = { options: { panels: 'main,agents,receipt,log' } }
 
 const JOBS_NOW = 3_600_000
@@ -2994,21 +3263,115 @@ const jobPayload = (now: number) =>
     },
   ])
 
-test('the agents panel lists a farmer job and its live detail line until the work tree lands', JOBS_PANELS, async ($, on) => {
-  await jobsSession($, on, now => jobPayload(now))
-  for (const cols of [64, 40]) {
-    const ui = await $.ui.mount({ ...pane(cols), surface: 'terminal' })
-    expect(await ui.find({ text: /ring-panel ▸ Hydrogen xhigh/ })).toBeDefined()
-    expect(await ui.find({ text: /receipt ▸ sol/ })).toBeDefined()
-    if (cols >= 56) expect(await ui.find({ text: /edit hooks\/register\.tsx · 1 file · 83 st/ })).toBeDefined()
-    else expect(await ui.find({ text: /edit hooks\/register\.tsx/ })).toBeUndefined()
-    expect(spillsOf(await ui.drawn(), cols)).toEqual([])
-    await ui.unmount()
+const WORK_PANELS = { options: { panels: 'main,work,receipt' } }
+
+/** The example tree's session: main's plan, a running farmer job on t3, and a sub-main box with a builder. */
+const workSession = async ($: Parameters<TestBody>[0], on: On) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('agent.spawn', (_$, e) => ({ model: 'claude-sonnet-5-5', agentId: e.description }))
+  on('tool.call', () => ({ result: {}, text: 'jobid: j1' }))
+  const now = JOBS_NOW
+  const tasks = workTasks
+  const jobs = [
+    {
+      jobid: 'j1',
+      job: 'ring-panel',
+      status: 'running',
+      ts: (now - 960_000) / 1000,
+      pid: 42,
+      tree: '/x',
+      trying: 'agy:gemini-4-hydrogen-xhigh',
+      stageLines: ['copied 4 files', 'trying: agy:gemini-4-hydrogen-xhigh'],
+      hasTrying: true,
+      stepsTotal: 83,
+      steps: [
+        { type: 132, runs: ['call_1', 'edit_file', '{"Path":"/x/hooks/core.ts"}'] },
+        { type: 132, runs: ['call_2', 'edit_file', '{"Path":"/x/hooks/ring.tsx"}'] },
+        { type: 132, runs: ['call_3', 'edit_file', '{"Path":"/x/hooks/types.ts"}'] },
+        { type: 132, runs: ['call_4', 'edit_file', '{"Path":"/x/hooks/register.tsx"}'] },
+      ],
+      dbs: [{ path: '/c.db', mtime: now, matched: true }],
+    },
+    {
+      jobid: 'j2',
+      job: 'receipt',
+      status: 'done',
+      ts: (now - 1_200_000) / 1000,
+      endedAt: now - 300_000,
+      handoff: { backend: 'azure:gpt-6.1-sol', files_changed: '4', ds: 'wall=246s cost_cny_est=0 tokens=in=12000 cache=3000 out=4500 think=800' },
+    },
+  ]
+  const checkpoints: Record<string, string> = {
+    'sm1.md': ['status: DOING', 'tests: 40/40', '✔ step 1 copy the fixture (exit 0)', '✔ step 2 jobs probe (exit 0)', 'open:', '- receipt rows', '- tests', '- docs'].join('\n'),
+    'builder.md': ['step 1 edit the probe', 'next: edit hooks/core.ts'].join('\n'),
   }
+  on('process.run', (_$, e) => {
+    if (e.argv[2] === MESH_PY) return { value: { exitCode: 0, stdout: JSON.stringify(tasks), stderr: '' } } as never
+    if (e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: JSON.stringify(jobs), stderr: '' } } as never
+    if (e.argv[2] === CHECKPOINT_PY) {
+      const name = (e.argv[3] ?? '').split('/').pop() ?? ''
+      const text = checkpoints[name] ?? ''
+      return { value: { exitCode: 0, stdout: text ? JSON.stringify({ text }) : '{}', stderr: '' } } as never
+    }
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  // Main's farmer job, issued while t3 is the `doing` item.
+  await $.tool.call({ tool: 'Bash', command: 'python3 ds-job.py run --job ring-panel --detach', tool_use_id: 'runcall' } as never)
+  // The sub-main and its builder: each brief names its checkpoint file.
+  await $.agent.spawn({ ...spawn('sub-main', 'sub-main'), prompt: 'Fix the receipts\ntask: t4\nreport: .handoffs/sm1.md' })
+  await $.agent.spawn({ ...spawn('builder', 'builder'), parentAgentId: 'sub-main', prompt: 'Fix probe\nreport: .handoffs/builder.md' } as never)
+  return clock
+}
+
+test('the work tree renders the example: tasks, a farmer job, a sub-main box and the closing line', WORK_PANELS, async ($, on) => {
+  const clock = await workSession($, on)
+  await clock.advance(11_000)
+  await Promise.resolve()
+  await Promise.resolve()
+  const ui = await $.ui.mount({ ...pane(66), surface: 'terminal' })
+  expect(await ui.find({ text: /WORK · main's tasks/ })).toBeDefined()
+  expect(await ui.find({ text: /●●◐○○ 2\/5/ })).toBeDefined()
+  expect(await ui.find({ text: /^t3 flightdeck 0\.7\.0$/ })).toBeDefined()
+  expect(await ui.find({ text: /ring-panel ▸ Hydrogen xhigh/ })).toBeDefined()
+  expect(await ui.find({ text: /edit hooks\/register\.tsx · 4 files · 83 st/ })).toBeDefined()
+  expect(await ui.find({ text: /sub-main · t4/ })).toBeDefined()
+  expect(await ui.find({ text: /●●◐○○○ 2\/6/ })).toBeDefined()
+  expect(await ui.find({ text: /last ✔ step 2 jobs probe \(exit 0\)/ })).toBeDefined()
+  expect(await ui.find({ text: /^builder$/ })).toBeDefined()
+  expect(await ui.find({ text: /receipt rows/ })).toBeDefined()
+  expect(await ui.find({ text: /○ t4 receipt · ○ t5 docs/ })).toBeDefined()
+  expect(await ui.find({ text: /● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel/ })).toBeDefined()
+  // The top main card carries the plan too: the strip, done/total and the doing task.
+  expect(await ui.find({ text: /▸ t3 flightdeck 0\.7\.0/ })).toBeDefined()
+  expect(spillsOf(await ui.drawn(), 66)).toEqual([])
+  await ui.unmount()
 })
 
-test('the job lines refit at 40x20, 60x30 and 100x45, and a size change drops the detail line', JOBS_PANELS, async ($, on) => {
-  await jobsSession($, on, now => jobPayload(now))
+test('a selected leaf expands to all its rows, and an ended box collapses to its line', WORK_PANELS, async ($, on) => {
+  const clock = await workSession($, on)
+  await clock.advance(11_000)
+  await Promise.resolve()
+  await Promise.resolve()
+  const ui = await $.ui.mount({ ...pane(66), surface: 'terminal' })
+  await ui.press({ key: 'work-job:j1' })
+  expect(await ui.find({ text: /stage {2}stage model/ })).toBeDefined()
+  expect(await ui.find({ text: /now {2}edit hooks\/register\.tsx/ })).toBeDefined()
+  expect(await ui.find({ text: /work {2}4 files · 83 st/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the work tree fits 40x20, 60x30 and 100x45, and a size change re-fits at once', WORK_PANELS, async ($, on) => {
+  const clock = await workSession($, on)
+  await clock.advance(11_000)
+  await Promise.resolve()
+  await Promise.resolve()
+  const failures: string[] = []
   for (const [cols, rows] of [
     [40, 20],
     [60, 30],
@@ -3016,28 +3379,49 @@ test('the job lines refit at 40x20, 60x30 and 100x45, and a size change drops th
   ] as const) {
     const props = { ...pane(cols).props, scroll: { offset: 0, bodyRows: rows } }
     const ui = await $.ui.mount({ ...pane(cols), props, surface: 'terminal' })
-    expect(await ui.find({ text: /ring-panel/ })).toBeDefined()
-    expect(spillsOf(await ui.drawn(), cols)).toEqual([])
+    const drawn = await ui.drawn()
+    const h = heightOf(drawn)
+    if (h > rows) failures.push(`${cols}x${rows}: ${h} rows`)
+    for (const s of spillsOf(drawn, cols)) failures.push(`${cols}x${rows}: ${s}`)
+    expect(await ui.find({ text: /WORK · main's tasks/ })).toBeDefined()
+    if (cols < 56) expect(await ui.find({ text: /edit hooks\/register\.tsx/ })).toBeUndefined()
+    else expect(await ui.find({ text: /edit hooks\/register\.tsx · 4 files · 83 st/ })).toBeDefined()
     await ui.unmount()
   }
-  // The same state drawn narrow and wide: no width is kept between renders.
-  const narrow = await $.ui.mount({ ...pane(40), surface: 'terminal' })
-  expect(await narrow.find({ text: /edit hooks\/register\.tsx/ })).toBeUndefined()
+  // Under 40 columns every box is one line: header, strip and clock; no worker lines.
+  const props = { ...pane(36).props, scroll: { offset: 0, bodyRows: 30 } }
+  const narrow = await $.ui.mount({ ...pane(36), props, surface: 'terminal' })
+  expect(await narrow.find({ text: /WORK · main's tasks/ })).toBeDefined()
+  expect(await narrow.find({ text: /sub-main · t4/ })).toBeDefined()
+  expect(await narrow.find({ text: /ring-panel/ })).toBeUndefined()
+  expect(heightOf(await narrow.drawn()) <= 30).toBe(true)
   await narrow.unmount()
+  // The same state drawn at another width: nothing about the layout is kept between renders.
   const wide = await $.ui.mount({ ...pane(100), surface: 'terminal' })
-  expect(await wide.find({ text: /edit hooks\/register\.tsx · 1 file · 83 st/ })).toBeDefined()
+  expect(await wide.find({ text: /edit hooks\/register\.tsx · 4 files · 83 st/ })).toBeDefined()
   await wide.unmount()
+  expect(failures).toEqual([])
 })
 
-test('an empty probe leaves the agents panel out, and no job line is drawn', JOBS_PANELS, async ($, on) => {
-  await jobsSession($, on, () => '[]')
+test('an empty plan and no worker leave the work panel out', WORK_PANELS, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('process.run', (_$, e) => {
+    if (e.argv[2] === MESH_PY || e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
-  expect(await ui.find({ text: /agents ·/ })).toBeUndefined()
+  expect(await ui.find({ text: /WORK/ })).toBeUndefined()
   expect(await ui.find({ text: /▸/ })).toBeUndefined()
   await ui.unmount()
 })
 
-test('an agy-job call shows as a ◇ real-repo leaf with its worker and a verify-pending badge', { options: { panels: 'main,agents,log' } }, async ($, on) => {
+test('an agy-job call shows as a ◇ real-repo leaf with its worker and a verify-pending badge', { options: { panels: 'main,work,log' } }, async ($, on) => {
   const clock = engine(on)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -3119,7 +3503,7 @@ test('the receipt lists the turn jobs and panel run, four job rows then +N more,
   await narrow.unmount()
 })
 
-test('the jobs probe polls every 3 s while a job is live and every 20 s otherwise, once at a time, silently', { options: { panels: 'main,agents' } }, async ($, on) => {
+test('the jobs probe polls every 3 s while a job is live and every 20 s otherwise, once at a time, silently', { options: { panels: 'main,work' } }, async ($, on) => {
   const clock = engine(on)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -3164,6 +3548,38 @@ test('the jobs probe polls every 3 s while a job is live and every 20 s otherwis
   expect(polls).toBe(5)
   // The last good rows stayed; no error reached the pane.
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
-  expect(await ui.find({ text: /agents ·/ })).toBeUndefined()
+  expect(await ui.find({ text: /WORK/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('checkpoint probes run every 10 s for a card with a checkpoint, one at a time, silently', { options: { panels: 'main,work' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'b1' }))
+  let polls = 0
+  on('process.run', (_$, e) => {
+    if (e.argv[2] !== CHECKPOINT_PY) return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+    polls += 1
+    return { value: { exitCode: 0, stdout: JSON.stringify({ text: 'step 1 read\nnext: edit x' }), stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.agent.spawn({ ...spawn('builder', 'b1'), prompt: 'Fix probe\nreport: .handoffs/b1.md' })
+  // A card with no checkpoint is never probed.
+  await $.agent.spawn({ ...spawn('Explore', 'look'), prompt: 'look around' } as never)
+  await clock.advance(9_000)
+  expect(polls).toBe(0)
+  await clock.advance(1_000)
+  expect(polls).toBe(1)
+  await clock.advance(10_000)
+  expect(polls).toBe(2)
+  // Its rows reached the card: `last` and `next` on the work tree line, and no error in the pane.
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  await ui.press({ key: 'work-b1' })
+  expect(await ui.find({ text: /last {2}✔ step 1 read/ })).toBeDefined()
+  expect(await ui.find({ text: /next {2}edit x/ })).toBeDefined()
   await ui.unmount()
 })

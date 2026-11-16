@@ -65,6 +65,25 @@ export type Gate = { recent: Check[]; totals: Record<Bucket, Tally> }
 
 export type ToolNote = { tool: string; text: string; isError: boolean }
 
+/** One step line of a Claude subagent's checkpoint: `step 3 wire probe (exit 0)`. */
+export type CheckpointStep = { text: string; ok: boolean }
+
+/** The tail of a Claude subagent's checkpoint file, read only (rule 8). */
+export type CheckpointTail = {
+  /** The last step line, marked `✔` / `✗`. */
+  last: string
+  /** Its `next:` command. */
+  next: string
+  /** Its `open:` bullets, at most 4. */
+  open: string[]
+  /** Its `status:` value. */
+  status: string
+  /** Its `tests:` value. */
+  tests: string
+  /** Step lines in the tail, oldest first, for a sub-main box's strip. */
+  steps: CheckpointStep[]
+}
+
 export type AgentCard = {
   id: string
   type: string
@@ -91,6 +110,10 @@ export type AgentCard = {
   jobdir: string
   /** What that model's job cost in USD (0 = free or a subscription quota); null until the job's report says. */
   workerCost: number | null
+  /** The agent's checkpoint file (rule 8): a `report:` / `handoff:` path from its brief, or `.handoffs/<name>.md` for a builder. */
+  checkpoint: string
+  /** The checkpoint's tail, as the last probe read it; null until one reads. */
+  check: CheckpointTail | null
 }
 
 /** A model loop whose id matches no card: a workflow agent, a compaction or a memory fork. */
@@ -293,6 +316,7 @@ declare module 'claude-code' {
       agents: AgentCard[]
       jobs: Job[]
       issued: Issued[]
+      mesh: MeshTask[]
       loops: Loop[]
       log: LogLine[]
       turn: Turn

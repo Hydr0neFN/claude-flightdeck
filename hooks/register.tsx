@@ -1,10 +1,26 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AgentCard, Architect, Bucket, Check, ConsultState, Feed, Gate, Issued, Job, Layout, LogLine, Loop, Main, MeshTask, Roster, Turn, Usage, View } from '../types'
+import type { AgentCard, Architect, Bucket, Check, CheckpointTail, ConsultState, Feed, Gate, Issued, Job, Layout, LogLine, Loop, Main, MeshTask, Roster, Turn, Usage, View } from '../types'
 import {
   AGY_SHOW_MS,
   PYTHON_CANDIDATES,
+  WORK_DETAIL_COLS,
+  WORK_LEGEND,
+  WORK_NARROW,
+  WORK_STRIP_MAX,
+  buildWork,
+  checkpointOfAnswer,
+  checkpointPath,
+  checkpointProbe,
+  fitWork,
+  isRunningStatus,
+  isWorkEmpty,
+  parseCheckpoint,
+  stripOf,
+  stripText,
+  workGlyph,
+  workRows,
   DEFAULT_ARCHITECT,
   addCard,
   resumeCard,
@@ -39,7 +55,6 @@ import {
   isJobLive,
   isObject,
   issueCall,
-  jobLeaves,
   jobsProbe,
   meshProbe,
   normalizeIssued,
@@ -120,7 +135,7 @@ import {
   stepSpeed,
   stepLoop,
 } from './core'
-import type { Config, JobLeaf, Panel, RingGridRun } from './core'
+import type { Config, Panel, RingGridRun, WorkBox, WorkEntry, WorkLeaf } from './core'
 
 const PANE = 'flightdeck'
 const TITLE = 'Flightdeck'
@@ -136,6 +151,7 @@ const gate = atom({ plugin: 'flightdeck', key: 'gate' } as const, DEFAULT_GATE)
 const agents = atom({ plugin: 'flightdeck', key: 'agents' } as const, [])
 const jobs = atom({ plugin: 'flightdeck', key: 'jobs' } as const, [])
 const issued = atom({ plugin: 'flightdeck', key: 'issued' } as const, [])
+const mesh = atom({ plugin: 'flightdeck', key: 'mesh' } as const, [])
 const loops = atom({ plugin: 'flightdeck', key: 'loops' } as const, [])
 const log = atom({ plugin: 'flightdeck', key: 'log' } as const, [])
 const turn = atom({ plugin: 'flightdeck', key: 'turn' } as const, DEFAULT_TURN)
@@ -177,6 +193,11 @@ async function getJobs($: EngineInterface): Promise<Job[]> {
 }
 async function getIssued($: EngineInterface): Promise<Issued[]> {
   return normalizeIssued(await read($, issued))
+}
+async function getMesh($: EngineInterface): Promise<MeshTask[]> {
+  return listOf<unknown>(await read($, mesh))
+    .filter(isObject)
+    .map(x => ({ id: String(x.id ?? ''), status: String(x.status ?? ''), subject: typeof x.subject === 'string' ? x.subject : '' }))
 }
 async function getLoops($: EngineInterface): Promise<Loop[]> {
   return listOf<Loop>(await read($, loops))
@@ -282,6 +303,7 @@ async function resetAll($: EngineInterface) {
   await update($, agents, () => [])
   await update($, jobs, () => [])
   await update($, issued, () => [])
+  await update($, mesh, () => [])
   await update($, loops, () => [])
   await update($, log, () => [])
   await update($, turn, () => DEFAULT_TURN)
@@ -568,6 +590,69 @@ async function readMeshTasks($: EngineInterface, python: readonly string[]): Pro
   return { tasks: [], python }
 }
 
+const MESH_TICK_MS = 5_000
+const CHECKPOINT_TICK_MS = 10_000
+const CHECKPOINT_TIMEOUT_MS = 5_000
+
+type MeshLock = { inFlight: boolean; python: readonly string[]; last: string }
+type CheckpointLock = { inFlight: boolean; python: readonly string[] }
+
+/** Reads the session's mesh task items into the `mesh` atom every 5 s; silent and one at a time. */
+async function pollMesh($: EngineInterface, lock: MeshLock) {
+  if (lock.inFlight) return
+  lock.inFlight = true
+  try {
+    const r = await readMeshTasks($, lock.python)
+    lock.python = r.python
+    const json = JSON.stringify(r.tasks)
+    if (json !== lock.last) {
+      lock.last = json
+      await update($, mesh, () => r.tasks)
+    }
+  } catch {
+    // Silent: the tree keeps the plan it last read.
+  } finally {
+    lock.inFlight = false
+  }
+}
+
+/**
+ * Reads the checkpoint tail of every running card (and one that just ended) every 10 s: the last step,
+ * next command, open bullets, status and tests. Read-only; a missing or huge file leaves the rows out.
+ */
+async function pollCheckpoints($: EngineInterface, lock: CheckpointLock) {
+  if (lock.inFlight) return
+  lock.inFlight = true
+  try {
+    const now = await $.clock.now()
+    const todo = (await getCards($)).filter(
+      c => c.checkpoint && (c.status === 'running' || (c.endedAt !== null && now - c.endedAt < 3 * CHECKPOINT_TICK_MS)),
+    )
+    for (const c of todo) {
+      let res: { exitCode: number; stdout: string } | null = null
+      for (const py of lock.python.length > 0 ? [lock.python] : PYTHON_CANDIDATES) {
+        res = await $.process.run(checkpointProbe(py, c.checkpoint), { timeoutMs: CHECKPOINT_TIMEOUT_MS }).catch(() => null)
+        if (res && res.exitCode === 0) {
+          lock.python = py
+          break
+        }
+      }
+      const tail = res && res.exitCode === 0 ? parseCheckpoint(res.stdout) : null
+      if (tail) await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(x => (x.id === c.id ? { ...x, check: tail } : x)))
+    }
+  } catch {
+    // Silent: the card keeps the checkpoint rows it last read.
+  } finally {
+    lock.inFlight = false
+  }
+}
+
+/** Stores a checkpoint tail on a card, when it has one. */
+async function noteCheckpoint($: EngineInterface, id: string, tail: CheckpointTail | null) {
+  if (!tail) return
+  await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(c => (c.id === id ? { ...c, check: tail } : c)))
+}
+
 export const register: Register = (on, options) => {
   const cfg = parseConfig(options)
   const C = PALETTES[cfg.palette]
@@ -593,6 +678,10 @@ export const register: Register = (on, options) => {
     lastAgy: '',
     dbCache: {},
   }
+  const meshLock: MeshLock = { inFlight: false, python: [], last: '' }
+  let stopMeshTimer: (() => void) | undefined
+  const checkLock: CheckpointLock = { inFlight: false, python: [] }
+  let stopCheckTimer: (() => void) | undefined
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -658,7 +747,7 @@ export const register: Register = (on, options) => {
         consultLock.stopTimer = typeof stopC === 'function' ? (stopC as () => void) : undefined
       }
     }
-    if (cfg.panels.includes('agents') || cfg.panels.includes('receipt')) {
+    if (cfg.panels.includes('agents') || cfg.panels.includes('receipt') || cfg.panels.includes('work')) {
       jobsLock.stopped = false
       jobsLock.ticks = 0
       await pollJobs($, cfg.jobsDir, jobsLock)
@@ -674,6 +763,23 @@ export const register: Register = (on, options) => {
         })
         jobsLock.stopTimer = typeof stopJ === 'function' ? (stopJ as () => void) : undefined
       }
+    }
+    // The plan behind the tree and the main card's tasks row: read even when only `main` shows it.
+    if (cfg.panels.includes('work') || cfg.panels.includes('main')) {
+      await pollMesh($, meshLock)
+      stopMeshTimer?.()
+      const stopM: unknown = $.clock.every(MESH_TICK_MS, () => {
+        void pollMesh($, meshLock)
+      })
+      stopMeshTimer = typeof stopM === 'function' ? (stopM as () => void) : undefined
+    }
+    if (cfg.panels.includes('work') || cfg.panels.includes('agents')) {
+      await pollCheckpoints($, checkLock)
+      stopCheckTimer?.()
+      const stopP: unknown = $.clock.every(CHECKPOINT_TICK_MS, () => {
+        void pollCheckpoints($, checkLock)
+      })
+      stopCheckTimer = typeof stopP === 'function' ? (stopP as () => void) : undefined
     }
     return done
   })
@@ -692,6 +798,10 @@ export const register: Register = (on, options) => {
       jobsLock.stopTimer?.()
       jobsLock.stopTimer = undefined
       jobsLock.started = false
+      stopMeshTimer?.()
+      stopMeshTimer = undefined
+      stopCheckTimer?.()
+      stopCheckTimer = undefined
     }
     // The process goes on in another conversation, whose first request may find no fill: no compaction.
     if (e.reason === 'clear' || e.reason === 'resume') await update($, usage, x => ({ ...normalize(DEFAULT_USAGE, x), hasFill: false }))
@@ -923,9 +1033,10 @@ export const register: Register = (on, options) => {
     if (runner && e.tool_use_id) {
       const at = await $.clock.now()
       const cardTask = e.agentId ? ((await getCards($)).find(c => c.id === e.agentId)?.task ?? '') : ''
-      const mesh = e.agentId ? { tasks: [] as MeshTask[], python: meshPython } : await readMeshTasks($, meshPython)
-      meshPython = mesh.python
-      const task = taskAtIssue(e.agentId ?? '', cardTask, mesh.tasks)
+      const plan = e.agentId ? { tasks: [] as MeshTask[], python: meshPython } : await readMeshTasks($, meshPython)
+      meshPython = plan.python
+      if (!e.agentId) await update($, mesh, () => plan.tasks)
+      const task = taskAtIssue(e.agentId ?? '', cardTask, plan.tasks)
       await update($, issued, list => issueCall(normalizeIssued(list), { ...runner, callId: e.tool_use_id!, agentId: e.agentId ?? '', at, task }))
       if (!jobsLock.stopped) void pollJobs($, cfg.jobsDir, jobsLock)
     }
@@ -1019,15 +1130,19 @@ export const register: Register = (on, options) => {
       return started
     }
     const spawnPrompt = typeof (e as unknown as { prompt?: unknown }).prompt === 'string' ? (e as unknown as { prompt: string }).prompt : ''
+    const type = e.name ?? e.subagentType
+    const brief = spawnPrompt || briefs.get(e.description) || ''
+    const cwd = brief || /builder/i.test(type) ? await $.session.cwd().catch(() => '') : ''
     const card: AgentCard = {
       ...normalizeCard({}),
       id,
-      type: e.name ?? e.subagentType,
+      type,
       model: started.model,
       description: e.description,
       spawnedAt: await $.clock.now(),
       parentId: e.parentAgentId ?? '',
-      task: taskOfBrief(spawnPrompt || briefs.get(e.description) || ''),
+      task: taskOfBrief(brief),
+      checkpoint: checkpointPath(brief, type, cwd),
     }
     // Decided in the write: a resume whose first step already put its card back to running is not logged again.
     let isNew = true
@@ -1069,13 +1184,29 @@ export const register: Register = (on, options) => {
       return done
     }
     const cards = await getCards($)
-    if (cards.some(c => c.id === id)) {
+    const card = cards.find(c => c.id === id)
+    if (card) {
       const status = e.reason === 'answer' ? 'done' : e.reason === 'aborted' ? 'stopped' : 'failed'
+      // The brief named no checkpoint, but the final message may: its HANDOFF: / REPORT: line.
+      const cwd = !card.checkpoint && e.answer ? await $.session.cwd().catch(() => '') : ''
+      const checkpoint = card.checkpoint || checkpointOfAnswer(e.answer, cwd)
       await update($, agents, list =>
         listOf<unknown>(list)
           .map(normalizeCard)
-          .map(c => (c.id === id ? { ...c, status, endedAt: now, answer: shorten(e.answer, 400) } : c)),
+          .map(c => (c.id === id ? { ...c, status, endedAt: now, answer: shorten(e.answer, 400), checkpoint } : c)),
       )
+      // One last read of the checkpoint, so an ended card shows its final status and tests.
+      if (checkpoint) {
+        let res: { exitCode: number; stdout: string } | null = null
+        for (const py of checkLock.python.length > 0 ? [checkLock.python] : PYTHON_CANDIDATES) {
+          res = await $.process.run(checkpointProbe(py, checkpoint), { timeoutMs: CHECKPOINT_TIMEOUT_MS }).catch(() => null)
+          if (res && res.exitCode === 0) {
+            checkLock.python = py
+            break
+          }
+        }
+        if (res && res.exitCode === 0) await noteCheckpoint($, id, parseCheckpoint(res.stdout))
+      }
       // This run's own length: a resumed agent's card clock also spans the idle time between runs.
       const took = fmtDuration(e.durationMs)
       await say($, await whoIs($, id), status === 'done' ? `done · ${took}` : status, status === 'done' ? 'done' : 'error', id)
@@ -1116,7 +1247,7 @@ export const register: Register = (on, options) => {
     const hasRail = hasClient && !faulted.has(faultKey(e.surface, 'rail.tsx'))
     const hasRing = hasClient && !faulted.has(faultKey(e.surface, 'ring.tsx'))
     const hasClock = hasClient && !faulted.has(faultKey(e.surface, 'elapsed.tsx'))
-    const [m, u, a, cs, g, cards, jobsNow, issuedNow, lp, lines, t, r, v, f, now, mono] = await Promise.all([
+    const [m, u, a, cs, g, cards, jobsNow, issuedNow, meshTasks, lp, lines, t, r, v, f, now, mono] = await Promise.all([
       getMain($),
       getUsage($),
       getArchitect($),
@@ -1125,6 +1256,7 @@ export const register: Register = (on, options) => {
       getCards($),
       getJobs($),
       getIssued($),
+      getMesh($),
       getLoops($),
       getLog($),
       getTurn($),
@@ -1151,15 +1283,18 @@ export const register: Register = (on, options) => {
     const showArchitect = a.consults.length > 0 || a.ids.length > 0
     const showConsult = isConsultShown(cs, now)
     const motion = cfg.motion && hasRail
-    // Until the work tree lands, the agents panel carries the farmer and agy-job leaves too.
-    const leaves = jobLeaves(jobsNow, issuedNow, now)
+    // The body rows the host gives the pane (the same way it gives bodyColumns): the hard height limit.
+    const bodyRows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
+    // The whole delegation as one tree, rebuilt on every render from the pane size (rule 6).
+    const work = buildWork({ jobs: jobsNow, issued: issuedNow, cards, tasks: meshTasks, run: cs?.run ?? null, now, expanded: v.expanded })
     // A panel with nothing to show yet takes no room: most sessions never spawn an agent.
     const isEmpty: Record<Panel, boolean> = {
       main: false,
+      work: isWorkEmpty(work),
       architect: !showArchitect,
       consult: !showConsult,
       gate: g.recent.length === 0 && gateSummary(g).total === 0,
-      agents: cards.length === 0 && leaves.length === 0,
+      agents: cards.length === 0,
       loops: lp.length === 0,
       receipt: !m.isRunning && !r,
       log: false,
@@ -1192,6 +1327,18 @@ export const register: Register = (on, options) => {
       ) : (
         <Text color={color}>{fmtTimer((endAt ?? now) - since)}</Text>
       )
+
+    // A work status as its colour: done green, running blue, failed red, waiting dim.
+    const toneOfStatus = (s: string) =>
+      s === 'done' || s === 'ok'
+        ? C.gate
+        : s === 'partial' || s === 'stopped'
+          ? C.amber
+          : s === 'failed' || s === 'refused' || s === 'blocked'
+            ? C.warn
+            : isRunningStatus(s)
+              ? C.agent
+              : C.dim
 
     const isTerminal = e.surface === 'terminal'
     // A row of marks (gate checks, loop dots), sized by `marksIn`. Should a surface draw them wider
@@ -1311,7 +1458,7 @@ export const register: Register = (on, options) => {
               w,
               'claude',
               // Both windows with their reset times fit from 58 columns; narrower, the times are left out.
-              u.limits.slice(0, 2).map((l, i) => meter(limitLabel(l.kind), l.pct, l.resetsAt, w, i > 0 ? 2 : 0)),
+              u.limits.slice(0, 2).map((l, i) => meter(limitLabel(l.kind), l.pct, l.resetsAt ?? null, w, i > 0 ? 2 : 0)),
             )
           : null}
         {hasFeedA && f && f.gem.length > 0
@@ -1339,6 +1486,23 @@ export const register: Register = (on, options) => {
             ])
           : null}
         {m.speed ? row(w, 'last', [{ spans: [{ text: fmtSpeed(m.speed), dim: true }] }]) : null}
+        {meshTasks.length > 0 ? (() => {
+          // The plan at a glance: the strip, done/total, and the task being done now.
+          const st = stripOf(meshTasks.map(x => x.status))
+          const doing = meshTasks.find(x => x.status === 'doing')
+          return row(w, 'tasks', [
+            {
+              spans: [
+                ...meshTasks.slice(0, WORK_STRIP_MAX).map(t => ({ text: workGlyph(t.status), color: toneOfStatus(t.status) })),
+                ...(st.more > 0 ? [{ text: `+${st.more}`, color: C.faint }] : []),
+              ],
+            },
+            { spans: [{ text: `${st.done}/${st.total}`, dim: true }] },
+            doing
+              ? { fill: true, spans: [{ text: `▸ ${doing.id}${doing.subject ? ` ${doing.subject}` : ''}`, color: C.text }] }
+              : null,
+          ])
+        })() : null}
       </Box>
     )
 
@@ -1476,32 +1640,6 @@ export const register: Register = (on, options) => {
     const expandOnPress = (id: string) => () =>
       update($, view, x => ({ ...normalize(DEFAULT_VIEW, x), expanded: normalize(DEFAULT_VIEW, x).expanded === id ? null : id }))
 
-    // The farmer and agy-job leaves the agents panel carries until the work tree lands: one line each,
-    // `now · work` under a running one, and never more than four.
-    const leafColor = (l: JobLeaf) =>
-      l.status === 'failed' || l.status === 'refused' ? C.warn : l.status === 'partial' ? C.amber : l.isLive ? C.agent : C.gate
-    const leafLines = (w: number) => {
-      const shown = leaves.slice(0, 4)
-      return (
-        <Box flexDirection="column">
-          {shown.map(l => (
-            <Box key={l.id} flexDirection="column">
-              <Box width={w} columnGap={1} overflow="hidden">
-                <Text color={leafColor(l)}>{l.glyph}</Text>
-                <Box flexShrink={1}>
-                  <Text wrap="truncate">{`${l.isRealRepo ? '◇' : ''}${l.name}${l.worker ? ` ▸ ${l.worker}` : ''}`}</Text>
-                </Box>
-                {l.verifyPending ? <Text color={C.amber}>verify pending</Text> : null}
-                <Box flexShrink={0}>{clock(`job-clock-${l.id}`, l.startedAt, l.endedAt, C.dim)}</Box>
-              </Box>
-              {w >= 56 && l.detail ? <Text dimColor wrap="truncate">{`  ${l.detail}`}</Text> : null}
-            </Box>
-          ))}
-          {leaves.length > shown.length ? <Text color={C.faint}>{`+${leaves.length - shown.length} more`}</Text> : null}
-        </Box>
-      )
-    }
-
     const agentsPanel = (w: number) => {
       // Cards need 20 columns each; when the pane can't hold the limit, lanes take over.
       const fit = Math.max(1, Math.min(cfg.maxCards, Math.floor((w + 1) / 21)))
@@ -1523,7 +1661,7 @@ export const register: Register = (on, options) => {
         return (
           <Box flexDirection="column" width={w}>
             {header}
-            {leaves.length === 0 ? <Text color={C.faint}>no subagents yet</Text> : leafLines(w)}
+            <Text color={C.faint}>no subagents yet</Text>
           </Box>
         )
       }
@@ -1560,7 +1698,6 @@ export const register: Register = (on, options) => {
                 </Box>
               )
             })}
-            {leaves.length > 0 ? leafLines(w) : null}
           </Box>
         )
       }
@@ -1607,7 +1744,6 @@ export const register: Register = (on, options) => {
             })}
           </Box>
           {rail('merge', running.length > 0, C.agent, w, centers, true)}
-          {leaves.length > 0 ? leafLines(w) : null}
         </Box>
       )
     }
@@ -1619,7 +1755,40 @@ export const register: Register = (on, options) => {
           <Text bold wrap="wrap">
             {expandedCard.description || expandedCard.type}
           </Text>
-          <Text dimColor wrap="truncate">{`${expandedCard.type} · ${prettyModel(expandedCard.model)}${expandedCard.worker ? ` ▸ ${expandedCard.worker}` : ''} · ${expandedCard.status} · ${expandedCard.steps} steps`}</Text>
+          <Text dimColor wrap="truncate">{`${expandedCard.type} · ${prettyModel(expandedCard.model)}${expandedCard.worker ? ` ▸ ${expandedCard.worker}` : ''} · ${expandedCard.status} · ${expandedCard.steps} steps${expandedCard.task ? ` · ${expandedCard.task}` : ''}`}</Text>
+          {/* The subagent's own checkpoint (rule 8), labelled like the main card's rows. */}
+          {expandedCard.check?.last ? (
+            <Box width={w - 4} columnGap={1} overflow="hidden">
+              <Box width={5} flexShrink={0}>
+                <Text dimColor>last</Text>
+              </Box>
+              <Text wrap="truncate">{expandedCard.check.last}</Text>
+            </Box>
+          ) : null}
+          {expandedCard.check?.next ? (
+            <Box width={w - 4} columnGap={1} overflow="hidden">
+              <Box width={5} flexShrink={0}>
+                <Text dimColor>next</Text>
+              </Box>
+              <Text wrap="truncate">{expandedCard.check.next}</Text>
+            </Box>
+          ) : null}
+          {expandedCard.check && expandedCard.check.open.length > 0
+            ? expandedCard.check.open.slice(0, 3).map((item, i) => (
+                <Box width={w - 4} columnGap={1} overflow="hidden">
+                  <Box width={5} flexShrink={0}>
+                    <Text dimColor>{i === 0 ? 'open' : ''}</Text>
+                  </Box>
+                  <Text wrap="truncate">{`○ ${item}`}</Text>
+                  {i === 2 && expandedCard.check!.open.length > 3 ? <Text color={C.faint}>{`+${expandedCard.check!.open.length - 3} more`}</Text> : null}
+                </Box>
+              ))
+            : null}
+          {expandedCard.check && expandedCard.status !== 'running' && (expandedCard.check.status || expandedCard.check.tests) ? (
+            <Text dimColor wrap="truncate">
+              {[expandedCard.check.status ? `status ${expandedCard.check.status}` : '', expandedCard.check.tests ? `tests ${expandedCard.check.tests}` : ''].filter(Boolean).join(' · ')}
+            </Text>
+          ) : null}
           {expandedCard.tools.length === 0 ? <Text color={C.faint}>no tool calls yet</Text> : null}
           {expandedCard.tools.map(n => (
             <Text color={n.isError ? C.warn : C.text} wrap="truncate">
@@ -1633,6 +1802,194 @@ export const register: Register = (on, options) => {
           ) : null}
         </Box>
       ) : null
+
+    // ---- work: one live tree of who is doing what (rules 3-6). Every row is recomputed from the
+    // pane size on each render: nothing about the layout is cached.
+    const workHas = (p: Panel) => panels.includes(p)
+    const workRailRows = panels.reduce((n, p, i) => {
+      const prev = panels[i - 1]
+      if (i === 0 || p === 'agents' || prev === 'agents' || p === 'consult' || prev === 'consult' || p === 'log' || p === 'loops' || prev === 'loops') return n
+      return n + 1
+    }, 0)
+    // The rows every other shown panel needs; the tree gets what is left of the pane's body.
+    const otherPanelRows = (): number => {
+      let n = 1 + 1 + legendGap // the pane's header and legend
+      if (workHas('main')) {
+        n += 2 + 1 + 1 // border, header, effort
+        if (ctxGauge) n += 1
+        if (u.limits.length > 0) n += 1
+        if (hasFeedA && f && f.gem.length > 0) n += 1
+        if (u.costUsd !== null || (hasFeedA && f && f.dsCny !== null)) n += 1
+        if (hasFeedB && f && f.task) n += 1
+        if (hasFeedB && f && f.cwd) n += 1
+        if (m.speed) n += 1
+        if (meshTasks.length > 0) n += 1
+      }
+      if (workHas('architect')) n += 2 + 1 + 1 + 1 + (cfg.moments ? (W < 70 ? 2 : 1) : 0) + (a.lastAdvice ? 1 : 0)
+      if (workHas('gate')) {
+        n += 2 + 1 + 1 + 1 + (W >= 44 ? 1 : 2)
+        if (v.gateOpen) n += Math.min(5, g.recent.filter(c => c.bucket === v.gateOpen).length)
+      }
+      if (workHas('agents')) {
+        const fit = Math.max(1, Math.min(cfg.maxCards, Math.floor((W + 1) / 21)))
+        n += cards.length === 0 ? 2 : cards.length > fit ? 1 + (cards.length > 6 ? 1 : 0) + Math.min(6, cards.length) : 10
+        if (expandedCard) n += 12
+      }
+      if (workHas('loops')) n += 1
+      if (workHas('receipt')) {
+        const jobN = r ? turnJobs(jobsNow, issuedNow, r.since, r.since + r.durationMs).length : 0
+        const panelN = r ? turnConsults(cs?.run ?? null, r.since, r.since + r.durationMs).length : 0
+        n += 2 + (m.isRunning || !r ? 1 : 1 + (W >= 40 ? Math.min(4, jobN) + (jobN > 4 ? 1 : 0) + Math.min(2, panelN) : 0))
+        if (t.isReviewing) n += 1
+      }
+      const run = cs?.run
+      if (workHas('consult') && run) {
+        const narrow = W < 40 || run.engines.length > 10
+        n += 2 + 1 + (narrow ? run.engines.length + 2 : (run.engines.length <= 6 ? 11 : 13) + 1 + (run.round >= 2 || run.kind === 'round2' ? 1 : 0))
+        if (run.question) n += 1
+        n += 1
+        if (!narrow) n += Math.min(3, run.engines.filter(e => (e.state === 'failed' || e.state === 'skipped') && e.reason).length)
+        n += activeConsultLocks(cs?.locks ?? {}, now).length
+        if (run.endedAt !== null && run.summary) n += 1
+      }
+      return n + workRailRows
+    }
+    const logReserve = workHas('log') ? 8 : 0
+    const workBudget = Math.max(0, bodyRows - otherPanelRows() - logReserve)
+    const workCols = isWide ? colW : W
+    const fittedWork = fitWork(work, workBudget, workCols)
+    const drawnWorkRows = workHas('work') && workBudget > 0 ? Math.min(workBudget, workRows(fittedWork, workCols)) : 0
+
+    const workClock = (key: string, since: number, endAt: number | null) => clock(key, since, endAt, C.dim)
+
+    const workLeafView = (l: WorkLeaf, w: number, depth: number, done = false) => {
+      const cost = l.cost === null || l.isLive ? '' : l.cost === 0 ? 'free' : `+${fmtWorkerCost(l.cost)}`
+      return (
+        <Box key={`work-leaf-${l.id}`} width={w} columnGap={1} overflow="hidden">
+          {depth > 0 ? <Text color={C.faint}>{'└'}</Text> : null}
+          <Button key={`work-${l.id}`} plain label={l.glyph} onPress={expandOnPress(l.id)} />
+          <Box flexShrink={1}>
+            <Text dimColor={done} wrap="truncate">{`${l.isRealRepo ? '◇' : ''}${l.name}${l.worker ? ` ▸ ${l.worker}` : ''}`}</Text>
+          </Box>
+          {l.note ? <Text dimColor wrap="truncate">{l.note}</Text> : null}
+          {l.verifyPending ? <Text color={C.amber} wrap="truncate">verify pending</Text> : null}
+          {cost ? <Text color={l.cost === 0 ? C.dim : C.agent} wrap="truncate">{cost}</Text> : null}
+          <Box flexShrink={0}>{workClock(`work-clock-${l.id}`, l.startedAt, l.endedAt)}</Box>
+        </Box>
+      )
+    }
+
+    const workEntryView = (e: WorkEntry, w: number) => {
+      if (e.kind === 'box' && e.box) return workBoxView(e.box, w - 1)
+      if (e.kind === 'leaf' && e.leaf) return workLeafView(e.leaf, w, e.depth, e.done)
+      // The one detail line under a running leaf, from 56 columns; the fit drops it when the pane is short.
+      if (e.kind === 'detail' && e.leaf) {
+        return workCols >= WORK_DETAIL_COLS && e.leaf.detail ? <Text dimColor wrap="truncate">{`  ${e.leaf.detail}`}</Text> : null
+      }
+      if (e.kind === 'task') {
+        return (
+          <Box key={`work-task-${e.text}`} width={w} columnGap={1} overflow="hidden">
+            <Text color={toneOfStatus(e.status ?? '')}>{workGlyph(e.status ?? '')}</Text>
+            <Text wrap="truncate">{e.text}</Text>
+          </Box>
+        )
+      }
+      if (e.kind === 'last') return <Text color={C.dim} wrap="truncate">{`last ${e.text}`}</Text>
+      if (e.kind === 'step') {
+        return (
+          <Box key={`work-step-${e.text}`} width={w} columnGap={1} overflow="hidden">
+            <Text color={C.faint}>○</Text>
+            <Text dimColor wrap="truncate">{e.text}</Text>
+          </Box>
+        )
+      }
+      if (e.kind === 'more') return <Text color={C.faint} wrap="truncate">{`+${e.count ?? 0} more`}</Text>
+      if (e.kind === 'expand') {
+        return (
+          <Text dimColor={e.tone === 'dim'} wrap="truncate">
+            {`  ${e.text ?? ''}`}
+          </Text>
+        )
+      }
+      if (e.kind === 'closing') return <Text dimColor wrap="truncate">{e.text ?? ''}</Text>
+      return null
+    }
+
+    const workBoxLine = (b: WorkBox, w: number) => (
+      <Box key={`work-boxline-${b.id}`} width={w} columnGap={1} overflow="hidden">
+        <Text color={toneOfStatus(b.isLive ? 'running' : 'done')}>{b.glyph}</Text>
+        <Box flexShrink={1}>
+          <Text bold wrap="truncate">{`${b.title} ${stripText(b.strip)}`}</Text>
+        </Box>
+        <Box flexShrink={0}>{workClock(`work-box-${b.id}`, b.startedAt, b.endedAt)}</Box>
+      </Box>
+    )
+
+    const workBoxView = (b: WorkBox, w: number) => {
+      if (b.collapsed || w < WORK_NARROW) return workBoxLine(b, w)
+      const inner = Math.max(4, w - 4)
+      return (
+        <Box
+          key={`work-box-${b.id}`}
+          flexDirection="column"
+          borderStyle="round"
+          borderColor={b.isLive ? C.agent : C.gate}
+          borderDimColor={!b.isLive}
+          paddingX={1}
+          marginLeft={1}
+          width={w}
+        >
+          <Box justifyContent="space-between">
+            <Box flexShrink={1} columnGap={1}>
+              <Text color={toneOfStatus(b.isLive ? 'running' : 'done')} bold>
+                {b.glyph}
+              </Text>
+              <Text bold wrap="truncate">{b.title}</Text>
+              <Text color={C.dim}>{stripText(b.strip)}</Text>
+            </Box>
+            <Box flexShrink={0}>{workClock(`work-box-${b.id}`, b.startedAt, b.endedAt)}</Box>
+          </Box>
+          {b.entries.map(e => workEntryView(e, inner))}
+        </Box>
+      )
+    }
+
+    const workPanel = (w: number) => {
+      if (workBudget < 1) return null
+      // Under 40 columns: header and strip, then one line per box.
+      if (fittedWork.collapsed || w < WORK_NARROW || workBudget < 3) {
+        const lines = [
+          <Box key="work-main-line" width={w} columnGap={1} overflow="hidden">
+            <Text color={toneOfStatus(fittedWork.isLive ? 'running' : 'done')}>{fittedWork.glyph}</Text>
+            <Box flexShrink={1}>
+              <Text bold wrap="truncate">{`${fittedWork.title} ${stripText(fittedWork.strip)}`}</Text>
+            </Box>
+            <Box flexShrink={0}>{workClock('work-main', fittedWork.startedAt, fittedWork.endedAt)}</Box>
+          </Box>,
+          ...fittedWork.boxes.map(b => workBoxLine(b, w)),
+        ]
+        return <Box flexDirection="column" width={w}>{lines.slice(0, Math.max(0, workBudget))}</Box>
+      }
+      const inner = Math.max(4, w - 4)
+      return (
+        <Box flexDirection="column" borderStyle="round" borderColor={C.main} borderDimColor={!fittedWork.isLive} paddingX={1} width={w}>
+          <Box justifyContent="space-between">
+            <Box flexShrink={1} columnGap={1}>
+              <Text color={toneOfStatus(fittedWork.isLive ? 'running' : 'done')} bold>
+                {fittedWork.glyph}
+              </Text>
+              <Text bold wrap="truncate">{fittedWork.title}</Text>
+              <Text color={C.dim}>{stripText(fittedWork.strip)}</Text>
+            </Box>
+            <Box flexShrink={0}>{workClock('work-main', fittedWork.startedAt, fittedWork.endedAt)}</Box>
+          </Box>
+          {fittedWork.entries.map(e => workEntryView(e, inner))}
+          <Text color={C.faint} wrap="truncate">
+            {WORK_LEGEND}
+          </Text>
+        </Box>
+      )
+    }
 
     // ---- other loops (workflow agents, forks): ids that match no card
     const loopsPanel = (w: number) => {
@@ -1884,9 +2241,26 @@ export const register: Register = (on, options) => {
     }
 
     // ---- log: whatever rows the other panels leave, 4 to 8
-    // The main box's speed line, the legend's gap and the gap above the log are a row each.
-    const used = 2 + legendGap + 5 + (m.speed ? 1 : 0) + (hasFeedA ? 1 : 0) + (hasFeedB ? 1 : 0) + 1 + (showArchitect ? 6 : 0) + (showConsult && cfg.panels.includes('consult') ? 15 : 0) + 6 + (v.gateOpen ? 5 : 0) + (cards.length > cfg.maxCards ? 3 + Math.min(6, cards.length) : 8) + (expandedCard ? 8 : 0) + (lp.length ? 1 : 0) + 3
-    const bodyRows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
+    // The main box's speed line, the legend's gap and the gap above the log are a row each; the work
+    // tree takes the rows it was given before the log is sized.
+    const used =
+      2 +
+      legendGap +
+      5 +
+      (m.speed ? 1 : 0) +
+      (hasFeedA ? 1 : 0) +
+      (hasFeedB ? 1 : 0) +
+      (meshTasks.length > 0 ? 1 : 0) +
+      1 +
+      (showArchitect ? 6 : 0) +
+      (showConsult && cfg.panels.includes('consult') ? 15 : 0) +
+      6 +
+      (v.gateOpen ? 5 : 0) +
+      (cards.length > cfg.maxCards ? 3 + Math.min(6, cards.length) : 8) +
+      (expandedCard ? 8 : 0) +
+      (lp.length ? 1 : 0) +
+      drawnWorkRows +
+      3
     const nLog = logRows(bodyRows, used)
     const shownLines = (viewed ? lines.filter(l => l.agentId === viewed) : lines).slice(-nLog)
     const colorOf = (l: LogLine) =>
@@ -1919,19 +2293,21 @@ export const register: Register = (on, options) => {
     const draw = (p: Panel, w: number) =>
       p === 'main'
         ? mainPanel(w)
-        : p === 'architect'
-          ? architectPanel(w)
-          : p === 'consult'
-            ? consultPanel(w)
-            : p === 'gate'
-              ? gatePanel(w)
-              : p === 'agents'
-                ? agentsPanel(w)
-                : p === 'loops'
-                  ? loopsPanel(w)
-                  : p === 'receipt'
-                    ? receiptPanel(w)
-                    : logPanel(w)
+        : p === 'work'
+          ? workPanel(w)
+          : p === 'architect'
+            ? architectPanel(w)
+            : p === 'consult'
+              ? consultPanel(w)
+              : p === 'gate'
+                ? gatePanel(w)
+                : p === 'agents'
+                  ? agentsPanel(w)
+                  : p === 'loops'
+                    ? loopsPanel(w)
+                    : p === 'receipt'
+                      ? receiptPanel(w)
+                      : logPanel(w)
 
     // Panels with the flow between them; the agents panel draws its own rails.
     const column = (ps: Panel[], w: number) => (
@@ -2064,7 +2440,7 @@ export const register: Register = (on, options) => {
     const body = isWide ? (
       <Box flexDirection="column">
         <Box columnGap={2}>
-          {column(panels.filter(p => p === 'main' || p === 'architect' || p === 'gate'), colW)}
+          {column(panels.filter(p => p === 'main' || p === 'work' || p === 'architect' || p === 'gate'), colW)}
           {column(panels.filter(p => p === 'agents' || p === 'loops' || p === 'receipt'), colW)}
         </Box>
         {panels.includes('consult') ? consultPanel(W) : null}
