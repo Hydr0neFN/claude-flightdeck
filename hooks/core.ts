@@ -50,7 +50,7 @@ export const DEFAULT_TURN: Turn = { edits: 0, errorStreak: 0, errors: 0, isRevie
 export const DEFAULT_VIEW: View = { expanded: null, gateOpen: null, layout: null }
 export const DEFAULT_ROSTER: Roster = { architectTypes: [] }
 
-const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+export const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
 /** A stored object merged over its defaults, so a value saved under an older shape still reads. */
 export const normalize = <T extends object>(def: T, stored: unknown): T =>

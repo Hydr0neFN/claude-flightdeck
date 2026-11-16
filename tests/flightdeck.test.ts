@@ -842,6 +842,37 @@ test('a resumed session reads its compaction window at start, and /clear leaves 
   await cleared.unmount()
 })
 
+test('a resumed session shows its model, effort, mode and an estimated context before its first request', async ($, on) => {
+  mock.clock(on)
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('command.register', () => ({ value: { command: 'flightdeck' } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.model', () => ({ value: 'claude-opus-5-5[1m]' }))
+  on('session.turns', () => ({ value: 12 }))
+  // A read of one key is the read of the whole object, projected by the engine.
+  on('settings.read', () => ({ value: { effortLevel: 'medium', permissions: { defaultMode: 'bypassPermissions' } } as never }))
+  // The host has no fill yet; the local summary breakdown says 123 tokens of a 400k compaction window.
+  compactHost(on, { window: () => 1_000_000, compact: 400_000 })
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui.find({ text: /OPUS 5\.5/ })).toBeDefined()
+  expect(await ui.find({ text: /^medium$/ })).toBeDefined()
+  expect(await ui.find({ text: /bypassPermissions/ })).toBeDefined()
+  expect(await ui.find({ text: /^~123\/400k$/ })).toBeDefined()
+  await ui.unmount()
+  // A measurement with no count keeps the estimate; the first real count replaces it.
+  await $.session.measure({ context: { window: 1_000_000 }, rateLimits: [], changed: ['context'] } as never)
+  const kept = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await kept.find({ text: /^~123\/400k$/ })).toBeDefined()
+  await kept.unmount()
+  await $.session.measure({ context: { window: 1_000_000, tokens: 100_000, percent: 10 }, rateLimits: [], changed: ['context'] })
+  const real = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await real.find({ text: /^100k\/400k$/ })).toBeDefined()
+  await real.unmount()
+})
+
 test('a compaction-window read that fails is asked again at the next measurement', async ($, on) => {
   mock.clock(on)
   on('ui.status', () => ({ value: undefined }))

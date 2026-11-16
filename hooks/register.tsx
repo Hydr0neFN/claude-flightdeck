@@ -22,6 +22,7 @@ import {
   cardTitle,
   afterCompactHooked,
   afterCompactRead,
+  isObject,
   afterFillRead,
   afterResponse,
   claimCompactRead,
@@ -301,6 +302,43 @@ async function pollFeed($: EngineInterface, argv: string[], lock: { inFlight: bo
   }
 }
 
+/**
+ * Fills the main panel at start instead of at the first request: the model (`$.session.model()`), the
+ * effort (`effortLevel`) and the permission mode (`permissions.defaultMode`) from the settings, each only
+ * where nothing is known yet. A resumed session (it has prompts already) whose host has no fill yet gets
+ * the context from a local `summary` breakdown, marked as an estimate until the first response counts it.
+ * Every read is best effort.
+ */
+async function seedResumed($: EngineInterface, u: { context: { tokens?: number; window: number } } | null) {
+  const [model, effort, perms, turns] = await Promise.all([
+    $.session.model().catch(() => ''),
+    $.settings.read({ key: 'effortLevel' }).catch(() => undefined),
+    $.settings.read({ key: 'permissions' }).catch(() => undefined),
+    $.session.turns().catch(() => 0),
+  ])
+  const mode = isObject(perms) && typeof perms.defaultMode === 'string' ? perms.defaultMode : ''
+  await update($, main, x => {
+    const m = normalize(DEFAULT_MAIN, x)
+    return {
+      ...m,
+      model: m.model || (typeof model === 'string' ? model : ''),
+      effort: m.effort || (typeof effort === 'string' ? effort : ''),
+      mode: m.mode || mode,
+    }
+  })
+  if (turns <= 0 || !u || u.context.tokens !== undefined) return
+  const r = await $.session.usage({ breakdown: 'summary' }).catch(() => null)
+  const b = r?.context.breakdown
+  if (!b || !(b.totalTokens > 0)) return
+  const window = r.context.window || u.context.window
+  await update($, usage, x => {
+    const now = normalize(DEFAULT_USAGE, x)
+    if (now.tokens !== null && !now.isFillEstimate) return now
+    const read = afterCompactRead({ ...now, window, compactFor: window }, window, b)
+    return { ...read, tokens: b.totalTokens, pct: window > 0 ? (b.totalTokens * 100) / window : null, isFillEstimate: true }
+  })
+}
+
 const WORKER_INTERVAL_MS = 10_000
 const WORKER_TIMEOUT_MS = 5_000
 
@@ -376,6 +414,8 @@ export const register: Register = (on, options) => {
       await readCompactWindow($, resumedWindow)
       await refreshStatus($, cfg)
     }
+    await seedResumed($, u)
+    await refreshStatus($, cfg)
     stopWorkerTimer?.()
     const stopW: unknown = $.clock.every(WORKER_INTERVAL_MS, () => {
       void pollWorkers($, workerLock)
@@ -558,10 +598,13 @@ export const register: Register = (on, options) => {
     await update($, usage, x => {
       const claim = claimCompactRead(normalize(DEFAULT_USAGE, x), e.context.window)
       isStale = claim.isClaimed
+      // A resumed session's estimate stands until a response gives the real count.
+      const keep = e.context.tokens === undefined && claim.usage.isFillEstimate === true
       return {
         ...claim.usage,
-        pct: e.context.percent ?? null,
-        tokens: e.context.tokens ?? null,
+        pct: keep ? claim.usage.pct : (e.context.percent ?? null),
+        tokens: keep ? claim.usage.tokens : (e.context.tokens ?? null),
+        isFillEstimate: keep,
         window: e.context.window,
         costUsd: e.cost?.usd ?? null,
         limits: e.rateLimits.map(limitOf),
@@ -967,7 +1010,9 @@ export const register: Register = (on, options) => {
                   { text: ` ${String(Math.round(ctxFill.pct ?? 0)).padStart(3)}%`, bold: true },
                 ],
               },
-              u.tokens !== null ? { lead: 1, spans: [{ text: `${kTokens(u.tokens)}/${kTokens(ctxFill.window)}`, dim: true }] } : null,
+              u.tokens !== null
+                ? { lead: 1, spans: [{ text: `${u.isFillEstimate ? '~' : ''}${kTokens(u.tokens)}/${kTokens(ctxFill.window)}`, dim: true }] }
+                : null,
               u.compactions > 0 ? { spans: [{ text: compactMark(u), color: C.amber }], lead: 1 } : null,
               // Left out first when the line is short; the ~ in the mark still says it.
               u.compactions > 0 && u.isCompactEstimate ? { spans: [{ text: '(estimated)', color: C.faint }] } : null,

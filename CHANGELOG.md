@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.6 (yu)
+
+- A resumed session fills the main box at start, not at its first request: the model (`$.session.model()`), the effort (`effortLevel`) and the permission mode (`permissions.defaultMode`) from the settings. The context gauge shows a local estimate (`~59k/400k`, no request sent) until the first response gives the real count, so you can see how full a resumed session is before you send anything.
+
 ## 0.6.5 (yu)
 
 - An agent card names the model that does its work, not only the agent's own model. A wrapper agent that hands its job to a job runner (`ds-job.py`) shows `farmer ▸ Hydrogen`, `▸ Argon`, `▸ DS Flash`, `▸ GPT 6.1` and so on. The card reads the runner's `backend:` line, and while the job runs, the job dir's `trying` file (polled every 10 s), so a fallback to the next model shows. The expanded card shows the full backend label.

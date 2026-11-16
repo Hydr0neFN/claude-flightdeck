@@ -19,6 +19,8 @@ export type Main = {
 export type Usage = {
   pct: number | null
   tokens: number | null
+  /** `tokens` is the local estimate read when a resumed session started, not a response's count; absent in older state. */
+  isFillEstimate?: boolean
   window: number
   /** The compaction window (`autoCompactWindow`, or the host's own) the host measures context against, when auto-compaction
    *  is on and the window is smaller than the model's; null when none is set or none could be read. */
