@@ -1854,6 +1854,32 @@ const gridMatrix = (grid: ReturnType<typeof buildConsultGrid>): string[][] => {
 
 const isArrowGlyph = (g: string) => ARROWS.has(g)
 
+const ARROW_VEC: Record<string, readonly [number, number]> = {
+  '→': [1, 0],
+  '↘': [1, 1],
+  '↓': [0, 1],
+  '↙': [-1, 1],
+  '←': [-1, 0],
+  '↖': [-1, -1],
+  '↑': [0, -1],
+  '↗': [1, -1],
+}
+
+const pointsAtHubBorder = (L: ReturnType<typeof ringLayout>, p: { x: number; y: number; glyph: string }) => {
+  const v = ARROW_VEC[p.glyph]
+  if (!v) return false
+  const tx = p.x + v[0]
+  const ty = p.y + v[1]
+  const c = L.centre
+  return (
+    tx >= c.x &&
+    tx < c.x + c.width &&
+    ty >= c.y &&
+    ty < c.y + c.height &&
+    (tx === c.x || tx === c.x + c.width - 1 || ty === c.y || ty === c.y + c.height - 1)
+  )
+}
+
 /** The cell is 8-adjacent to a cell of this node's label block (label row and model row). */
 const touchesLabel = (L: ReturnType<typeof ringLayout>, i: number, p: { x: number; y: number }) => {
   const nd = L.nodes[i]!
@@ -1928,8 +1954,7 @@ test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and keeps every 
         expect(usedArrows.has(`${last.x},${last.y}`)).toBe(false)
         usedArrows.add(`${last.x},${last.y}`)
         expect(besideHub(L, last)).toBe(true)
-        const prev = sp[sp.length - 2]!
-        expect(last.glyph).toBe(expected8WayArrow(last.x - prev.x, last.y - prev.y))
+        expect(pointsAtHubBorder(L, last)).toBe(true)
         for (const c of sp) {
           expect(c.x >= 0 && c.x < cols && c.y >= 0 && c.y < rows).toBe(true)
           for (const nd of L.nodes) {
@@ -1979,8 +2004,7 @@ test('consult ring: every spoke runs in one 8-connected stroke from its label to
         const last = sp[sp.length - 1]!
         expect(isArrowGlyph(last.glyph)).toBe(true)
         expect(besideHub(L, last)).toBe(true)
-        const prev = sp[sp.length - 2]!
-        expect(last.glyph).toBe(expected8WayArrow(last.x - prev.x, last.y - prev.y))
+        expect(pointsAtHubBorder(L, last)).toBe(true)
         for (const c of sp) {
           const inBox =
             c.x >= L.centre.x && c.x < L.centre.x + L.centre.width && c.y >= L.centre.y && c.y < L.centre.y + L.centre.height
@@ -2019,10 +2043,11 @@ test('consult ring: every spoke runs in one 8-connected stroke from its label to
   const mainRun = (grid.rows[cx.y + 1] ?? []).find(r => r.text === 'MAIN')
   expect(mainRun?.color).toBe(PALETTES.theme.main)
   expect(mainRun?.bold).toBe(true)
-  // Queued spoke (index 2): faint dots, no arrowhead.
+  // Queued spoke (index 2): faint dots ending in a faint arrowhead.
   const qSpoke = grid.layout.spokes[2]!
   const qLast = qSpoke[qSpoke.length - 1]!
-  expect(mat[qLast.y]![qLast.x]).toBe('·')
+  expect(isArrowGlyph(qLast.glyph)).toBe(true)
+  expect(mat[qLast.y]![qLast.x]).toBe(qLast.glyph)
   const qRun = (grid.rows[qLast.y] ?? []).find(r => qLast.x >= r.x && qLast.x < r.x + cellWidth(r.text))
   expect(qRun?.color).toBe(PALETTES.theme.faint)
   // Running spoke (index 1): dim body dots + animated path.
@@ -4003,4 +4028,103 @@ test('a failed row stays until the next turn starts; a stale card draws ⊘ and 
 
 test('the mesh probe keeps a task title when the cache has no subject (mesh writes title)', () => {
   expect(MESH_PY).toContain('i.get("subject") or i.get("title")')
+})
+
+test('every consult spoke aims into a hub-border cell without 4-neighbouring arrowheads across sizes, widths and state mixes', () => {
+  for (const n of [4, 6, 7, 9, 10]) {
+    for (const cols of [46, 60, 64, 70]) {
+      for (const mix of ['running', 'queued', 'skipped'] as const) {
+        const engines = Array.from({ length: n }, (_, i) => {
+          const state = mix === 'queued' && i === n - 3 ? 'queued' : mix === 'skipped' && i === 1 ? 'skipped' : 'running'
+          return {
+            name: `eng${i}`,
+            state,
+            startedAt: state === 'running' ? 10_000 : null,
+            endedAt: null,
+            reason: state === 'skipped' ? 'locked' : null,
+            note: null,
+            model: `mod-${i}`,
+          }
+        })
+        const run = parseConsult(JSON.stringify({ run: makeRun({ engines }), locks: {} }))!.run!
+        const grid = buildConsultGrid(run, cols, PALETTES.theme, 25_000)
+        const mat = gridMatrix(grid)
+        const L = grid.layout
+        expect(L.spokes.length).toBe(n)
+        for (let i = 0; i < n; i += 1) {
+          const sp = L.spokes[i]!
+          expect(sp.length).toBeGreaterThanOrEqual(2)
+          expect(touchesLabel(L, i, sp[0]!)).toBe(true)
+          for (let k = 1; k < sp.length; k += 1) {
+            expect(Math.max(Math.abs(sp[k]!.x - sp[k - 1]!.x), Math.abs(sp[k]!.y - sp[k - 1]!.y))).toBeLessThanOrEqual(1)
+          }
+          const last = sp[sp.length - 1]!
+          expect(besideHub(L, last)).toBe(true)
+          expect(pointsAtHubBorder(L, last)).toBe(true)
+          const st = engines[i]!.state
+          if (st === 'skipped') {
+            expect(mat[last.y]![last.x]).toBe('⊘')
+          } else {
+            expect(isArrowGlyph(last.glyph)).toBe(true)
+            expect(mat[last.y]![last.x]).toBe(last.glyph)
+            if (st === 'queued') {
+              const runCell = (grid.rows[last.y] ?? []).find(r => last.x >= r.x && last.x < r.x + cellWidth(r.text))
+              expect(runCell?.color).toBe(PALETTES.theme.faint)
+            }
+          }
+          for (let j = i + 1; j < n; j += 1) {
+            const other = L.spokes[j]!
+            const oLast = other[other.length - 1]!
+            expect(Math.abs(last.x - oLast.x) + Math.abs(last.y - oLast.y)).toBeGreaterThan(1)
+          }
+        }
+      }
+    }
+  }
+})
+
+test('9-engine consult ring at 64 columns grows a 5-row hub so opencode and agy end on the hub wall with → / ←', () => {
+  const run = parseConsult(
+    JSON.stringify({
+      run: makeRun({
+        engines: [
+          { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 28_000, reason: null, note: null, model: 'auto' },
+          { name: 'codex', state: 'skipped', startedAt: null, endedAt: null, reason: 'locked', note: null },
+          { name: 'deepseek', state: 'ok', startedAt: 10_000, endedAt: 11_000, reason: null, note: null },
+          { name: 'agy', state: 'running', startedAt: 10_000, endedAt: null, reason: null, note: null },
+          { name: 'nim', state: 'ok', startedAt: 10_000, endedAt: 40_000, reason: null, note: null },
+          { name: 'openrouter', state: 'ok', startedAt: 10_000, endedAt: 47_000, reason: null, note: null, model: 'ernie-5.5-flash' },
+          { name: 'opencode', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null, model: 'beam-free' },
+          { name: 'azure', state: 'ok', startedAt: 10_000, endedAt: 14_000, reason: null, note: null, model: 'gpt-6.1-sol' },
+          { name: 'gemini', state: 'ok', startedAt: 10_000, endedAt: 47_000, reason: null, note: null, model: 'gemini-4-hydrogen' },
+        ],
+      }),
+      locks: {},
+    }),
+  )!.run!
+  for (const cols of [60, 64]) {
+    const grid = buildConsultGrid(run, cols, PALETTES.theme, 15_000)
+    const mat = gridMatrix(grid)
+    const c = grid.layout.centre
+    expect(c.height).toBe(5)
+    expect(mat[c.y]!.slice(c.x, c.x + c.width).join('')).toBe('╭──────╮')
+    expect(mat[c.y + 1]!.slice(c.x, c.x + c.width).join('')).toBe('│      │')
+    expect(mat[c.y + 2]!.slice(c.x, c.x + c.width).join('')).toBe('│ MAIN │')
+    expect(mat[c.y + 3]!.slice(c.x, c.x + c.width).join('')).toBe('│      │')
+    expect(mat[c.y + 4]!.slice(c.x, c.x + c.width).join('')).toBe('╰──────╯')
+
+    const agySpoke = grid.layout.spokes[3]!
+    const agyEnd = agySpoke[agySpoke.length - 1]!
+    expect(agySpoke.every(p => p.y === agyEnd.y)).toBe(true)
+    expect(agyEnd.y).toBeGreaterThanOrEqual(c.y)
+    expect(agyEnd.y).toBeLessThan(c.y + c.height)
+    expect([agyEnd.x, mat[agyEnd.y]![agyEnd.x]]).toEqual([c.x + c.width, '←'])
+
+    const opencodeSpoke = grid.layout.spokes[6]!
+    const opencodeEnd = opencodeSpoke[opencodeSpoke.length - 1]!
+    expect(opencodeSpoke.every(p => p.y === opencodeEnd.y)).toBe(true)
+    expect(opencodeEnd.y).toBeGreaterThanOrEqual(c.y)
+    expect(opencodeEnd.y).toBeLessThan(c.y + c.height)
+    expect([opencodeEnd.x, mat[opencodeEnd.y]![opencodeEnd.x]]).toEqual([c.x - 1, '→'])
+  }
 })

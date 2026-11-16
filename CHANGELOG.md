@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+- Every `consult` ring spoke now aims its arrowhead directly into the 8-adjacent `MAIN` hub-border cell (`╭ ─ ╮ │ ╰ ╯`) it adjoins instead of following the spoke's last step direction, and queued engines keep their faint arrowhead so their spokes never end in a gap.
+- When more side engines need the hub's left or right wall than its rows hold without 4-neighbouring arrowheads (such as 9- and 10-engine rings), the `MAIN` box grows taller with empty interior rows (e.g. a 5-row box with `MAIN` on the middle row) so each side engine ends straight on its own wall row with `→` / `←` instead of crowding below the corners.
+- README: redrew the 60-column 9-engine `consult` ring example from a real render.
+
 ## 0.9.0
 
 - The pane is one status picture: colour means status everywhere — running blue (`agent`), done green (`gate`), stopped and partial amber, failed and a dead runner red (`warn`), to-do and queued faint — and the role is written as text (`sub-main`, `farmer`, `helper`, `consult`). Glyphs follow the same states: `◐` running, `●`/`✓` done, `◑` stopped/partial, `✗` failed, `⊘` locked/dead, `○` to do. The header's `■ main ■ agents ■ gate` colour legend and the work tree's glyph legend line are gone.

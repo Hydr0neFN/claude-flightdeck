@@ -3280,9 +3280,9 @@ const pickArcArrowIdx = (
 
 /**
  * Computes balanced, mirror-symmetric ellipse layout for `nodes` on a `cols x rows` cell grid:
- * rounded `MAIN` centre box, one continuous 8-connected spoke from each engine label to its
- * arrowhead beside the hub, and a smooth dotted clockwise ring for debate rounds. Side engines sit
- * on the hub's middle row, so their spoke is a straight horizontal line.
+ * rounded `MAIN` centre box (taller when more side engines need the wall), one continuous
+ * 8-connected spoke from each engine label to an arrowhead pointing into the hub border, and a
+ * smooth dotted clockwise ring for debate rounds.
  */
 export const ringLayout = (
   nodes: readonly RingNodeInput[],
@@ -3294,10 +3294,8 @@ export const ringLayout = (
   const isDebate = Boolean(options.isDebate)
   const tagW = options.tagWidth ?? 6
   const boxW = isDebate ? Math.max(8, tagW + 4 + (tagW % 2)) : 8
-  const boxH = isDebate ? 4 : 3
   const boxX = Math.floor((cols - boxW) / 2)
   const cy = Math.floor(rows / 2)
-  const centre: RingBox = { x: boxX, y: cy - 1, width: boxW, height: boxH }
   const cxLeft = boxX + Math.floor(boxW / 2) - 1
   const cxRight = boxX + Math.floor(boxW / 2)
   const cx = cxRight
@@ -3404,6 +3402,14 @@ export const ringLayout = (
       }
     }
   }
+
+  // Grow the hub symmetrically when more side engines need their own non-4-neighbouring wall row.
+  const sideNodes = placed.filter((nd, i) => i > 0 && i < n / 2 && nd.align !== 'center')
+  const wallNodes = sideNodes.slice(1, -1)
+  const needHalf = Math.max(1, ...wallNodes.map(nd => Math.abs(nd.labelY - cy)))
+  const halfH = isDebate ? 1 : Math.min(needHalf, Math.max(1, cy - 4))
+  const boxH = isDebate ? 4 : 1 + 2 * halfH
+  const centre: RingBox = { x: boxX, y: isDebate ? cy - 1 : cy - halfH, width: boxW, height: boxH }
 
   // One dim model row under each label, centred and truncated to the label's width + 4.
   for (let i = 0; i < placed.length; i += 1) {
@@ -3655,11 +3661,12 @@ export const ringLayout = (
 
   const spokes: RingCell[][] = spokePts.map(pts =>
     pts.map((p, k) => {
-      const prev = pts[Math.max(0, k - 1)]!
+      const hx = Math.max(bx0, Math.min(bx1, p.x))
+      const hy = Math.max(by0, Math.min(by1, p.y))
       return {
         x: p.x,
         y: p.y,
-        glyph: k === pts.length - 1 ? arrowFromVec(p.x - prev.x, p.y - prev.y) : '·',
+        glyph: k === pts.length - 1 ? arrowFromVec(hx - p.x, hy - p.y) : '·',
       }
     }),
   )
@@ -3722,17 +3729,16 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
 
   const c = layout.centre
   putStr(c.x, c.y, `╭${'─'.repeat(c.width - 2)}╮`, colors.main)
-  put(c.x, c.y + 1, '│', colors.main)
-  put(c.x + c.width - 1, c.y + 1, '│', colors.main)
-  putStr(c.x + Math.floor((c.width - 4) / 2), c.y + 1, 'MAIN', colors.main, true)
-  if (isDebate) {
-    put(c.x, c.y + 2, '│', colors.main)
-    put(c.x + c.width - 1, c.y + 2, '│', colors.main)
-    putStr(c.x + Math.floor((c.width - cellWidth(tag)) / 2), c.y + 2, tag, colors.arch)
-    putStr(c.x, c.y + 3, `╰${'─'.repeat(c.width - 2)}╯`, colors.main)
-  } else {
-    putStr(c.x, c.y + 2, `╰${'─'.repeat(c.width - 2)}╯`, colors.main)
+  for (let y = c.y + 1; y < c.y + c.height - 1; y += 1) {
+    put(c.x, y, '│', colors.main)
+    put(c.x + c.width - 1, y, '│', colors.main)
   }
+  const mainY = isDebate ? c.y + 1 : c.y + Math.floor(c.height / 2)
+  putStr(c.x + Math.floor((c.width - 4) / 2), mainY, 'MAIN', colors.main, true)
+  if (isDebate) {
+    putStr(c.x + Math.floor((c.width - cellWidth(tag)) / 2), c.y + 2, tag, colors.arch)
+  }
+  putStr(c.x, c.y + c.height - 1, `╰${'─'.repeat(c.width - 2)}╯`, colors.main)
   // One dim model row under each engine label, where the run file names one.
   for (const nd of layout.nodes) {
     if (nd.model !== undefined && nd.modelX !== undefined && nd.modelY !== undefined) {
@@ -3759,7 +3765,7 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
       } else if (st === 'ok') {
         for (const pt of spoke) put(pt.x, pt.y, pt.glyph, colors.gate)
       } else if (st === 'queued') {
-        for (const pt of spoke) put(pt.x, pt.y, '·', colors.faint)
+        for (const pt of spoke) put(pt.x, pt.y, pt.glyph, colors.faint)
       } else if (st === 'running') {
         for (let k = 0; k < spoke.length; k += 1) {
           const pt = spoke[k]!

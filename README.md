@@ -176,7 +176,7 @@ The command writes JSON to `stdout` (every field optional; unknown fields ignore
 
 The `consult` panel polls `consultDir` (default `~/.claude/state/consult-runs`) every 2 s while a run is live and every 15 s otherwise, hiding when there is no run or 10 minutes after the newest run ends. Below 40 columns or above 10 engines it collapses to a compact list.
 
-Every spoke is one continuous 8-connected stroke from the engine label to its arrowhead beside `MAIN`; a side engine sits on the hub's middle row so its spoke is a straight horizontal line, and two arrowheads never land in 4-neighbouring cells. Each engine label has one dim model row under it, centred and cut to the label's width + 4: the run file's `engines[].model`, or the part after the first `:` in a name like `agy:gemini-4-argon-high`. A locked or skipped engine is drawn in red with a faint broken spoke (`·  ·  ·`) that ends in `⊘` at the hub; it has no clock and no lock text. This is a real render at 60 columns (an ended consult, round 1):
+Every spoke is one continuous 8-connected stroke from the engine label to an arrowhead pointing directly into an 8-adjacent cell of `MAIN`; when more side engines need the hub's left or right wall than fit without 4-neighbouring arrowheads, the box grows taller (for example a 5-row box with `MAIN` on the middle row) so each side engine ends on its own wall row with a straight horizontal spoke. Queued engines also end in a faint arrowhead, never in a gap. Each engine label has one dim model row under it, centred and cut to the label's width + 4: the run file's `engines[].model`, or the part after the first `:` in a name like `agy:gemini-4-argon-high`. A locked or skipped engine is drawn in red with a faint broken spoke (`·  ·  ·`) that ends in `⊘` at the hub; it has no clock and no lock text. This is a real render at 60 columns (an ended consult, round 1):
 
 ```
 ╭────────────────────────────────────────────────────────────╮
@@ -184,13 +184,13 @@ Every spoke is one continuous 8-connected stroke from the engine label to its ar
 │                       ● copilot 18s                        │
 │                            auto                            │
 │         ● gemini 37s··      ·        ·⊘ codex              │
-│       gemini-4-hydrog…··    ·                              │
-│                         ↘   ↓    ⊘·                        │
+│       gemini-4-hydrog…··↘   ↓    ⊘·                        │
 │                          ╭──────╮                          │
+│                          │      │                          │
 │    ● azure 2m28s········→│ MAIN │←········● deepseek 4s    │
-│     gpt-6.1-sol          ╰──────╯                          │
-│    ● opencode 34s·······→ ↗    ↖ ←·······● agy 1m44s       │
-│       beam-free          ·      ·                          │
+│     gpt-6.1-sol          │      │                          │
+│    ● opencode 34s·······→╰──────╯←·······● agy 1m44s       │
+│       beam-free          ↑      ↑                          │
 │                         ·        ·                         │
 │        ● openrouter 37s·          ·● nim 30s               │
 │         ernie-5.5-flash                                    │
