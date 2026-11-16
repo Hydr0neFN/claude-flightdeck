@@ -61,10 +61,10 @@ https://github.com/user-attachments/assets/9ad0fcc3-c81c-427a-a743-f7b6c49f5885
 
 | Panel | Shows | From |
 | --- | --- | --- |
-| **main** | model, effort, permission mode, request count; a context gauge with compactions (↺, or ↺~ when [estimated](#what-is-inferred-not-measured)), measured against the compaction window when the session compacts in a smaller one than the model's (`autoCompactWindow`, or Claude Code's own); cost and the first two rate-limit windows when your plan reports them, with the time to each reset (↻) from 56 columns; the last main-loop request's time to first token; when mesh tasks exist, one `tasks` row with the plan's strip and the task being done now | `turn.step`, `session.measure`, `session.compact`, `$.session.usage()` (at each main-loop request, and its local `summary` breakdown, once per model, for the compaction window); the permission mode from `classic.UserPromptSubmit` and `agent.spawn`; the mesh task cache |
-| **work** | one live tree of the whole delegation: main's mesh tasks with the workers under them, a box per sub-main with its checkpoint plan and workers, and a closing line of the tasks still to do. Strips, live clocks, one detail line under a running leaf, and the selected leaf's rows; fits the pane's height | `jobsDir` (farmer jobs), the agy conversation store, `consultDir` and the run file, `agent.spawn` and `tool.call` (who issued what), mesh tasks, and each Claude subagent's checkpoint file |
+| **main** | `ctx` with its gauge, percent, tokens and effort on one row; the `5h` and `7d` rate-limit windows with the time to each reset (↻) and session spend on the next; the permission mode only when it is not the default (`bypass`). Then `plan <done>/<total>` and one row per mesh task with its title: glyph, id, title, the doing task's elapsed and `→ sub-main` when a sub-main's brief names the task. Too few rows keep the doing task and the next to-do ones, then `+N done`. Without mesh tasks the feed's `task` is one `task` row. No `cwd`, `ttft` or request count | `turn.step`, `session.measure`, `session.compact`, `$.session.usage()` (at each main-loop request, and its local `summary` breakdown, once per model, for the compaction window); the permission mode from `classic.UserPromptSubmit` and `agent.spawn`; the mesh task cache |
+| **work** | only live, waiting and recently ended work, in one `running <N> · waiting <M>` box. A sub-main is a header row (`◐ sub-main · t4 tests`) with its workers as a `├ └` tree and one `N steps left: …` row; main's loose workers follow, then a live consult (`◎ consult · 7 engines · 4/7`) and ended rows (`done 30s ago`, `failed 30s ago` in red). Colour is the status — running blue, done green, stopped/partial amber, failed red, to-do faint — and the role is plain text (`sub-main`, `farmer`, `helper`, `consult`). Ended rows leave after 60 s; failed rows stay until the next `turn.start`; a running card with no event for 10 minutes, or a job whose pid is gone, draws `⊘ stale` and leaves after 60 s. Nothing live, waiting or recent: no box | `jobsDir` (farmer jobs), the agy conversation store, `consultDir` and the run file, `agent.spawn` and `tool.call` (who issued what), mesh tasks, and each Claude subagent's checkpoint file |
 | **architect** | consults on a timeline, whether one is running, how long the last took; optionally the moment of each consult; the first line of a subagent architect's advice | a spawn of a matching agent type, or a matching server tool in the assistant's rows |
-| **consult** | external multi-engine consults and debates in a ring around `MAIN`, with live spinners, travelling packets, question, legend, failure reasons, active locks and summary | `~/.claude/state/consult-runs/` (or `consultDir`) and `~/.claude/state/consult-locks.json` |
+| **consult** | external multi-engine consults and debates in a ring around `MAIN`: one continuous 8-connected spoke from each engine label to its arrowhead, side engines on the hub's middle row, and one dim model row under each label (`engines[].model`, or the part after `:` in `agy:gemini-4-argon-high`). Live spinners and travelling packets; a locked engine in red with a faint broken spoke ending in `⊘`, and no clock or lock text; the question's first sentence only when it fits whole; the status legend only when the box has 3 spare rows; an ended summary `✓ 8/9 answered · ⊘ codex` | `~/.claude/state/consult-runs/` (or `consultDir`) and `~/.claude/state/consult-locks.json` |
 | **gate** | one cell per permission check: green allowed without asking, blue decided by the auto-mode classifier or you and then run, amber pending, red ✗ denied, dim if made inside a subagent. Totals, and a drill-down per tool family with credentials masked | `tool.check`, settled by the `tool.call` around it |
 | **agents** | cards side by side while they fit: the task, type, live context and output tokens, steps, a running clock, `max_tokens` in red. Beyond that, swimlanes on one time axis. Farmer jobs and agy-job calls live in the `work` tree | `agent.spawn`, `turn.step`, `tool.call`, `turn.complete` |
 | **loops** | model loops that match no card: workflow agents, compactions, memory forks | `turn.step` ids no card claims |
@@ -176,95 +176,99 @@ The command writes JSON to `stdout` (every field optional; unknown fields ignore
 
 The `consult` panel polls `consultDir` (default `~/.claude/state/consult-runs`) every 2 s while a run is live and every 15 s otherwise, hiding when there is no run or 10 minutes after the newest run ends. Below 40 columns or above 10 engines it collapses to a compact list.
 
-Consult (round 1, spokes fan in to `MAIN`):
+Every spoke is one continuous 8-connected stroke from the engine label to its arrowhead beside `MAIN`; a side engine sits on the hub's middle row so its spoke is a straight horizontal line, and two arrowheads never land in 4-neighbouring cells. Each engine label has one dim model row under it, centred and cut to the label's width + 4: the run file's `engines[].model`, or the part after the first `:` in a name like `agy:gemini-4-argon-high`. A locked or skipped engine is drawn in red with a faint broken spoke (`·  ·  ·`) that ends in `⊘` at the hub; it has no clock and no lock text. This is a real render at 60 columns (an ended consult, round 1):
 
 ```
-╭──────────────────────────────────────────────────────────────╮
-│ CONSULT · consult · R1/1                          3/6 · 0:24 │
-│                        ● copilot 10s                         │
-│                               ·                              │
-│                               ·                              │
-│         ● claude 18s ··       ↓      ·· ◐ gemini 12s         │
-│                        ··→╭──────╮←··                        │
-│                           │ MAIN │                           │
-│                        ···╰──────╯←··                        │
-│               ○ qwen ··       ·      ·· ● codex 20s          │
-│                               ·                              │
-│                               ·                              │
-│                          ○ deepseek                          │
-│ “Which approach fits best?”                                  │
-│ ● done  ◐ running  ○ queued  ✗ failed  ⊘ locked              │
-╰──────────────────────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────────────╮
+│ CONSULT · consult · R1/1                        8/9 · 2:36 │
+│                       ● copilot 18s                        │
+│                            auto                            │
+│         ● gemini 37s··      ·        ·⊘ codex              │
+│       gemini-4-hydrog…··    ·                              │
+│                         ↘   ↓    ⊘·                        │
+│                          ╭──────╮                          │
+│    ● azure 2m28s········→│ MAIN │←········● deepseek 4s    │
+│     gpt-6.1-sol          ╰──────╯                          │
+│    ● opencode 34s·······→ ↗    ↖ ←·······● agy 1m44s       │
+│       beam-free          ·      ·                          │
+│                         ·        ·                         │
+│        ● openrouter 37s·          ·● nim 30s               │
+│         ernie-5.5-flash                                    │
+│ ✓ 8/9 answered · ⊘ codex                                   │
+╰────────────────────────────────────────────────────────────╯
 ```
 
 Debate (round 2+, answers circulate clockwise around the ring):
 
 ```
 ╭──────────────────────────────────────────────────────────────╮
-│ CONSULT · debate · R2/3                           2/6 · 1:05 │
-│                        ● copilot 10s                         │
-│                           ········                           │
-│                        ··↗        ↘··                        │
-│         ◐ claude 12s ··              ·· ◐ gemini 8s          │
-│                     ·    ╭────────╮    ·                     │
-│                     ↑    │  MAIN  │    ↓                     │
-│                     ·    │ ⟳ R2/3 │    ·                     │
-│            ◐ qwen 6s ··  ╰────────╯  ·· ● codex 14s          │
-│                        ··↖        ↙··                        │
-│                           ········                           │
-│                        ◐ deepseek 11s                        │
-│                 answers pass round the ring                  │
+│ CONSULT · debate · R2/3                           2/6 · 0:14 │
+│                        ● copilot 8s                          │
+│                       ··············                         │
+│                  ····↗              ↘····                    │
+│   ◐ claude 14s ··                        ·· ◐ gemini 14s     │
+│               ·         ╭────────╮         ·                 │
+│              ↑          │  MAIN  │          ↓                │
+│               ·         │ ⟳ R2/3 │         ·                 │
+│      ● qwen 9s ··       ╰────────╯       ·· ○ codex          │
+│                  ·····              ·····                    │
+│                       ·······←······                         │
+│                       ✗ deepseek 4s                          │
+│                answers pass round the ring                   │
 │ “Which approach fits best?”                                  │
 │ ● done  ◐ running  ○ queued  ✗ failed  ⊘ locked              │
 ╰──────────────────────────────────────────────────────────────╯
 ```
 
+The question line is the first sentence up to `:`, `.`, `?` or a newline, and it is drawn only when the whole sentence fits. The glyph legend is left out when the box has under 3 spare rows. An ended run never shows its raw summary text: it draws one line that fits, `✓ 8/9 answered · ⊘ codex`, shortening the list of names but never the counts.
+
 ## Work tree
 
-The `work` panel is the whole delegation as one tree rooted at main: the plan's tasks, the workers under the task each serves, and a box per sub-main. Farmer jobs and agy-job calls are workers here, not on the `agents` panel (which is cards and lanes again). This is a real render at 66 columns:
+The `work` panel shows only live work, waiting work and work that ended under a minute ago. It is one `running <N> · waiting <M>` box: a sub-main is a header row (`◐ sub-main · t4 tests`) with its workers as a `├ └` tree and its remaining plan steps folded into one `└ ○ 3 steps left: …` row; main's loose workers follow, then a live consult as one `◎ consult · 7 engines · 4/7` row, and ended rows read `done 30s ago` (`failed 30s ago` in red). This is a real render at 60 columns:
 
 ```
-╭────────────────────────────────────────────────────────────────╮
-│ ◐ WORK · main's tasks ●●◐○○ 2/5                            20m │
-│ ◐ t3 flightdeck 0.7.0                                          │
-│ └ ◐ ring-panel ▸ Hydrogen xhigh                            16m │
-│     edit hooks/register.tsx · 4 files · 83 st                  │
-│  ╭───────────────────────────────────────────────────────────╮ │
-│  │ ◐ sub-main · t4 ●●◐○○○ 2/6                             6m │ │
-│  │ last ✔ step 2 jobs probe (exit 0)                         │ │
-│  │ ├ ◐ builder                                         2m10s │ │
-│  │ │   next edit hooks/core.ts                               │ │
-│  │ ├ ○ receipt rows                                          │ │
-│  │ ├ ○ tests                                                 │ │
-│  │ └ ○ docs                                                  │ │
-│  ╰───────────────────────────────────────────────────────────╯ │
-│ ● receipt ▸ sol free                                       15m │
-│ ○ t4 receipt · ○ t5 docs                                       │
-│ ● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel       │
-╰────────────────────────────────────────────────────────────────╯
+╭ running 3 · waiting 3 ───────────────────────────────────╮
+│ ◐ sub-main · t4 tests                              8m11s │
+│ ├ ◐ farmer fd-tidy ▸ Hydrogen xhigh                6m02s │
+│ ├ ◐ helper grep refs                               1m40s │
+│ └ ○ 3 steps left: snapshots · docs · review              │
+│ ◎ consult · 7 engines · 4/7                        2m18s │
+│ ✓ farmer-smoke ▸ Hydrogen high              done 30s ago │
+╰──────────────────────────────────────────────────────────╯
 ```
 
-Main's box is titled `WORK · main's tasks`; every sub-main (any agent that spawns agents) is a box titled with its brief's `task: t<N>`. A box's header carries its glyph, name, strip and elapsed; its body is a `├ └` tree of running workers first, then to-do plan steps, then at most two dimmed done lines, then `+N more`. Main lists the tasks with no row of their own on one closing line (`○ t4 receipt · ○ t5 docs`).
+A worker row is its glyph, role, name, `▸ model` when a farmer model is known, and its elapsed clock at the right edge. Colour is the status everywhere — running blue (`agent`), done green (`gate`), stopped and partial amber, failed and a dead runner red (`warn`), to-do and queued faint — and the role is plain text (`sub-main`, `farmer`, `helper`, `consult`), never a colour. Ended rows fade in place and leave 60 s after their end; a failed row stays until the next `turn.start`. A running card with no event for 10 minutes, or a job whose runner pid is gone, draws `⊘ stale` and leaves after 60 s like an ended row. Nothing live, waiting or recent and the box is not drawn.
 
-The strip is one glyph per unit and `<done>/<total>`: mesh task items for main (`todo`, `doing`, `done`, `blocked`), plan steps plus workers for a sub-main. It holds at most 12 glyphs, then `+N`. A worker line names its farmer model (`▸ Hydrogen xhigh`), keeps a live clock, and a running leaf gets one detail line from 56 columns (`edit hooks/register.tsx · 4 files · 83 st`, or a builder's `next`). Select a leaf with its glyph to expand its `stage`, `now`, `work`, `think`, `last`, `next` and `status`/`tests` rows. Ended leaves keep one line. A box whose work is all done collapses to its header line 60 s after the last end. Ended leaves and done boxes leave the tree 2 minutes after their end (the receipt and probes keep them), and when every task is done and nothing runs the body becomes one dim `all done · <N> tasks` line.
+The `main` card carries the plan above it: `plan <done>/<total>` and one row per mesh task with its title (`✓ t1 scaffold pane`, `◐ t3 polish pane   12m04s`, `○ t4 tests   → sub-main`). When the pane has too few rows for every task, the doing task and the next to-do rows stay and the rest folds into one `+N done` line. A real render at 60 columns:
 
-Who issued what comes from the events, not a guess: `agent.spawn`'s `parentAgentId`; a Bash call running `ds-job.py run|batch`, `agy-job.py run` or `consult-cli.js` binds its job or consult run to the agent whose call it was, and the result's `jobid:` line binds the job dir. A job the probe sees but nothing bound belongs to main. Main's direct workers hang under the mesh task that was `doing` when they were issued; a sub-main's under its brief's `task:` line. A consult-cli run is one `◎` line that points at the `consult` panel.
+```
+╭ main ────────────────────────────────────────────────────╮
+│ ctx  ▰▰▰▰▰▰▱▱▱▱ 57% 170k/300k     effort medium          │
+│ 5h ▰▱▱▱▱ 10% ↻4h37m   7d ▰▰▰▰▱ 74% ↻1d21h   $14.42       │
+│ plan 2/4                                                 │
+│ ✓ t1 scaffold pane                                       │
+│ ✓ t2 worker tree                                         │
+│ ◐ t3 polish pane                                  12m04s │
+│ ○ t4 tests                                    → sub-main │
+╰──────────────────────────────────────────────────────────╯
+```
 
-The pane is the hard limit. On every render the tree takes the rows the other shown panels leave (`e.props.scroll.bodyRows`), and drops detail lines, dimmed done lines, to-do lines (folded into `+N more`) and then nested box bodies until the pane fits. Below 56 columns it leaves detail lines out; below 40 every box is one line: header, strip and clock. Boxes nest two levels at most: a coordinator under a sub-main draws as a line with its own strip. Nothing wraps.
+Without mesh tasks the plan block is absent and the external feed's `task` text is one `task` row; `cwd`, `last ttft` and the request count are never drawn. The permission mode appears only when it is not the default, in its short form (`bypass`).
 
-The top `main` card keeps one `tasks` row of its own (`tasks  ●●◐○○ 2/5 ▸ t3 flightdeck 0.7.0`), so the plan stays visible when the tree is cut by height.
+Who issued what comes from the events, not a guess: `agent.spawn`'s `parentAgentId`; a Bash call running `ds-job.py run|batch`, `agy-job.py run` or `consult-cli.js` binds its job or consult run to the agent whose call it was, and the result's `jobid:` line binds the job dir. A job the probe sees but nothing bound belongs to main. Main's direct workers hang under the mesh task that was `doing` when they were issued; a sub-main's under its brief's `task:` line.
 
-Claude subagents (`sub-main`, `builder`, `builder-lite`) already write a checkpoint after every step. The tree finds the file from the brief (`report:` / `handoff:`, a `.handoffs/<name>.md` token, or `.handoffs/<agent name>.md` for a builder), or from an ended agent's `HANDOFF:` / `REPORT:` line, and reads its last 8 KB with a local python probe every 10 s: the last step (`last ✔ step 2 jobs probe (exit 0)`), the `next` command, the `open:` bullets, `status:` and `tests:`. Those rows show on the expanded card and on a sub-main's box; a file over 256 KB is left alone.
+The pane is the hard limit. On every render the box takes the rows the other shown panels leave (`e.props.scroll.bodyRows`) and drops ended rows, then whole sub-main boxes, then waiting rows until it fits. Below 40 columns a sub-main is one header line and its children are left out; main's loose workers still draw. Nothing wraps.
+
+Claude subagents (`sub-main`, `builder`, `builder-lite`) already write a checkpoint after every step. The tree finds the file from the brief (`report:` / `handoff:`, a `.handoffs/<name>.md` token, or `.handoffs/<agent name>.md` for a builder), or from an ended agent's `HANDOFF:` / `REPORT:` line, and reads its last 8 KB with a local python probe every 10 s: the last step, the `next` command, the `open:` bullets (the `N steps left` row), `status:` and `tests:`. Select a leaf with its glyph to expand its `last`, `next`, `status` and `tests` rows. A file over 256 KB is left alone.
 
 ## Farmer jobs
 
 A farmer job (`ds-job.py run`, `agy-job.py run`) is not a Claude subagent, so the agent cards never saw it. Flightdeck reads `jobsDir` (default `~/.claude/state/ds-jobs`) with a local python probe every 3 s while a job is live and every 20 s otherwise: live jobs, and jobs that ended in the last 30 minutes, newest first, at most 8. A live job whose recorded pid is gone is marked `⊘`. Each job is a line in the [work tree](#work-tree):
 
 ```
-◐ ring-panel ▸ Hydrogen xhigh          2m04s
-  edit hooks/register.tsx · 4 files · 83 st
-● receipt ▸ sol free                   4m06s
-◇verify ▸ agy Sonnet high                41s  verify pending
+◐ farmer ring-panel ▸ Hydrogen xhigh           2m04s
+✓ farmer receipt ▸ sol free              done 45s ago
+◐ farmer ◇verify ▸ agy Sonnet high     41s  verify pending
 ```
 
 `◇` marks an agy-job: it runs on your real repo, with no scrubbed copy. `verify pending` shows while `~/.claude/state/agy-verify-pending/<job>.json` exists, and its thought is never read: those jobs are private.
@@ -299,7 +303,7 @@ No model is called. For an agy worker the pane opens that conversation's SQLite 
 | [`hooks/core.ts`](hooks/core.ts) | every reducer, formatter and layout rule as pure functions, so behaviour is testable directly |
 | [`hooks/rail.tsx`](hooks/rail.tsx), [`hooks/elapsed.tsx`](hooks/elapsed.tsx) | surface modules: animated connectors and live clocks that redraw only themselves, on the surface's own frame clock |
 | [`types/index.d.ts`](types/index.d.ts) | the state contract |
-| [`tests/`](tests) | 59 tests: pure behaviour, plus drawings mounted on every surface at 24–120 columns, with every width from 24 to 40 checked for anything that spills past its box |
+| [`tests/`](tests) | 121 tests: pure behaviour, plus drawings mounted on every surface at 24–120 columns, with every width from 24 to 40 checked for anything that spills past its box |
 
 State lives in `$.state` atoms. Every read is merged over defaults, so a missing or older field never breaks the pane; an update that changes the state's shape may still reset its counters once. New to mods? Start with [Claude Code mods](https://claude.com/blog/claude-code-mods) and [Getting started with Claude Code mods](https://claude.dev/blog/getting-started-with-claude-code-mods/).
 

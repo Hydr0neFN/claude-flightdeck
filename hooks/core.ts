@@ -103,6 +103,7 @@ export const normalizeCard = (stored: unknown): AgentCard =>
       workerCost: null,
       checkpoint: '',
       check: null,
+      lastAt: 0,
     },
     stored,
   )
@@ -1589,6 +1590,8 @@ def main():
   tree = tree_of(d, jobid, state, log)
   job = {"jobid": jobid, "job": str(state.get("job") or jobid), "status": status, "ts": ts, "pid": pid or None, "backend": str(state.get("backend") or ""), "tier": str(state.get("tier") or ""), "profile": str(state.get("profile") or ""), "phase": str(state.get("phase") or ""), "rc": rc, "dir": d, "tree": tree, "live": live, "stale": False, "endedAt": None if live else int(mt * 1000), "mtime": int(start_mt * 1000), "trying": trying, "stageLines": stage_lines(log), "hasTrying": bool(trying), "hasHandoff": bool(handoff.strip()), "handoff": {"backend": fields.get("backend", ""), "files_changed": fields.get("files_changed", ""), "ds": fields.get("ds", ""), "not_verified": fields.get("not_verified", "")}}
   job["stale"] = bool(live and status == "running" and not (pid and alive(pid)))
+  if job["stale"]:
+   job["endedAt"] = int(mt * 1000)
   if live and (job["stale"] or not (pid and alive(pid))) and time.time() - mt > 1800:
    continue
   if live and not job["stale"]:
@@ -2261,25 +2264,25 @@ export const checkpointOfAnswer = (answer: string, cwd: string): string => {
 export const COLLAPSE_AFTER_MS = 60_000
 
 /** An ended leaf or done box stays in the tree this long after its end, then drops out. */
-export const DONE_KEEP_MS = 120_000
+export const DONE_KEEP_MS = 60_000
+
+/** A running card with no event for this long is stale: `⊘ stale`, and it leaves like an ended row. */
+export const STALE_AFTER_MS = 10 * 60_000
 
 /** Under 56 columns the tree leaves out its live detail lines. */
 export const WORK_DETAIL_COLS = 56
 
-/** Under 40 columns every box is one line: header, strip and clock. */
+/** Under 40 columns a sub-main is one header line. */
 export const WORK_NARROW = 40
 
 /** At most 12 glyphs in a strip, then `+N`. */
 export const WORK_STRIP_MAX = 12
 
-/** The tree's own legend, under the last box. */
-export const WORK_LEGEND = '● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel'
-
 const WORK_RUNNING = new Set(['running', 'parked', 'need_tool', 'doing', 'queued'])
 
 export const isRunningStatus = (status: string) => WORK_RUNNING.has(status)
 
-/** `●` done ok · `◑` partial · `✗` failed · `◐` running · `○` to do; `◎` for a consult panel. */
+/** `●` done ok · `◑` partial · `✗` failed · `◐` running · `⊘` stale · `○` to do; `◎` for a consult panel. */
 export const workGlyph = (status: string): string =>
   status === 'done' || status === 'ok'
     ? '●'
@@ -2287,16 +2290,20 @@ export const workGlyph = (status: string): string =>
       ? '◑'
       : status === 'failed' || status === 'refused' || status === 'blocked'
         ? '✗'
-        : isRunningStatus(status)
-          ? '◐'
-          : '○'
+        : status === 'stale'
+          ? '⊘'
+          : status === 'queued'
+            ? '○'
+            : isRunningStatus(status)
+              ? '◐'
+              : '○'
 
 /** Only to-do and blocked units wait their turn; done, failed and partial are behind. */
 export const isTodoStatus = (status: string) => status === 'todo' || status === 'blocked' || status === '' || status === 'queued' || status === 'dry'
 
 /** The one status a box of units adds up to. */
 export const sumStatus = (statuses: readonly string[]): string =>
-  statuses.some(isRunningStatus)
+  statuses.some(s => s === 'running' || s === 'parked' || s === 'need_tool' || s === 'doing')
     ? 'running'
     : statuses.some(s => s === 'failed' || s === 'refused')
       ? 'failed'
@@ -2380,14 +2387,18 @@ export type WorkLeaf = {
   id: string
   kind: 'job' | 'agy' | 'consult' | 'card'
   glyph: string
+  /** The role written before the name: `farmer`, `helper`, `consult`. */
+  role: string
   name: string
+  /** `▸ <model>` when one is known, '' otherwise. */
   worker: string
-  /** A short note after the name (`5/7` for a consult, a strip for a deeper coordinator). */
+  /** A short note after the name (`3 engines · 4/7` for a consult). */
   note: string
   status: string
   startedAt: number
   endedAt: number | null
   isLive: boolean
+  isStale: boolean
   isRealRepo: boolean
   verifyPending: boolean
   /** The card whose box holds it; '' for main. */
@@ -2419,6 +2430,10 @@ export type WorkEntry = {
 
 export type WorkBox = {
   id: string
+  /** The role written in the header: `sub-main`. */
+  role: string
+  /** The mesh task its brief names, '' when none. */
+  task: string
   title: string
   glyph: string
   status: string
@@ -2426,7 +2441,6 @@ export type WorkBox = {
   startedAt: number
   endedAt: number | null
   isLive: boolean
-  last: string
   entries: WorkEntry[]
   collapsed: boolean
 }
@@ -2439,6 +2453,10 @@ export type WorkTree = {
   startedAt: number
   endedAt: number | null
   isLive: boolean
+  /** Live workers and live sub-main headers. */
+  running: number
+  /** Waiting workers plus the open plan steps of every sub-main. */
+  waiting: number
   entries: WorkEntry[]
   boxes: WorkBox[]
   collapsed: boolean
@@ -2453,23 +2471,30 @@ export type WorkInput = {
   now: number
   /** The selected leaf (`view.expanded`), whose rows expand under it. */
   expanded?: string | null
+  /** When the current turn started: a failed row stays until the next turn starts. */
+  turnStartedAt?: number
 }
+
+const lastEventOf = (c: AgentCard) => (typeof c.lastAt === 'number' && c.lastAt > 0 ? c.lastAt : c.spawnedAt)
 
 const jobWorkLeaf = (j: Job, issued: readonly Issued[]): WorkLeaf => {
   const live = isJobLive(j)
+  const stale = j.stale === true
   const worker = live ? j.trying || j.backend : j.handoffBackend || j.backend || j.trying
   const stage = j.stage ? `stage ${j.stage}${j.attempts > 1 ? ` ×${j.attempts}` : ''}` : ''
   return {
     id: `job:${j.jobid}`,
     kind: 'job',
-    glyph: jobGlyph(j),
+    glyph: stale ? '⊘' : jobGlyph(j),
+    role: 'farmer',
     name: j.job || j.jobid,
     worker: workerDisplay(worker),
     note: '',
-    status: j.status,
+    status: stale ? 'stale' : j.status,
     startedAt: jobStartOf(j.jobid, j.ts * 1000),
-    endedAt: live ? null : j.endedAt,
+    endedAt: live ? null : j.endedAt ?? (stale ? j.ts * 1000 : null),
     isLive: live,
+    isStale: stale,
     isRealRepo: false,
     verifyPending: false,
     owner: ownerOfJob(issued, j.jobid),
@@ -2490,7 +2515,8 @@ const agyWorkLeaf = (i: Issued): WorkLeaf => {
   return {
     id: `agy:${i.callId}`,
     kind: 'agy',
-    glyph: live ? '◐' : i.ok === false ? '✗' : '●',
+    glyph: live ? '◐' : i.ok === false ? '✗' : '✓',
+    role: 'farmer',
     name: `${i.name || 'agy job'}`,
     worker: agyWorker(i.worker, i.model, i.effort),
     note: '',
@@ -2498,6 +2524,7 @@ const agyWorkLeaf = (i: Issued): WorkLeaf => {
     startedAt: i.at,
     endedAt: i.endedAt,
     isLive: live,
+    isStale: false,
     isRealRepo: true,
     verifyPending: i.verifyPending,
     owner: i.agentId,
@@ -2532,13 +2559,15 @@ const consultWorkLeaf = (i: Issued, run: ConsultRun | null): WorkLeaf => {
     id: `consult:${bound?.id || i.callId}`,
     kind: 'consult',
     glyph: '◎',
-    name: bound ? `panel ${consultKindLabel(bound.kind)} R${bound.round}` : 'panel',
+    role: '',
+    name: 'consult',
     worker: '',
-    note: bound ? `${answered}/${total}` : '',
+    note: total > 0 ? `· ${total} engines · ${answered}/${total}` : '',
     status: live ? 'running' : failed ? 'partial' : 'done',
     startedAt: bound ? bound.startedAt : i.at,
     endedAt: bound ? bound.endedAt : i.endedAt,
     isLive: live,
+    isStale: bound?.stale === true,
     isRealRepo: false,
     verifyPending: false,
     owner: i.agentId,
@@ -2549,19 +2578,22 @@ const consultWorkLeaf = (i: Issued, run: ConsultRun | null): WorkLeaf => {
   }
 }
 
-const cardWorkLeaf = (c: AgentCard): WorkLeaf => {
-  const live = c.status === 'running'
+const cardWorkLeaf = (c: AgentCard, now: number): WorkLeaf => {
+  const stale = c.status === 'running' && now - lastEventOf(c) > STALE_AFTER_MS
+  const live = c.status === 'running' && !stale
   return {
     id: c.id,
     kind: 'card',
-    glyph: workGlyph(c.status),
+    glyph: stale ? '⊘' : workGlyph(c.status),
+    role: c.type || 'agent',
     name: cardTitle(c),
     worker: c.worker ? workerDisplay(c.worker) : '',
     note: '',
-    status: c.status,
+    status: stale ? 'stale' : c.status,
     startedAt: c.spawnedAt,
-    endedAt: c.endedAt,
+    endedAt: c.endedAt !== null ? c.endedAt : stale ? lastEventOf(c) + STALE_AFTER_MS : null,
     isLive: live,
+    isStale: stale,
     isRealRepo: false,
     verifyPending: false,
     owner: c.parentId,
@@ -2578,22 +2610,25 @@ const cardWorkLeaf = (c: AgentCard): WorkLeaf => {
 }
 
 /** A coordinator that is not a root box draws as a line with its own strip. */
-const coordWorkLeaf = (c: AgentCard, workers: readonly WorkLeaf[]): WorkLeaf => {
+const coordWorkLeaf = (c: AgentCard, workers: readonly WorkLeaf[], now: number): WorkLeaf => {
   const statuses = workers.map(l => l.status)
   const status = sumStatus(statuses)
   const live = workers.some(l => l.isLive)
   const ends = workers.map(l => l.endedAt).filter((n): n is number => n !== null)
+  const stale = c.status === 'running' && now - lastEventOf(c) > STALE_AFTER_MS
   return {
     id: c.id,
     kind: 'card',
-    glyph: workGlyph(status),
+    glyph: stale && !live ? '⊘' : workGlyph(status),
+    role: c.type || 'agent',
     name: cardTitle(c),
     worker: '',
     note: stripText(stripOf(statuses)),
-    status,
+    status: stale && !live ? 'stale' : status,
     startedAt: c.spawnedAt,
     endedAt: live || ends.length !== workers.length ? null : Math.max(...ends),
     isLive: live,
+    isStale: stale,
     isRealRepo: false,
     verifyPending: false,
     owner: c.parentId,
@@ -2618,9 +2653,16 @@ const entriesOf = (l: WorkLeaf, depth: number, detail: boolean, expanded?: strin
     : []),
 ]
 
+/** `3 steps left: snapshots · docs · review` for a sub-main's open plan items, '' when none. */
+export const stepsLeftText = (open: readonly string[], max = 80): string => {
+  if (open.length === 0) return ''
+  const head = `${open.length} step${open.length === 1 ? '' : 's'} left: `
+  return shorten(`${head}${open.join(' · ')}`, max)
+}
+
 /**
- * The whole delegation as one tree (rule 2): main's box holds the mesh tasks with their workers, its
- * sub-main boxes and its loose workers; each sub-main box holds its checkpoint plan and its workers.
+ * The whole delegation as one tree: main's sub-main headers, each with its workers and one steps-left
+ * row, then main's loose workers. Only live work, waiting work and work ended under a minute ago.
  */
 export const buildWork = (input: WorkInput): WorkTree => {
   const now = input.now
@@ -2648,7 +2690,14 @@ export const buildWork = (input: WorkInput): WorkTree => {
     return ''
   }
 
-  const keepLeaf = (l: WorkLeaf): boolean => l.isLive || l.endedAt === null || now - l.endedAt <= DONE_KEEP_MS
+  const turnAt = input.turnStartedAt ?? 0
+  const isFailed = (s: string) => s === 'failed' || s === 'refused'
+  // A failed row stays until the next turn starts; every other ended row leaves after a minute.
+  const keepLeaf = (l: WorkLeaf): boolean =>
+    l.isLive ||
+    l.endedAt === null ||
+    (isFailed(l.status) && (turnAt <= 0 || l.endedAt >= turnAt)) ||
+    now - l.endedAt <= DONE_KEEP_MS
 
   const rawLeaves: WorkLeaf[] = []
   for (const j of orderJobs(input.jobs, now)) rawLeaves.push(jobWorkLeaf(j, input.issued))
@@ -2656,7 +2705,7 @@ export const buildWork = (input: WorkInput): WorkTree => {
     if (i.kind === 'agy' && (i.endedAt === null || now - i.endedAt <= DONE_KEEP_MS)) rawLeaves.push(agyWorkLeaf(i))
     if (i.kind === 'consult' && consultShown(i, input.run, now)) rawLeaves.push(consultWorkLeaf(i, input.run))
   }
-  for (const c of cards) if (!hasKids(c.id)) rawLeaves.push(cardWorkLeaf(c))
+  for (const c of cards) if (!hasKids(c.id)) rawLeaves.push(cardWorkLeaf(c, now))
 
   const leaves = rawLeaves.filter(keepLeaf)
   const directOf = (id: string, src: readonly WorkLeaf[] = leaves) => src.filter(l => l.owner === id)
@@ -2666,136 +2715,93 @@ export const buildWork = (input: WorkInput): WorkTree => {
 
   const roots = cards.filter(c => hasKids(c.id) && boxOf(c.id) === c.id)
   const deeps = cards.filter(c => hasKids(c.id) && boxOf(c.id) !== c.id)
+  const taskById = new Map(input.tasks.filter(t => t.id).map(t => [t.id, t]))
 
   const subBox = (c: AgentCard): WorkBox | null => {
     const boxDeeps = deeps.filter(x => boxOf(x.id) === c.id)
     const rawAll = [...directOf(c.id, rawLeaves), ...boxDeeps.flatMap(d => underOf(d.id, c.id, rawLeaves))]
-    const isBoxLive = c.status === 'running' || rawAll.some(l => l.isLive) || boxDeeps.some(d => d.status === 'running')
+    const keptAll = rawAll.filter(keepLeaf)
+    const cardStale = c.status === 'running' && now - lastEventOf(c) > STALE_AFTER_MS
+    const isBoxLive = (c.status === 'running' && !cardStale) || keptAll.some(l => l.isLive) || boxDeeps.some(d => d.status === 'running')
     let boxEnd: number | null = null
     if (!isBoxLive) {
-      const ends = [c.endedAt, ...rawAll.map(l => l.endedAt), ...boxDeeps.map(d => d.endedAt)].filter((n): n is number => n !== null)
-      if (rawAll.every(l => l.endedAt !== null) && ends.length > 0) boxEnd = Math.max(...ends)
+      const cardEnd = c.status === 'running' ? (cardStale ? lastEventOf(c) + STALE_AFTER_MS : null) : c.endedAt
+      const ends = [cardEnd, ...keptAll.map(l => l.endedAt), ...boxDeeps.map(d => d.endedAt)].filter((n): n is number => n !== null)
+      if (ends.length > 0) boxEnd = Math.max(...ends)
     }
-    if (boxEnd !== null && now - boxEnd > DONE_KEEP_MS) return null
-    const collapsed = boxEnd !== null && now - boxEnd > COLLAPSE_AFTER_MS
+    const keepsAFailure = keptAll.some(l => isFailed(l.status) && l.endedAt !== null && (turnAt <= 0 || l.endedAt >= turnAt))
+    if (boxEnd !== null && now - boxEnd > DONE_KEEP_MS && !keepsAFailure) return null
 
     const workers = orderWorkLeaves(directOf(c.id))
     const check = c.check
-    const steps = check?.steps ?? []
     const open = check?.open ?? []
-    // The plan in order: steps done, the worker on the current one, then the open items.
-    const statuses = [...steps.map(s => (s.ok ? 'done' : 'failed')), ...workers.map(l => l.status), ...open.map(() => 'todo')]
+    const statuses = [...workers.map(l => l.status), ...open.map(() => 'todo')]
     const entries: WorkEntry[] = []
-    if (check?.last) entries.push({ kind: 'last', depth: 0, text: check.last })
-    // An ended sub-main's own report: `status DONE · tests 72/72`.
-    if (c.status !== 'running' && (check?.status || check?.tests)) {
-      entries.push({ kind: 'closing', depth: 0, text: [check?.status ? `status ${check.status}` : '', check?.tests ? `tests ${check.tests}` : ''].filter(Boolean).join(' · ') })
-    }
-    for (const l of workers.filter(w => w.isLive)) entries.push(...entriesOf(l, 0, true, exp))
-    for (const o of open) entries.push({ kind: 'step', depth: 0, text: o, status: 'todo', todo: true })
-    const behind = workers.filter(w => !w.isLive)
-    const doneWorkers = behind.filter(w => !isTodoStatus(w.status))
-    for (const l of behind.filter(w => isTodoStatus(w.status))) entries.push(...entriesOf(l, 0, false, exp))
-    for (const l of doneWorkers.slice(0, 2)) entries.push(...entriesOf(l, 0, false, exp))
-    const moreDone = Math.max(0, doneWorkers.length - 2)
-    const moreSteps = Math.max(0, steps.length - 2)
-    if (moreDone + moreSteps > 0) entries.push({ kind: 'more', depth: 0, count: moreDone + moreSteps })
+    for (const l of workers.filter(w => w.isLive)) entries.push(...entriesOf(l, 0, false, exp))
+    for (const l of workers.filter(w => !w.isLive)) entries.push(...entriesOf(l, 0, false, exp))
     for (const d of boxDeeps) {
       const keptUnder = underOf(d.id, c.id)
       const rawUnder = underOf(d.id, c.id, rawLeaves)
       const dLive = d.status === 'running' || rawUnder.some(l => l.isLive)
-      const dEnds = [d.endedAt, ...rawUnder.map(l => l.endedAt)].filter((n): n is number => n !== null)
+      const dEnds = [d.status === 'running' ? null : d.endedAt, ...rawUnder.map(l => l.endedAt)].filter((n): n is number => n !== null)
       const dEnd = !dLive && rawUnder.every(l => l.endedAt !== null) && dEnds.length > 0 ? Math.max(...dEnds) : null
       if (dEnd !== null && now - dEnd > DONE_KEEP_MS) continue
-      const dl = coordWorkLeaf(d, keptUnder)
+      const dl = coordWorkLeaf(d, keptUnder, now)
       entries.push({ kind: 'leaf', depth: 0, leaf: dl, done: !dl.isLive })
     }
-    if (!isBoxLive && entries.length === 0 && !collapsed) return null
+    const steps = stepsLeftText(open)
+    if (steps) entries.push({ kind: 'step', depth: 0, text: steps, status: 'todo', todo: true, count: open.length })
+    if (!isBoxLive && entries.length === 0) return null
     const startedEnds = [c.spawnedAt, ...workers.map(w => w.startedAt)].filter(n => n > 0)
-    const boxStatus = isBoxLive ? 'running' : sumStatus(statuses)
+    const boxStatus = isBoxLive ? 'running' : cardStale ? 'stale' : sumStatus(statuses)
+    const role = c.type || 'sub-main'
+    const subject = taskById.get(c.task)?.subject ?? ''
     return {
       id: c.id,
-      title: `${c.type || 'sub-main'}${c.task ? ` · ${c.task}` : ''}`,
+      role,
+      task: c.task,
+      title: `${role}${c.task ? ` · ${c.task}${subject ? ` ${subject}` : ''}` : ''}`,
       glyph: workGlyph(boxStatus),
       status: boxStatus,
       strip: stripOf(statuses),
       startedAt: startedEnds.length > 0 ? Math.min(...startedEnds) : 0,
       endedAt: boxEnd,
       isLive: isBoxLive,
-      last: check?.last ?? '',
       entries,
-      collapsed,
+      collapsed: false,
     }
   }
 
-  const plan = input.tasks.filter(t => t.id)
-  const taskById = new Map(plan.map(t => [t.id, t]))
-  const rank: Record<string, number> = { doing: 0, running: 0, todo: 1, blocked: 1, done: 2, ok: 2 }
-  const tasks = [...plan].sort((a, b) => (rank[a.status] ?? 1) - (rank[b.status] ?? 1))
-
-  const mainLeaves = orderWorkLeaves(leaves.filter(l => boxOf(l.owner) === ''))
-  const groups = new Map<string, WorkLeaf[]>()
-  const loose: WorkLeaf[] = []
-  for (const l of mainLeaves) {
-    if (l.task && taskById.has(l.task)) {
-      const list = groups.get(l.task)
-      if (list) list.push(l)
-      else groups.set(l.task, [l])
-    } else loose.push(l)
-  }
-
-  const entries: WorkEntry[] = []
-  const used = new Set<string>()
-  for (const t of tasks) {
-    const ls = groups.get(t.id) ?? []
-    if (ls.length === 0 && t.status !== 'doing') continue
-    used.add(t.id)
-    entries.push({ kind: 'task', depth: 0, text: `${t.id}${t.subject ? ` ${t.subject}` : ''}`, status: t.status })
-    for (const l of orderWorkLeaves(ls)) entries.push(...entriesOf(l, 1, true, exp))
-  }
   const boxes = [...roots]
     .map(subBox)
     .filter((b): b is WorkBox => b !== null)
-    .sort((a, b) => {
-      const ta = byId.get(a.id)?.task ?? ''
-      const tb = byId.get(b.id)?.task ?? ''
-      return (
-        Number(b.isLive) - Number(a.isLive) ||
-        (rank[taskById.get(ta)?.status ?? ''] ?? 1) - (rank[taskById.get(tb)?.status ?? ''] ?? 1) ||
-        (byId.get(a.id)?.spawnedAt ?? 0) - (byId.get(b.id)?.spawnedAt ?? 0)
-      )
-    })
-  for (const b of boxes) entries.push({ kind: 'box', depth: 0, box: b })
-  for (const l of loose) entries.push(...entriesOf(l, 0, true, exp))
-  const rest = tasks.filter(t => !used.has(t.id) && (t.status === 'todo' || t.status === 'blocked'))
-  if (rest.length > 0) entries.push({ kind: 'closing', depth: 0, text: rest.map(t => `○ ${t.id}${t.subject ? ` ${shorten(t.subject, 18)}` : ''}`).join(' · ') })
+    .sort((a, b) => Number(b.isLive) - Number(a.isLive) || (a.status === 'todo' ? -1 : 0) - (b.status === 'todo' ? -1 : 0) || a.startedAt - b.startedAt)
 
-  const isLive = leaves.some(l => l.isLive) || boxes.some(b => b.isLive)
-  const allTasksDone = plan.length > 0 && plan.every(t => t.status === 'done' || t.status === 'ok')
-  const anyTaskDoing = plan.some(t => isRunningStatus(t.status))
-  if (allTasksDone && !isLive && entries.length === 0 && boxes.length === 0) {
-    entries.push({ kind: 'closing', depth: 0, text: `all done · ${plural(plan.length, 'task')}` })
-  }
+  const mainLeaves = orderWorkLeaves(leaves.filter(l => boxOf(l.owner) === ''))
+  const entries: WorkEntry[] = []
+  for (const b of boxes) entries.push({ kind: 'box', depth: 0, box: b })
+  for (const l of mainLeaves) entries.push(...entriesOf(l, 0, false, exp))
+
+  const runningInside = boxes.reduce((n, b) => n + b.entries.filter(e => e.kind === 'leaf' && e.leaf?.isLive).length, 0)
+  const running = mainLeaves.filter(l => l.isLive).length + boxes.filter(b => b.isLive).length + runningInside
+  const openSteps = boxes.reduce((n, b) => n + b.entries.filter(e => e.kind === 'step').reduce((m, e) => m + (e.count ?? 0), 0), 0)
+  const waitingLeaves = mainLeaves.filter(l => !l.isLive && isTodoStatus(l.status)).length + boxes.reduce((n, b) => n + b.entries.filter(e => e.kind === 'leaf' && e.leaf && !e.leaf.isLive && isTodoStatus(e.leaf.status)).length, 0)
+  const waiting = waitingLeaves + openSteps
 
   const starts = [...leaves.map(l => l.startedAt), ...boxes.map(b => b.startedAt)].filter(n => n > 0)
   const ends = [...leaves.map(l => l.endedAt), ...boxes.map(b => b.endedAt)]
-  const endedAll = !isLive && ends.length > 0 && ends.every((n): n is number => n !== null) ? Math.max(...ends) : null
-  const stripStatuses = plan.length > 0 ? plan.map(t => t.status) : mainLeaves.map(l => l.status)
-  const allDone =
-    plan.length > 0
-      ? allTasksDone
-      : stripStatuses.length > 0
-        ? stripStatuses.every(s => s === 'done' || s === 'ok')
-        : boxes.length > 0 && boxes.every(b => b.status === 'done' || b.status === 'ok')
-  const treeStatus = isLive || anyTaskDoing ? 'running' : allDone ? 'done' : 'todo'
+  const endedAll = running === 0 && ends.length > 0 && ends.every((n): n is number => n !== null) ? Math.max(...ends) : null
+  const status = running > 0 ? 'running' : waiting > 0 ? 'todo' : 'done'
   return {
-    title: "WORK · main's tasks",
-    glyph: workGlyph(treeStatus),
-    status: treeStatus,
-    strip: stripOf(stripStatuses),
+    title: `running ${running} · waiting ${waiting}`,
+    glyph: workGlyph(status),
+    status,
+    strip: stripOf(mainLeaves.map(l => l.status)),
     startedAt: starts.length > 0 ? Math.min(...starts) : 0,
     endedAt: endedAll,
-    isLive,
+    isLive: running > 0,
+    running,
+    waiting,
     entries,
     boxes,
     collapsed: false,
@@ -2803,108 +2809,164 @@ export const buildWork = (input: WorkInput): WorkTree => {
 }
 
 /** Whether the tree has anything to draw: no worker and no task takes no room. */
-export const isWorkEmpty = (w: WorkTree) => w.entries.length === 0 && w.boxes.length === 0
+export const isWorkEmpty = (w: WorkTree) => w.entries.length === 0
 
-const isLiveEntry = (e: WorkEntry) => (e.kind === 'leaf' ? Boolean(e.leaf?.isLive) : false)
+/** How many rows a box takes when drawn: its header line plus a line per body entry. */
+export const workBoxRows = (b: WorkBox, _cols = 0): number => 1 + b.entries.length
 
-/** A box's rows when selected: every leaf and step row, the last row and the closing line, in order. */
-const bodyRows = (entries: readonly WorkEntry[], cols: number): WorkEntry[] => {
-  const out: WorkEntry[] = []
-  for (const e of entries) {
-    if (e.kind === 'detail' && cols < WORK_DETAIL_COLS) continue
-    out.push(e)
-  }
-  return out
-}
-
-/** A box entry costs no row of its own: the nested box draws them. */
-const entryRows = (e: WorkEntry): number => (e.kind === 'box' ? 0 : 1)
-
-/** How many rows a box takes when drawn: header and border, plus a line per body entry. */
-export const workBoxRows = (b: WorkBox, cols: number): number =>
-  b.collapsed || cols < WORK_NARROW ? 1 : 2 + 1 + bodyRows(b.entries, cols).reduce((n, e) => n + entryRows(e), 0)
-
-/** How many rows the whole tree takes at `cols`, nested boxes included. */
-export const workRows = (w: WorkTree, cols: number): number =>
-  w.collapsed || cols < WORK_NARROW
-    ? 1 + w.boxes.reduce((n, b) => n + 1, 0)
-    : 4 + bodyRows(w.entries, cols).reduce((n, e) => n + entryRows(e), 0) + w.boxes.reduce((n, b) => n + workBoxRows(b, cols), 0)
+/** How many rows the whole tree takes at `cols`, the frame's two rows included. */
+export const workRows = (w: WorkTree, _cols = 0): number =>
+  w.entries.length === 0
+    ? 0
+    : 2 + w.entries.reduce((n, e) => n + (e.kind === 'box' && e.box ? workBoxRows(e.box) : 1), 0)
 
 /**
- * The tree at most `budget` rows tall, dropping in the rule 6 order and across all boxes evenly
- * (largest box first): detail lines, dimmed done lines, deeper to-do lines into `+N more`, then
- * nested box bodies down to header + strip + running lines.
+ * The tree at most `budget` rows tall: expanded rows first, then ended leaves, then whole boxes from
+ * the end, then steps-left rows and finally waiting rows, keeping live work to the last.
  */
 export const fitWork = (w: WorkTree, budget: number, cols: number): WorkTree => {
-  const next: WorkTree = { ...w, entries: [...w.entries], boxes: w.boxes.map(b => ({ ...b, entries: [...b.entries] })) }
+  // One clone per box, shared by `boxes` and the entries that draw it, so a fit that trims a box
+  // body really trims what workRows and the renderer see.
+  const boxes = w.boxes.map(b => ({ ...b, entries: [...b.entries] }))
+  const byId = new Map(boxes.map(b => [b.id, b]))
+  const next: WorkTree = {
+    ...w,
+    entries: w.entries.map(e => (e.box ? { ...e, box: byId.get(e.box.id) ?? { ...e.box, entries: [...e.box.entries] } } : { ...e })),
+    boxes,
+  }
   const total = () => workRows(next, cols)
   if (total() <= budget) return next
   const lists = (): WorkEntry[][] => [next.entries, ...next.boxes.map(b => b.entries)]
-  const drop = (kind: WorkEntry['kind'], doneOnly = false): boolean => {
-    let best: WorkEntry[] | null = null
-    for (const list of lists()) {
-      const n = list.filter(e => e.kind === kind && (!doneOnly || e.done)).length
-      if (n > 0 && (!best || n > best.filter(e => e.kind === kind).length)) best = list
-    }
-    if (!best) return false
-    const idx = doneOnly ? best.findIndex(e => e.kind === kind && e.done) : best.findIndex(e => e.kind === kind)
-    if (idx < 0) return false
-    best.splice(idx, 1)
-    return true
-  }
-  const fold = (): boolean => {
-    let best: WorkEntry[] | null = null
-    let bestN = 0
-    for (const list of lists()) {
-      const n = list.filter(e => e.todo).length
-      if (n > bestN) {
-        bestN = n
-        best = list
+  const dropLast = (pred: (e: WorkEntry, inBox: boolean) => boolean): boolean => {
+    for (const inBox of [true, false]) {
+      const list = inBox ? lists().slice(1).sort((a, b) => b.length - a.length)[0] : next.entries
+      if (!list) continue
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        if (pred(list[i]!, inBox)) {
+          list.splice(i, 1)
+          return true
+        }
       }
     }
-    if (!best) return false
-    const idx = best.map(e => Boolean(e.todo)).lastIndexOf(true)
-    if (idx < 0) return false
-    best.splice(idx, 1)
-    const more = best.find(e => e.kind === 'more')
-    if (more) more.count = (more.count ?? 0) + 1
-    else best.push({ kind: 'more', depth: 0, count: 1 })
-    return true
-  }
-  const shrinkBoxes = (): boolean => {
-    const box = next.boxes.filter(b => !b.collapsed && b.entries.some(e => !isLiveEntry(e) || e.kind === 'detail')).sort((a, b) => b.entries.length - a.entries.length)[0]
-    if (!box) return false
-    box.entries = box.entries.filter(isLiveEntry)
-    return true
-  }
-  const collapseThem = (): boolean => {
-    const box = next.boxes.filter(b => !b.collapsed && b.entries.length > 0).sort((a, b) => b.entries.length - a.entries.length)[0]
-    if (!box) return false
-    box.collapsed = true
-    box.entries = []
-    return true
+    return false
   }
   let guard = 0
-  while (total() > budget && guard < 400) {
+  while (total() > budget && guard < 300) {
     guard += 1
-    if (drop('detail')) continue
-    if (drop('leaf', true)) continue
-    if (fold()) continue
-    if (shrinkBoxes()) continue
-    if (drop('last')) continue
-    if (drop('closing')) continue
-    if (drop('leaf')) continue
-    if (collapseThem()) continue
+    if (dropLast(e => e.kind === 'expand', true)) continue
+    if (dropLast(e => e.kind === 'leaf' && Boolean(e.leaf && !e.leaf.isLive && !isTodoStatus(e.leaf.status)), true)) continue
+    if (next.boxes.length > 0 && total() > budget) {
+      const gone = next.boxes.pop()!
+      next.entries = next.entries.filter(e => e.box?.id !== gone.id)
+      continue
+    }
+    if (dropLast(e => e.kind === 'step', true)) continue
+    if (dropLast(e => e.kind === 'leaf' && Boolean(e.leaf && !e.leaf.isLive), true)) continue
+    if (dropLast(e => e.kind === 'leaf', true)) continue
     break
   }
-  // Still too tall: drop nested boxes from the end, then every row, then the box itself to its line.
-  while (total() > budget && next.boxes.length > 0) {
-    const gone = next.boxes.pop()!
-    next.entries = next.entries.filter(e => e.box !== gone)
-  }
-  if (total() > budget) next.entries = []
-  if (total() > budget) next.collapsed = true
   return next
+}
+
+// ---------------------------------------------------------------- plan
+
+/** The mesh task ids a sub-main's brief names: a task row draws `→ sub-main` for each. */
+export const subMainTasks = (cards: readonly AgentCard[]): Set<string> =>
+  new Set(cards.filter(c => !c.parentId && c.task && /sub-main/i.test(c.type)).map(c => c.task))
+
+export type PlanFit = { rows: MeshTask[]; more: number; isDone: boolean }
+
+/**
+ * The plan's rows: the doing task first, then the to-do ones, then the done ones. With too few rows
+ * it keeps the doing task and the next to-do ones, and folds the rest into one `+N done` (or `+N more`).
+ */
+export const fitPlan = (tasks: readonly MeshTask[], budget: number): PlanFit => {
+  const plan = tasks.filter(t => t.id)
+  const isDoing = (s: string) => s === 'doing' || s === 'running'
+  const doing = plan.filter(t => isDoing(t.status))
+  const todo = plan.filter(t => !isDoing(t.status) && isTodoStatus(t.status))
+  const done = plan.filter(t => !isDoing(t.status) && !isTodoStatus(t.status))
+  const all = [...doing, ...todo, ...done]
+  // The whole plan keeps the file's order; only a short pane puts the doing and to-do rows first.
+  if (plan.length <= budget) return { rows: plan, more: 0, isDone: false }
+  if (budget <= 1) return { rows: all.slice(0, Math.max(0, budget)), more: 0, isDone: false }
+  const room = Math.max(1, budget - (done.length > 0 ? 1 : 0))
+  const shown = [...doing, ...todo].slice(0, room)
+  // The line under the rows counts the done tasks left out, never the to-do ones still ahead.
+  return { rows: shown, more: done.length, isDone: true }
+}
+
+// ---------------------------------------------------------------- consult text
+
+/** The first sentence of a question, up to `:`, `.`, `?` or a newline. */
+export const firstSentence = (text: string): string => {
+  const raw = text.trim()
+  const m = /^[^:.?\n]*[:.?\n]/.exec(raw)
+  return (m ? m[0] : raw).replace(/\s+/g, ' ').trim()
+}
+
+/** The question as one quoted line, or '' when the whole first sentence does not fit `width`. */
+export const questionLine = (question: string, width: number): string => {
+  const sentence = firstSentence(question)
+  if (!sentence) return ''
+  const line = `“${sentence}”`
+  return cellWidth(line) <= width ? line : ''
+}
+
+/** The model an engine runs: its `model` field, else the part after the first `:` in its name. */
+export const engineModel = (e: Pick<ConsultEngine, 'name' | 'model'>): string => {
+  if (typeof e.model === 'string' && e.model.trim()) return e.model.trim()
+  const i = e.name.indexOf(':')
+  return i >= 0 ? e.name.slice(i + 1).trim() : ''
+}
+
+/** `✓ 8/9 answered · ⊘ codex` at the end of a run: names shorten, the counts never do. */
+export const consultSummaryLine = (run: ConsultRun, width: number): string => {
+  const total = run.engines.length
+  const answered = run.engines.filter(e => e.state === 'ok').length
+  let line = `✓ ${answered}/${total} answered`
+  const names = [
+    ...run.engines.filter(e => e.state === 'skipped').map(e => `⊘ ${shortConsultEngine(e.name)}`),
+    ...run.engines.filter(e => e.state === 'failed').map(e => `✗ ${shortConsultEngine(e.name)}`),
+  ]
+  let omitted = false
+  for (const name of names) {
+    const next = `${line} · ${name}`
+    if (cellWidth(next) <= width) line = next
+    else omitted = true
+  }
+  if (omitted && names.length > 0) {
+    const tail = `${line} · …`
+    if (cellWidth(tail) <= width) line = tail
+  }
+  return line
+}
+
+/** `⊘ codex until 22:54` for every locked or skipped engine, on one line, or '' when none. */
+export const consultLockNote = (run: ConsultRun | null, locks: readonly { engine: string; hhmm: string }[], width: number): string => {
+  const seen = new Set<string>()
+  const parts: string[] = []
+  for (const lk of locks) {
+    const name = shortConsultEngine(lk.engine)
+    if (seen.has(name)) continue
+    seen.add(name)
+    parts.push(`⊘ ${name} until ${lk.hhmm}`)
+  }
+  for (const e of run?.engines ?? []) {
+    if (e.state !== 'skipped') continue
+    const name = shortConsultEngine(e.name)
+    if (seen.has(name)) continue
+    seen.add(name)
+    const at = /(\d{1,2}:\d{2})\s*$/.exec(e.reason ?? '')
+    parts.push(at ? `⊘ ${name} until ${at[1]}` : `⊘ ${name}`)
+  }
+  if (parts.length === 0) return ''
+  let line = parts[0]!
+  for (const part of parts.slice(1)) {
+    const next = `${line} · ${part}`
+    if (cellWidth(next) <= width) line = next
+  }
+  return shorten(line, width)
 }
 
 const isEngineState = (v: unknown): v is ConsultEngineState =>
@@ -2919,6 +2981,7 @@ const normalizeEngine = (raw: unknown): ConsultEngine | null => {
     endedAt: typeof raw.endedAt === 'number' && Number.isFinite(raw.endedAt) ? raw.endedAt : null,
     reason: typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason.trim() : null,
     note: typeof raw.note === 'string' && raw.note.trim() ? raw.note.trim() : null,
+    ...(typeof raw.model === 'string' && raw.model.trim() ? { model: raw.model.trim() } : {}),
   }
 }
 
@@ -2933,7 +2996,8 @@ const normalizeConsultRun = (raw: unknown): ConsultRun | null => {
     kind: typeof raw.kind === 'string' && raw.kind.trim() ? raw.kind.trim() : 'all',
     startedAt: typeof raw.startedAt === 'number' && Number.isFinite(raw.startedAt) ? raw.startedAt : 0,
     endedAt,
-    question: typeof raw.question === 'string' ? raw.question.replace(/\s+/g, ' ').trim() : '',
+    // Newlines stay: the question line stops at the first one.
+    question: typeof raw.question === 'string' ? raw.question.replace(/[ \t]+/g, ' ').trim() : '',
     round: typeof raw.round === 'number' && Number.isFinite(raw.round) && raw.round >= 1 ? Math.round(raw.round) : 1,
     rounds: typeof raw.rounds === 'number' && Number.isFinite(raw.rounds) && raw.rounds >= 1 ? Math.round(raw.rounds) : 1,
     engines,
@@ -3033,7 +3097,7 @@ export const activeConsultLocks = (
 
 export type RingCell = { x: number; y: number; glyph: string }
 export type RingArcCell = RingCell & { lineGlyph: string; arrowGlyph: string; isArrow: boolean }
-export type RingNodeInput = { label: string; width: number; glyph?: string; name?: string; dur?: string }
+export type RingNodeInput = { label: string; width: number; glyph?: string; name?: string; dur?: string; model?: string }
 export type RingNodePos = {
   label: string
   width: number
@@ -3043,6 +3107,11 @@ export type RingNodePos = {
   labelX: number
   labelY: number
   align: 'left' | 'right' | 'center'
+  /** Its model, drawn in one dim row under the label; undefined = no row. */
+  model?: string
+  modelX?: number
+  modelY?: number
+  modelWidth?: number
 }
 export type RingBox = { x: number; y: number; width: number; height: number }
 export type RingLayout = {
@@ -3085,7 +3154,7 @@ const bresenham = (x0: number, y0: number, x1: number, y1: number): Pt[] => {
   return pts
 }
 
-// A straight raster line can round to either side to leave a cell between close spokes.
+// A straight raster line can round to either side; keep the variants so close spokes can choose.
 const spokeLines = (from: Pt, to: Pt): Pt[][] => {
   const paths = [bresenham(from.x, from.y, to.x, to.y)]
   const dx = to.x - from.x
@@ -3169,8 +3238,13 @@ const fitRingLabel = (nd: RingNodeInput, room: number): string => {
   return shorten(nd.label, room)
 }
 
+/** Any cell a label or its model row owns: spokes and arc arrowheads keep out. */
 const isNodeLabelCell = (nodes: readonly RingNodePos[], x: number, y: number): boolean =>
-  nodes.some(nd => y === nd.labelY && x >= nd.labelX && x < nd.labelX + nd.width)
+  nodes.some(
+    nd =>
+      (y === nd.labelY && x >= nd.labelX && x < nd.labelX + nd.width) ||
+      (nd.model !== undefined && nd.modelWidth !== undefined && nd.modelX !== undefined && y === nd.modelY && x >= nd.modelX && x < nd.modelX + nd.modelWidth),
+  )
 
 const angDiff = (a: number, b: number): number => Math.abs(((a - b + 3 * Math.PI) % (2 * Math.PI)) - Math.PI)
 
@@ -3206,8 +3280,9 @@ const pickArcArrowIdx = (
 
 /**
  * Computes balanced, mirror-symmetric ellipse layout for `nodes` on a `cols x rows` cell grid:
- * rounded `MAIN` centre box, straight dotted spokes stopping 1 cell outside `centre` with
- * collision-free 8-way arrowheads, and a smooth dotted clockwise ring.
+ * rounded `MAIN` centre box, one continuous 8-connected spoke from each engine label to its
+ * arrowhead beside the hub, and a smooth dotted clockwise ring for debate rounds. Side engines sit
+ * on the hub's middle row, so their spoke is a straight horizontal line.
  */
 export const ringLayout = (
   nodes: readonly RingNodeInput[],
@@ -3263,8 +3338,7 @@ export const ringLayout = (
     }
   }
 
-  const placed: RingNodePos[] = rawAnchors.map((a, i) => {
-    const nd = nodes[i]!
+  const placeLabel = (a: RawAnchor, nd: RingNodeInput): RingNodePos => {
     let label = nd.label
     let width = nd.width
     let labelX = 0
@@ -3296,7 +3370,76 @@ export const ringLayout = (
       labelY: a.labelY,
       align: a.align,
     }
-  })
+  }
+
+  const placed: RingNodePos[] = rawAnchors.map((a, i) => placeLabel(a, nodes[i]!))
+
+  // A side engine sits on the hub's middle row when its side has no other label there: the spoke is
+  // then one straight horizontal line from the label to the arrowhead beside MAIN.
+  if (!isDebate && n > 2) {
+    // Pick the mirrored pair nearest the middle row, so both sides snap together.
+    let best = -1
+    for (let i = 1; i < n / 2; i += 1) {
+      const nd = placed[i]!
+      if (nd.align === 'center') continue
+      if (best < 0 || Math.abs(nd.labelY - cy) < Math.abs(placed[best]!.labelY - cy)) best = i
+    }
+    if (best > 0) {
+      const pair = [best, n - best]
+      const sideOf = (i: number) => (i < n / 2 ? 'left' : 'right')
+      const free = pair.every(i => !placed.some((o, j) => j !== i && o.align === placed[i]!.align && sideOf(j) === sideOf(i) && o.labelY === cy))
+      if (free) {
+        for (const i of pair) {
+          const nd = placed[i]!
+          if (nd.align === 'center') continue
+          nd.labelY = cy
+          nd.anchorY = cy
+          nd.anchorX = nd.align === 'left' ? cxRight + rx : cxLeft - rx
+          if (nd.align === 'left') {
+            nd.labelX = Math.min(cols - 1 - nd.width, nd.anchorX + 2)
+          } else {
+            nd.labelX = Math.max(1, nd.anchorX - 2 - nd.width + 1)
+          }
+        }
+      }
+    }
+  }
+
+  // One dim model row under each label, centred and truncated to the label's width + 4.
+  for (let i = 0; i < placed.length; i += 1) {
+    const nd = placed[i]!
+    const raw = nodes[i]!.model
+    if (typeof raw !== 'string' || raw.trim() === '') continue
+    let y = nd.labelY + 1
+    if (y >= rows) {
+      // A bottom label moves up one row; its model takes the row under it.
+      nd.labelY -= 1
+      if (nd.align === 'center') nd.anchorY -= 1
+      y = nd.labelY + 1
+    }
+    const labelCentre = nd.labelX + (nd.width - 1) / 2
+    const room = Math.floor(Math.min(labelCentre - 1, cols - 1 - labelCentre)) * 2 + 1
+    const maxW = Math.max(1, Math.min(nd.width + 4, cols - 2, room))
+    const text = shorten(raw.trim(), maxW)
+    const width = cellWidth(text)
+    let x = Math.round(labelCentre - (width - 1) / 2)
+    x = Math.max(1, Math.min(cols - 1 - width, x))
+    if (y < 0 || y >= rows) continue
+    // Keep out of every other label or model row; a model that cannot fit is left out.
+    const blocked = placed.some(
+      (o, j) =>
+        j !== i &&
+        ((y === o.labelY && x < o.labelX + o.width && x + width > o.labelX) ||
+          (o.model !== undefined && o.modelWidth !== undefined && o.modelX !== undefined && y === o.modelY && x < o.modelX + o.modelWidth && x + width > o.modelX)),
+    )
+    if (blocked) continue
+    const inCentre = y >= centre.y && y < centre.y + centre.height && x < centre.x + centre.width && x + width > centre.x
+    if (inCentre) continue
+    nd.model = text
+    nd.modelX = x
+    nd.modelY = y
+    nd.modelWidth = width
+  }
 
   // Build one smooth, 4-way symmetric ellipse from a single first-quadrant curve (0 .. pi/2).
   const q1Angles: number[] = []
@@ -3395,58 +3538,131 @@ export const ringLayout = (
   for (let y = by1; y >= by0; y -= 1) outerRing.push({ x: bx0 - 1, y })
   const inCentre = (x: number, y: number) => x >= bx0 && x <= bx1 && y >= by0 && y <= by1
 
-  const separate = (a: readonly Pt[], b: readonly Pt[]): boolean =>
-    a.every((p, i) => b.every((q, j) => {
-      const d = Math.abs(p.x - q.x) + Math.abs(p.y - q.y)
-      return d > 1 || (d === 1 && i === a.length - 1 && j === b.length - 1)
-    }))
   const spokePts: Pt[][] = nodes.map(() => [])
-  const groups: { indices: number[]; candidates: Pt[][][] }[] = []
-  // Choose right-hand endpoints and mirror whole paths, not just their arrowheads.
-  for (let i = 0; i <= n / 2 && i < n; i += 1) {
-    const nd = placed[i]!
-    const indices = nd.align === 'center' ? [i] : [i, n - i]
-    const vx = nd.anchorX - cxMid
-    const vy = nd.anchorY - cyMid
-    const targets = outerRing.filter(p => {
-      if (nd.align === 'center') return p.x === nd.anchorX && (p.y - cyMid) * vy > 0
-      if (p.x < cxRight) return false
-      if (nd.anchorY < by0) return p.y === by0 - 1 || (p.x === bx1 + 1 && p.y === by0)
-      if (nd.anchorY > by1) return p.y === by1 + 1 || (p.x === bx1 + 1 && p.y === by1)
-      return p.x === bx1 + 1 && p.y >= by0 && p.y <= by1
-    })
-    // Diagonals meet the top/bottom corners; side corner cells are a clearance fallback.
-    const distance = (p: Pt) => Math.abs((p.x - cxMid) * vy - (p.y - cyMid) * vx)
-    const sideCorner = (p: Pt) =>
-      nd.align !== 'center' && (nd.anchorY < by0 || nd.anchorY > by1) && p.y >= by0 && p.y <= by1
-    targets.sort((a, b) => Number(sideCorner(a)) - Number(sideCorner(b)) || distance(a) - distance(b))
-    const candidates = targets.flatMap(p => spokeLines({ x: nd.anchorX, y: nd.anchorY }, p).map(right =>
-      indices.length === 1 ? [right] : [right, right.map(q => ({ x: 2 * cxMid - q.x, y: q.y }))],
-    )).filter(paths =>
-      paths.every(path => path.length >= 2 && path.every(p => !inCentre(p.x, p.y) && !isNodeLabelCell(placed, p.x, p.y))) &&
-      (paths.length === 1 || separate(paths[0]!, paths[1]!)),
-    )
-    groups.push({ indices, candidates })
-  }
-  // Constrained spokes claim their corners before spokes with more choices.
-  groups.sort((a, b) => a.candidates.length - b.candidates.length)
-  const placeSpokes = (g: number): boolean => {
-    if (g === groups.length) return true
-    const group = groups[g]!
-    for (const paths of group.candidates) {
-      if (!paths.every(path => spokePts.every(other => separate(path, other)))) continue
-      group.indices.forEach((idx, k) => { spokePts[idx] = paths[k]! })
-      if (placeSpokes(g + 1)) return true
-      group.indices.forEach(idx => { spokePts[idx] = [] })
+  if (!isDebate && n > 0) {
+    // Where a spoke leaves its label: one cell inside the label's block, toward MAIN.
+    const entryOf = (nd: RingNodePos): Pt => {
+      if (nd.align === 'left') return { x: nd.labelX - 1, y: nd.labelY }
+      if (nd.align === 'right') return { x: nd.labelX + nd.width, y: nd.labelY }
+      const top = nd.anchorY < cy
+      const modelTowardHub = nd.model !== undefined && nd.modelY === (top ? nd.labelY + 1 : nd.labelY - 1)
+      return { x: nd.labelX + Math.floor(nd.width / 2), y: top ? nd.labelY + (modelTowardHub ? 2 : 1) : nd.labelY - 1 }
     }
-    return false
+    const onLabel = (p: Pt) => isNodeLabelCell(placed, p.x, p.y)
+    const inGrid = (p: Pt) => p.x >= 0 && p.x < cols && p.y >= 0 && p.y < rows
+    const paths: Pt[][] = nodes.map(() => [])
+    const straight = (nd: RingNodePos, entry: Pt, p: Pt) =>
+      nd.align === 'center' ? Number(p.x !== entry.x) : Number(p.y !== entry.y)
+    const order = placed
+      .map((nd, i) => ({ nd, i }))
+      .sort((a, b) => {
+        const sideRow = (x: RingNodePos) => (x.align !== 'center' && x.labelY === cy ? 0 : x.align === 'center' ? 1 : 2)
+        return sideRow(a.nd) - sideRow(b.nd) || Math.abs(a.nd.labelY - cy) - Math.abs(b.nd.labelY - cy) || a.i - b.i
+      })
+    const fits = (path: readonly Pt[], arrow: Pt): boolean =>
+      path.every(p => inGrid(p) && !inCentre(p.x, p.y) && !onLabel(p)) &&
+      paths.every(other => {
+        if (other.length === 0) return true
+        const otherArrow = other[other.length - 1]!
+        if (Math.abs(arrow.x - otherArrow.x) + Math.abs(arrow.y - otherArrow.y) <= 1) return false
+        return path.every(p => other.every(q => p.x !== q.x || p.y !== q.y))
+      })
+    const place = (k: number): boolean => {
+      if (k === order.length) return true
+      const { nd, i } = order[k]!
+      const entry = entryOf(nd)
+      const candidates: { pts: Pt[]; score: number[] }[] = []
+      for (const target of outerRing) {
+        if (onLabel(target)) continue
+        for (const pts of spokeLines(entry, target)) {
+          if (pts.length < 2) continue
+          const dist = Math.abs(target.x - entry.x) + Math.abs(target.y - entry.y)
+          const aim = Math.abs(angDiff(Math.atan2(target.x - cxMid, -(target.y - cyMid)), nd.angle))
+          candidates.push({ pts, score: [straight(nd, entry, target), dist, aim] })
+        }
+      }
+      candidates.sort((a, b) => a.score[0]! - b.score[0]! || a.score[1]! - b.score[1]! || a.score[2]! - b.score[2]!)
+      for (const cand of candidates) {
+        if (!fits(cand.pts, cand.pts[cand.pts.length - 1]!)) continue
+        paths[i] = cand.pts
+        if (place(k + 1)) return true
+        paths[i] = []
+      }
+      return false
+    }
+    place(0)
+    for (let i = 0; i < n; i += 1) {
+      const pts = paths[i]!
+      if (pts.length < 2) continue
+      spokePts[i] = pts
+    }
+  } else {
+    const separate = (a: readonly Pt[], b: readonly Pt[]): boolean =>
+      a.every(p =>
+        b.every(q => {
+          const d = Math.abs(p.x - q.x) + Math.abs(p.y - q.y)
+          return d > 1
+        }),
+      )
+    const groups: { indices: number[]; candidates: Pt[][][] }[] = []
+    // Choose right-hand endpoints and mirror whole paths, not just their arrowheads.
+    for (let i = 0; i <= n / 2 && i < n; i += 1) {
+      const nd = placed[i]!
+      const indices = nd.align === 'center' ? [i] : [i, n - i]
+      const vx = nd.anchorX - cxMid
+      const vy = nd.anchorY - cyMid
+      const targets = outerRing.filter(p => {
+        if (nd.align === 'center') return p.x === nd.anchorX && (p.y - cyMid) * vy > 0
+        if (p.x < cxRight) return false
+        if (nd.anchorY < by0) return p.y === by0 - 1 || (p.x === bx1 + 1 && p.y === by0)
+        if (nd.anchorY > by1) return p.y === by1 + 1 || (p.x === bx1 + 1 && p.y === by1)
+        return p.x === bx1 + 1 && p.y >= by0 && p.y <= by1
+      })
+      const distance = (p: Pt) => Math.abs((p.x - cxMid) * vy - (p.y - cyMid) * vx)
+      const sideCorner = (p: Pt) => nd.align !== 'center' && (nd.anchorY < by0 || nd.anchorY > by1) && p.y >= by0 && p.y <= by1
+      targets.sort((a, b) => Number(sideCorner(a)) - Number(sideCorner(b)) || distance(a) - distance(b))
+      const candidates = targets
+        .flatMap(p =>
+          spokeLines({ x: nd.anchorX, y: nd.anchorY }, p).map(right =>
+            indices.length === 1 ? [right] : [right, right.map(q => ({ x: 2 * cxMid - q.x, y: q.y }))],
+          ),
+        )
+        .filter(
+          ps =>
+            ps.every(path => path.length >= 2 && path.every(p => !inCentre(p.x, p.y) && !isNodeLabelCell(placed, p.x, p.y))) &&
+            (ps.length === 1 || separate(ps[0]!, ps[1]!)),
+        )
+      groups.push({ indices, candidates })
+    }
+    groups.sort((a, b) => a.candidates.length - b.candidates.length)
+    const placeSpokes = (g: number): boolean => {
+      if (g === groups.length) return true
+      const group = groups[g]!
+      for (const ps of group.candidates) {
+        if (!ps.every(path => spokePts.every(other => other.length === 0 || separate(path, other)))) continue
+        group.indices.forEach((idx, k) => {
+          spokePts[idx] = ps[k]!
+        })
+        if (placeSpokes(g + 1)) return true
+        group.indices.forEach(idx => {
+          spokePts[idx] = []
+        })
+      }
+      return false
+    }
+    placeSpokes(0)
   }
-  placeSpokes(0)
-  const spokes: RingCell[][] = spokePts.map(pts => pts.map((p, k) => ({
-    x: p.x,
-    y: p.y,
-    glyph: k === pts.length - 1 ? arrowFromVec(cxMid - p.x, cyMid - p.y) : '·',
-  })))
+
+  const spokes: RingCell[][] = spokePts.map(pts =>
+    pts.map((p, k) => {
+      const prev = pts[Math.max(0, k - 1)]!
+      return {
+        x: p.x,
+        y: p.y,
+        glyph: k === pts.length - 1 ? arrowFromVec(p.x - prev.x, p.y - prev.y) : '·',
+      }
+    }),
+  )
 
   return { cols, rows, cx, cy, rx, ry, centre, nodes: placed, spokes, arcs }
 }
@@ -3481,14 +3697,15 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
   const ringHeight = run.engines.length <= 6 ? 11 : 13
   const parts = run.engines.map(e => {
     const glyph = consultGlyph(e.state)
-    const dur = consultEngineDuration(e, run, now)
+    // A locked or skipped engine keeps no clock: its label is just `⊘ name`.
+    const dur = e.state === 'skipped' ? '' : consultEngineDuration(e, run, now)
     const name = shortConsultEngine(e.name, 12)
     const label = dur ? `${glyph} ${name} ${dur}` : `${glyph} ${name}`
-    return { e, glyph, name, dur, label, width: cellWidth(label) }
+    return { e, glyph, name, dur, label, width: cellWidth(label), model: engineModel(e) }
   })
   const tag = `⟳ R${run.round}/${run.rounds}`
   const layout = ringLayout(
-    parts.map(p => ({ label: p.label, width: p.width, glyph: p.glyph, name: p.name, dur: p.dur })),
+    parts.map(p => ({ label: p.label, width: p.width, glyph: p.glyph, name: p.name, dur: p.dur, ...(p.model ? { model: p.model } : {}) })),
     cols,
     ringHeight,
     { isDebate, tagWidth: cellWidth(tag) },
@@ -3516,6 +3733,12 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
   } else {
     putStr(c.x, c.y + 2, `╰${'─'.repeat(c.width - 2)}╯`, colors.main)
   }
+  // One dim model row under each engine label, where the run file names one.
+  for (const nd of layout.nodes) {
+    if (nd.model !== undefined && nd.modelX !== undefined && nd.modelY !== undefined) {
+      putStr(nd.modelX, nd.modelY, nd.model, colors.dim, false, true)
+    }
+  }
 
   const paths: RingAnimatedPath[] = []
   const isRunLive = run.endedAt === null && !run.stale
@@ -3524,8 +3747,16 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
     for (let i = 0; i < parts.length; i += 1) {
       const st = parts[i]!.e.state
       const spoke = layout.spokes[i] ?? []
-      if (st === 'failed' || st === 'skipped' || spoke.length === 0) continue
-      if (st === 'ok') {
+      if (st === 'failed' || spoke.length === 0) continue
+      if (st === 'skipped') {
+        // A locked engine keeps a broken faint spoke that ends in ⊘ beside the hub.
+        for (let k = 0; k < spoke.length - 1; k += 3) {
+          const pt = spoke[k]!
+          put(pt.x, pt.y, '·', colors.faint)
+        }
+        const last = spoke[spoke.length - 1]!
+        put(last.x, last.y, '⊘', colors.amber)
+      } else if (st === 'ok') {
         for (const pt of spoke) put(pt.x, pt.y, pt.glyph, colors.gate)
       } else if (st === 'queued') {
         for (const pt of spoke) put(pt.x, pt.y, '·', colors.faint)
@@ -3584,9 +3815,9 @@ export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, 
     const nd = layout.nodes[i]!
     const st = p.e.state
     const stateColor =
-      st === 'ok' ? colors.gate : st === 'running' ? colors.agent : st === 'failed' ? colors.warn : st === 'skipped' ? colors.amber : colors.faint
+      st === 'ok' ? colors.gate : st === 'running' ? colors.agent : st === 'failed' ? colors.warn : st === 'skipped' ? colors.warn : colors.faint
     const nameColor =
-      st === 'queued' ? colors.faint : st === 'failed' ? colors.warn : st === 'skipped' ? colors.amber : colors.text
+      st === 'queued' ? colors.faint : st === 'failed' ? colors.warn : st === 'skipped' ? colors.warn : colors.text
     const chars = [...nd.label]
     const nameEnd = Math.min(chars.length, 2 + cellWidth(p.name))
     for (let k = 0; k < chars.length; k += 1) {

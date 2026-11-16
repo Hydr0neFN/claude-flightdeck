@@ -59,6 +59,7 @@ import {
   fmtWorkerCost,
   jobsCost,
   shortWorker,
+  shorten,
   workerProbe,
   CONSULT_HIDE_AFTER_MS,
   PALETTES,
@@ -118,12 +119,18 @@ import {
   turnJobs,
   workerDisplay,
   CHECKPOINT_PY,
-  COLLAPSE_AFTER_MS,
   CONSULT_PY,
   DONE_KEEP_MS,
+  STALE_AFTER_MS,
   MESH_PY,
-  WORK_DETAIL_COLS,
-  WORK_NARROW,
+  consultLockNote,
+  consultSummaryLine,
+  engineModel,
+  firstSentence,
+  fitPlan,
+  questionLine,
+  stepsLeftText,
+  subMainTasks,
   WORK_STRIP_MAX,
   buildWork,
   cardForTaskStop,
@@ -431,7 +438,7 @@ test('a fresh session draws on every surface and width, empty panels hidden', LE
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     for (const cols of [40, 60, 86, 120]) {
       const ui = await $.ui.mount({ ...pane(cols), surface })
-      expect(await ui.find({ text: /· main$/ })).toBeDefined()
+      expect(await ui.find({ text: /^╭ main / })).toBeDefined()
       expect(await ui.find({ text: /session log/ })).toBeDefined()
       expect(await ui.find({ text: /agents ·/ })).toBeUndefined() // no subagents: no agents panel
       expect(await ui.find({ text: /permissions/ })).toBeUndefined() // no checks yet: no gate panel
@@ -474,15 +481,16 @@ test('/clear starts the pane fresh', async ($, on) => {
 test('colours come from the theme by default, raw hex only when asked', async ($, on) => {
   engine(on)
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
-  const title = await ui.find({ text: /· main$/ })
-  expect(title?.props.color).toBe('claude')
+  const titles = await ui.findAll({ type: 'Text', text: /^╭ main / })
+  expect(titles.some(t => t.props.color === 'claude')).toBe(true)
   await ui.unmount()
 })
 
 test('pastel keeps the fixed dark-terminal colours', { options: { palette: 'pastel' } }, async ($, on) => {
   engine(on)
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
-  expect((await ui.find({ text: /· main$/ }))?.props.color).toBe('#7dd3fc')
+  const titles = await ui.findAll({ type: 'Text', text: /^╭ main / })
+  expect(titles.some(t => t.props.color === '#7dd3fc')).toBe(true)
   await ui.unmount()
 })
 
@@ -682,7 +690,7 @@ test('each rate-limit window shows the time to its reset where the main panel ha
   await narrow.unmount()
 })
 
-test("the main box shows the last request's time to first token, and no tokens per second", async ($, on) => {
+test('the main box no longer draws the last request\'s ttft, a request count, or the cwd', async ($, on) => {
   const clock = engine(on)
   // The model beneath: 800 ms to its first words, then 2 s more to stop after 120 tokens.
   on('turn.step', async function* () {
@@ -707,8 +715,10 @@ test("the main box shows the last request's time to first token, and no tokens p
   await s.result
   for (const cols of [40, 64, 120]) {
     const ui = await $.ui.mount({ ...pane(cols), surface: 'terminal' })
-    expect(await ui.find({ text: /ttft 0\.8s$/ })).toBeDefined()
+    expect(await ui.find({ text: /ttft/ })).toBeUndefined()
     expect(await ui.find({ text: /tok\/s/ })).toBeUndefined()
+    expect(await ui.find({ text: /\d+ req/ })).toBeUndefined()
+    expect(await ui.find({ text: /^cwd$/ })).toBeUndefined()
     await ui.unmount()
   }
 })
@@ -745,7 +755,7 @@ test('on a graphical surface, rows of marks hold fewer marks, keep the newest an
       expect(strip?.text.endsWith('✗')).toBe(true)
       expect((await ui.find({ type: 'Text', text: /^●$/ }))?.props.wrap).toBe('truncate-start')
       expect((await ui.find({ type: 'Text', text: /^[─━◆]+$/ }))?.props.wrap).toBe('truncate-middle')
-      expect((await ui.find({ key: 'legend' }))?.props.marginBottom).toBe(surface === 'terminal' ? 0 : 1)
+      expect(await ui.find({ key: 'legend' })).toBeUndefined()
       await ui.unmount()
     }
   }
@@ -970,8 +980,8 @@ test('a resumed session shows its model, effort, mode and an estimated context b
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
   expect(await ui.find({ text: /OPUS 5\.5/ })).toBeDefined()
-  expect(await ui.find({ text: /^medium$/ })).toBeDefined()
-  expect(await ui.find({ text: /bypassPermissions/ })).toBeDefined()
+  expect(await ui.find({ text: /effort medium/ })).toBeDefined()
+  expect(await ui.find({ text: /^bypass$/ })).toBeDefined()
   expect(await ui.find({ text: /^~123\/400k$/ })).toBeDefined()
   await ui.unmount()
   // A measurement with no count keeps the estimate; the first real count replaces it.
@@ -1735,8 +1745,8 @@ test('external feed polls on start and every 30s, keeps last good on error, skip
   const gauges = await ui.findAll({ type: 'Text', text: /^▰+$/ })
   expect(gauges.map(g => g.props.color)).toEqual(['error', 'claude'])
   expect(await ui.find({ text: /step 2\/4 build feed/ })).toBeDefined()
-  expect(await ui.find({ text: /^~\/Claude$/ })).toBeDefined()
-  expect(await ui.find({ text: /^yu\*$/, color: 'claude' })).toBeDefined()
+  expect(await ui.find({ text: /^~\/Claude$/ })).toBeUndefined()
+  expect(await ui.find({ text: /^yu\*$/ })).toBeUndefined()
   expect(await ui.find({ text: /^pro / })).toBeDefined() // `gem pro` cut to the meter's 3-cell name
   expect(await ui.find({ text: /^agy$/ })).toBeDefined()
   await ui.unmount()
@@ -1842,7 +1852,27 @@ const gridMatrix = (grid: ReturnType<typeof buildConsultGrid>): string[][] => {
   return buf
 }
 
-test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and connects spokes & clockwise arcs', () => {
+const isArrowGlyph = (g: string) => ARROWS.has(g)
+
+/** The cell is 8-adjacent to a cell of this node's label block (label row and model row). */
+const touchesLabel = (L: ReturnType<typeof ringLayout>, i: number, p: { x: number; y: number }) => {
+  const nd = L.nodes[i]!
+  for (let y = p.y - 1; y <= p.y + 1; y += 1) {
+    for (let x = p.x - 1; x <= p.x + 1; x += 1) {
+      if (y === nd.labelY && x >= nd.labelX && x < nd.labelX + nd.width) return true
+      if (nd.model !== undefined && y === nd.modelY && x >= nd.modelX! && x < nd.modelX! + nd.modelWidth!) return true
+    }
+  }
+  return false
+}
+
+const besideHub = (L: ReturnType<typeof ringLayout>, p: { x: number; y: number }) => {
+  const dx = p.x < L.centre.x ? L.centre.x - p.x : p.x >= L.centre.x + L.centre.width ? p.x - (L.centre.x + L.centre.width - 1) : 0
+  const dy = p.y < L.centre.y ? L.centre.y - p.y : p.y >= L.centre.y + L.centre.height ? p.y - (L.centre.y + L.centre.height - 1) : 0
+  return Math.max(dx, dy) === 1
+}
+
+test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and keeps every spoke continuous', () => {
   for (const n of [3, 7, 10]) {
     const rows = n <= 6 ? 11 : 13
     for (const cols of [40, 62, 116]) {
@@ -1882,33 +1912,24 @@ test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and connects spo
         }
       }
 
-      // Every spoke fits, stays clear of labels, and ends next to centre with an arrowhead pointing at it.
+      // Every spoke is one continuous 8-connected stroke from its label to an arrowhead beside the hub.
       expect(L.spokes.length).toBe(n)
-      const cMidX = L.centre.x + (L.centre.width - 1) / 2
-      const cMidY = L.centre.y + (L.centre.height - 1) / 2
       const usedArrows = new Set<string>()
-      for (const sp of L.spokes) {
-        expect(sp.length).toBeGreaterThan(0)
+      for (let i = 0; i < n; i += 1) {
+        const sp = L.spokes[i]!
+        expect(sp.length).toBeGreaterThan(1)
+        expect(touchesLabel(L, i, sp[0]!)).toBe(true)
+        for (let k = 1; k < sp.length; k += 1) {
+          expect(Math.max(Math.abs(sp[k]!.x - sp[k - 1]!.x), Math.abs(sp[k]!.y - sp[k - 1]!.y))).toBeLessThanOrEqual(1)
+        }
         for (let k = 0; k < sp.length - 1; k += 1) expect(sp[k]!.glyph).toBe('·')
         const last = sp[sp.length - 1]!
-        expect(ARROWS.has(last.glyph)).toBe(true)
+        expect(isArrowGlyph(last.glyph)).toBe(true)
         expect(usedArrows.has(`${last.x},${last.y}`)).toBe(false)
         usedArrows.add(`${last.x},${last.y}`)
-        const dx =
-          last.x < L.centre.x
-            ? L.centre.x - last.x
-            : last.x >= L.centre.x + L.centre.width
-              ? last.x - (L.centre.x + L.centre.width - 1)
-              : 0
-        const dy =
-          last.y < L.centre.y
-            ? L.centre.y - last.y
-            : last.y >= L.centre.y + L.centre.height
-              ? last.y - (L.centre.y + L.centre.height - 1)
-              : 0
-        expect(Math.max(dx, dy)).toBe(1)
-        // Arrowhead points toward hub centre (8-way rounded).
-        expect(last.glyph).toBe(expected8WayArrow(cMidX - last.x, cMidY - last.y))
+        expect(besideHub(L, last)).toBe(true)
+        const prev = sp[sp.length - 2]!
+        expect(last.glyph).toBe(expected8WayArrow(last.x - prev.x, last.y - prev.y))
         for (const c of sp) {
           expect(c.x >= 0 && c.x < cols && c.y >= 0 && c.y < rows).toBe(true)
           for (const nd of L.nodes) {
@@ -1938,48 +1959,31 @@ test('ringLayout fits 3, 7 and 10 nodes cleanly without overlap and connects spo
   }
 })
 
-test('consult ring spokes use straight · lines, unique 8-way arrowheads, and hub rounded box', () => {
-  for (const n of [4, 6, 7, 9, 10]) {
+test('consult ring: every spoke runs in one 8-connected stroke from its label to its arrowhead, at 46, 60 and 70 columns', () => {
+  for (const n of [4, 6, 7, 9]) {
     const rows = n <= 6 ? 11 : 13
-    for (const cols of [36, 42, 60, 66, 116]) {
+    for (const cols of [46, 60, 70]) {
       const nodes = Array.from({ length: n }, (_, i) => {
-        const glyph = '●'
-        const name = `engine${i}`
-        const dur = `${10 + i}s`
-        const label = `${glyph} ${name} ${dur}`
-        return { label, width: cellWidth(label), glyph, name, dur }
+        const label = `● engine${i} ${10 + i}s`
+        return { label, width: cellWidth(label), glyph: '●', name: `engine${i}`, dur: `${10 + i}s` }
       })
       const L = ringLayout(nodes, cols, rows)
-      const cMidX = L.centre.x + (L.centre.width - 1) / 2
-      const cMidY = L.centre.y + (L.centre.height - 1) / 2
-      const arrowCells = new Set<string>()
-
+      expect(L.spokes.length).toBe(n)
       for (let i = 0; i < n; i += 1) {
         const sp = L.spokes[i]!
-        const nd = L.nodes[i]!
         expect(sp.length).toBeGreaterThanOrEqual(2)
-        expect(sp[0]!.x === nd.anchorX && sp[0]!.y === nd.anchorY).toBe(true)
-        const bodyArrows = sp.slice(0, -1).filter(c => c.glyph !== '·')
-        expect(bodyArrows).toEqual([])
+        expect(touchesLabel(L, i, sp[0]!)).toBe(true)
         for (let k = 1; k < sp.length; k += 1) {
           expect(Math.max(Math.abs(sp[k]!.x - sp[k - 1]!.x), Math.abs(sp[k]!.y - sp[k - 1]!.y))).toBeLessThanOrEqual(1)
         }
-        const arrows = sp.filter(c => ARROWS.has(c.glyph))
-        expect(arrows.length).toBe(1)
         const last = sp[sp.length - 1]!
-        expect(arrows[0]).toBe(last)
-        expect(last.glyph).toBe(expected8WayArrow(cMidX - last.x, cMidY - last.y))
-        const key = `${last.x},${last.y}`
-        expect(arrowCells.has(key)).toBe(false)
-        arrowCells.add(key)
-
-        // No spoke overlaps hub box or any label.
+        expect(isArrowGlyph(last.glyph)).toBe(true)
+        expect(besideHub(L, last)).toBe(true)
+        const prev = sp[sp.length - 2]!
+        expect(last.glyph).toBe(expected8WayArrow(last.x - prev.x, last.y - prev.y))
         for (const c of sp) {
           const inBox =
-            c.x >= L.centre.x &&
-            c.x < L.centre.x + L.centre.width &&
-            c.y >= L.centre.y &&
-            c.y < L.centre.y + L.centre.height
+            c.x >= L.centre.x && c.x < L.centre.x + L.centre.width && c.y >= L.centre.y && c.y < L.centre.y + L.centre.height
           expect(inBox).toBe(false)
           for (const other of L.nodes) {
             expect(c.y === other.labelY && c.x >= other.labelX && c.x < other.labelX + other.width).toBe(false)
@@ -1989,19 +1993,11 @@ test('consult ring spokes use straight · lines, unique 8-way arrowheads, and hu
     }
   }
 
-  // Consult hub: 3-row rounded box in C.main, bold MAIN; queued = faint dots without arrowhead; running = dim dots.
+  // Consult hub: 3-row rounded box in C.main, bold MAIN.
   const cRun = parseConsult(
     JSON.stringify({
       run: {
-        v: 1,
-        id: 'hub-1',
-        pid: 1,
-        kind: 'all',
-        startedAt: 10_000,
-        endedAt: null,
-        question: 'Q?',
-        round: 1,
-        rounds: 1,
+        v: 1, id: 'hub-1', pid: 1, kind: 'all', startedAt: 10_000, endedAt: null, question: 'Q?', round: 1, rounds: 1,
         engines: [
           { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 20_000, reason: null, note: null },
           { name: 'gemini', state: 'running', startedAt: 22_000, endedAt: null, reason: null, note: null },
@@ -2070,15 +2066,7 @@ test('consult ring keeps mirror symmetry, 1-cell side margins, and drops duratio
   const run9 = parseConsult(
     JSON.stringify({
       run: {
-        v: 1,
-        id: 't1',
-        pid: 1,
-        kind: 'all',
-        startedAt: 10_000,
-        endedAt: null,
-        question: '',
-        round: 1,
-        rounds: 1,
+        v: 1, id: 't1', pid: 1, kind: 'all', startedAt: 10_000, endedAt: null, question: '', round: 1, rounds: 1,
         engines: [
           { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 20_000, reason: null, note: null },
           { name: 'codex', state: 'skipped', startedAt: null, endedAt: null, reason: 'locked', note: null },
@@ -2100,16 +2088,14 @@ test('consult ring keeps mirror symmetry, 1-cell side margins, and drops duratio
     expect(nd.labelX).toBeGreaterThanOrEqual(1)
     expect(nd.labelX + nd.width).toBeLessThanOrEqual(41)
   }
-  // azure (index 7): drops 9s -> full name "● azure" fits in 7 cells.
   expect(g42.layout.nodes[7]!.label).toBe('● azure')
-  // deepseek (index 2): drops 24s, then truncates name with ….
   expect(g42.layout.nodes[2]!.label).toMatch(/^● deep.*…$/)
   expect(g42.layout.nodes[2]!.label).not.toContain('24s')
 })
 
-test('ring spokes never share or touch cells except neighbouring arrowheads, at 46 and 70 cols', () => {
+test('ring spoke arrowheads never sit in 4-neighbouring cells, and no two spokes share a cell', () => {
   for (const n of [4, 6, 7, 9, 10]) {
-    for (const cols of [46, 70]) {
+    for (const cols of [46, 60, 70]) {
       const nodes = Array.from({ length: n }, (_, i) => {
         const label = `● engine${i} 12s`
         return { label, width: cellWidth(label) }
@@ -2118,36 +2104,30 @@ test('ring spokes never share or touch cells except neighbouring arrowheads, at 
       for (let i = 0; i < n; i += 1) {
         const sp = L.spokes[i]!
         expect(sp.length).toBeGreaterThanOrEqual(2)
-        const from = sp[0]!
-        const to = sp[sp.length - 1]!
-        const dx = to.x - from.x
-        const dy = to.y - from.y
-        // All raster cells stay within one cell of their own straight line.
-        for (const p of sp) {
-          expect(Math.abs((p.x - from.x) * dy - (p.y - from.y) * dx)).toBeLessThanOrEqual(Math.max(Math.abs(dx), Math.abs(dy)))
+        for (let k = 1; k < sp.length; k += 1) {
+          expect(Math.max(Math.abs(sp[k]!.x - sp[k - 1]!.x), Math.abs(sp[k]!.y - sp[k - 1]!.y))).toBeLessThanOrEqual(1)
         }
         for (let j = i + 1; j < n; j += 1) {
           const other = L.spokes[j]!
-          for (let a = 0; a < sp.length; a += 1) {
-            for (let b = 0; b < other.length; b += 1) {
-              const d = Math.abs(sp[a]!.x - other[b]!.x) + Math.abs(sp[a]!.y - other[b]!.y)
-              const arrowPair = a === sp.length - 1 && b === other.length - 1
-              expect(d > 1 || (d === 1 && arrowPair)).toBe(true)
-            }
+          const aArrow = sp[sp.length - 1]!
+          const bArrow = other[other.length - 1]!
+          expect(Math.abs(aArrow.x - bArrow.x) + Math.abs(aArrow.y - bArrow.y)).toBeGreaterThan(1)
+          for (const p of sp) {
+            for (const q of other) expect(p.x === q.x && p.y === q.y).toBe(false)
           }
         }
       }
-      for (let i = 1; i < n / 2; i += 1) {
-        expect(L.spokes[n - i]).toEqual(L.spokes[i]!.map(p => ({
-          x: cols - 1 - p.x,
-          y: p.y,
-          glyph: p.glyph === '·' ? '·' : expected8WayArrow(p.x - (cols - 1) / 2, L.cy - p.y),
-        })))
-      }
-      if (n >= 6) {
-        // The first upper diagonals meet the top corners, not the side rows.
-        for (const i of [1, n - 1]) expect(L.spokes[i]![L.spokes[i]!.length - 1]!.y).toBe(L.centre.y - 1)
-      }
+    }
+  }
+  // A side engine's spoke is one straight horizontal line on the hub's middle row.
+  for (const n of [4, 6, 7, 9]) {
+    const nodes = Array.from({ length: n }, (_, i) => ({ label: `● engine${i} 12s`, width: cellWidth(`● engine${i} 12s`) }))
+    const L = ringLayout(nodes, 60, n <= 6 ? 11 : 13)
+    const side = L.nodes.map((nd, i) => ({ nd, i })).filter(x => x.nd.align !== 'center' && x.nd.labelY === L.cy)
+    expect(side.length).toBeGreaterThan(0)
+    for (const { i } of side) {
+      const sp = L.spokes[i]!
+      expect(sp.every(p => p.y === L.cy)).toBe(true)
     }
   }
 })
@@ -2388,7 +2368,7 @@ test('consult panel hides when empty or ended > 10 min ago, and uses narrow fall
 
   const recentUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
   expect(await recentUi.find({ text: /CONSULT · consult · R1\/1/ })).toBeDefined()
-  expect(await recentUi.find({ text: /all done/ })).toBeDefined()
+  expect(await recentUi.find({ text: /✓ 1\/5 answered/ })).toBeDefined()
   await recentUi.unmount()
 
   await clock.advance(CONSULT_HIDE_AFTER_MS)
@@ -2532,22 +2512,24 @@ test('consult panel renders consult and debate views, animates ring.tsx, polls 2
   expect(cGrid.spinners.length).toBe(1)
   const flatC = cGrid.rows.flat().map(r => r.text).join('')
   expect(flatC).toContain('·') // queued dotted spoke
-  // Failed (index 3) and skipped (index 4) have no spoke cells rendered.
-  for (const idx of [3, 4]) {
-    for (const c of cGrid.layout.spokes[idx] ?? []) {
-      const hit = (cGrid.rows[c.y] ?? []).some(r => c.x >= r.x && c.x < r.x + cellWidth(r.text))
-      expect(hit).toBe(false)
-    }
+  // Failed (index 3) has no spoke cells; a skipped engine (index 4) draws a broken faint spoke ending in ⊘.
+  for (const c of cGrid.layout.spokes[3] ?? []) {
+    const hit = (cGrid.rows[c.y] ?? []).some(r => c.x >= r.x && c.x < r.x + cellWidth(r.text))
+    expect(hit).toBe(false)
   }
+  const skippedSpoke = cGrid.layout.spokes[4] ?? []
+  const skippedLast = skippedSpoke[skippedSpoke.length - 1]!
+  expect(gridMatrix(cGrid)[skippedLast.y]![skippedLast.x]).toBe('⊘')
 
-  // Consult view (round 1): animated ring, legend, question, failure reason, lock without emoji.
+  // Consult view (round 1): animated ring, legend, question, failure reason, no lock text.
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
   expect(await ui.find({ text: /CONSULT · consult · R1\/1/ })).toBeDefined()
   expect(await ui.find({ text: /^1\/5$/ })).toBeDefined()
   expect(await ui.find({ text: /“Which architecture best separates/ })).toBeDefined()
   expect(await ui.find({ text: /done/ })).toBeDefined()
   expect(await ui.find({ text: /deepseek: HTTP 502/ })).toBeDefined()
-  expect(await ui.find({ text: new RegExp(`⊘ codex locked until ${expectedHhmm}`) })).toBeDefined()
+  // Owner choice: a locked engine is red in the ring, with no lock text under it.
+  expect(await ui.find({ text: /until/ })).toBeUndefined()
   expect(await ui.find({ text: /🔒/ })).toBeUndefined()
   expect((await ui.find({ key: 'consult-ring' }))?.type).toBe('Client')
 
@@ -2633,7 +2615,8 @@ test('consult panel renders consult and debate views, animates ring.tsx, polls 2
 
   const endUi = await $.ui.mount({ ...pane(64), surface: 'terminal' })
   expect(await endUi.find({ text: /CONSULT · round 2 · R2\/2/ })).toBeDefined()
-  expect(await endUi.find({ text: /Consensus reached: separate parser from IO/ })).toBeDefined()
+  expect(await endUi.find({ text: /✓ 3\/3 answered/ })).toBeDefined()
+  expect(await endUi.find({ text: /Consensus reached/ })).toBeUndefined()
   await endUi.unmount()
 
   // Stale run shows `stopped` in warn colour.
@@ -3002,7 +2985,7 @@ test('a receipt row carries the job, its worker, tokens and cost; a running one 
 // ---------------------------------------------------------------- work tree
 
 test('a strip is one glyph per unit, twelve then +N, and done/total always', () => {
-  expect(['done', 'partial', 'failed', 'running', 'todo', 'blocked', 'stopped', 'dry'].map(workGlyph)).toEqual(['●', '◑', '✗', '◐', '○', '✗', '◑', '○'])
+  expect(['done', 'partial', 'failed', 'running', 'todo', 'queued', 'blocked', 'stopped', 'dry'].map(workGlyph)).toEqual(['●', '◑', '✗', '◐', '○', '○', '✗', '◑', '○'])
   expect(stripText(stripOf(['done', 'done', 'doing', 'todo', 'todo']))).toBe('●●◐○○ 2/5')
   const many = stripOf(Array.from({ length: 15 }, () => 'todo'))
   expect([many.glyphs.length, many.more, stripText(many)]).toEqual([WORK_STRIP_MAX, 3, '○○○○○○○○○○○○+3 0/15'])
@@ -3158,28 +3141,19 @@ const workTreeInput = (now: number) => {
   return { jobs, issued, cards, tasks: workTasks, run: null as never, now }
 }
 
-test('the tree hangs work under its task, running first then to-do then done, and caps boxes at two levels', () => {
+test('the tree hangs work under its sub-main headers, running before waiting before done', () => {
   const now = 2_000_000
   const tree = buildWork(workTreeInput(now))
-  expect(tree.title).toBe("WORK · main's tasks")
-  expect(stripText(tree.strip)).toBe('●●◐○○ 2/5')
-  const rows = tree.entries.map(e => (e.kind === 'leaf' && e.leaf ? `${e.kind}:${e.leaf.name}` : `${e.kind}:${e.text ?? ''}`))
-  // t3's task row, its running worker (with its live detail), then its done worker: running first.
-  expect(rows.filter(r => !r.startsWith('detail:'))).toEqual([
-    'task:t3 flightdeck 0.7.0',
-    'leaf:ring-panel',
-    'leaf:receipt',
-    'box:',
-    'closing:○ t4 receipt · ○ t5 docs',
-  ])
-  // The sub-main box follows, then the closing line for the tasks with no row of their own.
-  expect(rows[2]).toBe('detail:')
+  expect(tree.title).toBe('running 3 · waiting 3')
+  const rows = tree.entries.map(e => (e.kind === 'leaf' && e.leaf ? `leaf:${e.leaf.role}:${e.leaf.name}` : e.kind === 'box' ? 'box:' : `${e.kind}:${e.text ?? ''}`))
+  expect(rows).toEqual(['box:', 'leaf:farmer:ring-panel', 'leaf:farmer:receipt'])
   expect(tree.boxes.length).toBe(1)
-  expect(tree.boxes[0]?.title).toBe('sub-main · t4')
-  expect(stripText(tree.boxes[0]!.strip)).toBe('●●◐○○○ 2/6')
-  expect(tree.boxes[0]!.entries[0]).toMatchObject({ kind: 'last', text: '✔ step 2 jobs probe (exit 0)' })
-  expect(tree.boxes[0]!.entries.some(e => e.kind === 'leaf' && e.leaf?.id === 'builder')).toBe(true)
-  expect(rows[rows.length - 1]).toBe('closing:○ t4 receipt · ○ t5 docs')
+  expect(tree.boxes[0]?.title).toBe('sub-main · t4 receipt')
+  expect(tree.boxes[0]!.entries.map(e => (e.kind === 'leaf' ? `leaf:${e.leaf?.role}:${e.leaf?.name}` : `${e.kind}:${e.text ?? ''}`))).toEqual([
+    'leaf:builder:builder',
+    'step:3 steps left: receipt rows · tests · docs',
+  ])
+  expect(tree.boxes[0]!.entries[0]?.leaf?.isLive).toBe(true)
   expect(isWorkEmpty(tree)).toBe(false)
   expect(isWorkEmpty(buildWork({ jobs: [], issued: [], cards: [], tasks: [], run: null, now }))).toBe(true)
 
@@ -3202,7 +3176,7 @@ test('the tree hangs work under its task, running first then to-do then done, an
   const input = workTreeInput(now)
   const noPlan = buildWork({ jobs: input.jobs, issued: input.issued, cards: [], tasks: [], run: null, now })
   expect(stripText(noPlan.strip)).toBe('◐● 1/2')
-  // A bound consult-cli run is one ◎ line: its kind and round, and how many engines answered.
+  // A bound consult-cli run is one ◎ line with its engine count.
   const run = makeRun({ kind: 'all', round: 1, startedAt: now - 72_000, endedAt: now - 1_000 }) as never
   const consulted = buildWork({
     jobs: [],
@@ -3213,40 +3187,37 @@ test('the tree hangs work under its task, running first then to-do then done, an
     now,
   })
   const consultLeaf = consulted.entries.find(e => e.kind === 'leaf')?.leaf
-  expect([consultLeaf?.glyph, consultLeaf?.name, consultLeaf?.note]).toEqual(['◎', 'panel consult R1', '1/5'])
+  expect([consultLeaf?.glyph, consultLeaf?.name, consultLeaf?.note]).toEqual(['◎', 'consult', '· 5 engines · 1/5'])
 })
 
-test('a box whose work is all done collapses 60 s after the last end, and a selected leaf expands', () => {
+test('a done box leaves 60 s after the last end, and a selected leaf expands', () => {
   const now = 3_000_000
   const ended = (id: string, parentId = '') => normalizeCard({ id, type: 'builder', status: 'done', spawnedAt: now - 300_000, endedAt: now - 61_000, parentId })
   const sub = normalizeCard({ id: 'sm', type: 'sub-main', status: 'done', spawnedAt: now - 400_000, endedAt: now - 61_000 })
   const cards = [sub, ended('b', 'sm')]
-  const collapsed = buildWork({ jobs: [], issued: [], cards, tasks: [], run: null, now })
-  expect([COLLAPSE_AFTER_MS, collapsed.boxes[0]?.collapsed]).toEqual([60_000, true])
+  const gone = buildWork({ jobs: [], issued: [], cards, tasks: [], run: null, now })
+  expect([DONE_KEEP_MS, gone.boxes.length]).toEqual([60_000, 0])
   const open = buildWork({ jobs: [], issued: [], cards, tasks: [], run: null, now: now - 1_000 })
-  expect(open.boxes[0]?.collapsed).toBe(false)
+  expect(open.boxes.length).toBe(1)
   // Selected: the leaf's own rows (stage, now, work, think, last, next, status/tests) join its box.
   const selected = buildWork({ ...workTreeInput(now), expanded: 'job:j1' })
   expect(selected.entries.some(e => e.kind === 'expand' && /stage  stage model/.test(e.text ?? ''))).toBe(true)
   expect(selected.entries.some(e => e.kind === 'expand' && /now  edit hooks\/register\.tsx/.test(e.text ?? ''))).toBe(true)
 })
 
-test('the tree fits a given pane height by dropping details, done lines, to-do lines and box bodies in order', () => {
+test('the tree fits a given pane height by dropping ended rows, then boxes, then waiting rows', () => {
   const now = 2_000_000
   const tree = buildWork(workTreeInput(now))
-  const count = (t: typeof tree, kind: string) => t.entries.filter(e => e.kind === kind).length + t.boxes.reduce((n, b) => n + b.entries.filter(e => e.kind === kind).length, 0)
   const full = workRows(tree, 100)
-  const noDetail = fitWork(tree, full - 2, 100)
-  expect([workRows(noDetail, 100) <= full - 2, count(noDetail, 'detail'), count(noDetail, 'leaf') > 0]).toEqual([true, 0, true])
-  const tighter = fitWork(tree, full - 4, 100)
-  expect(workRows(tighter, 100) <= full - 4).toBe(true)
+  expect(full).toBe(7)
+  const tighter = fitWork(tree, full - 1, 100)
+  expect(workRows(tighter, 100) <= full - 1).toBe(true)
   for (const budget of [24, 16, 10, 6, 3, 2]) {
     const fitted = fitWork(tree, budget, 100)
     expect([budget, workRows(fitted, 100) <= budget]).toEqual([budget, true])
   }
-  // The width modes: no detail lines under 56 columns, one line per box under 40.
-  expect(workRows(tree, 100)).toBeGreaterThan(workRows(tree, 50))
-  expect(workRows(tree, 30)).toBe(1 + tree.boxes.length)
+  // Nothing wraps with width: the same rows at every width, and a narrow fit still obeys the budget.
+  expect(workRows(tree, 30)).toBe(workRows(tree, 100))
   const narrow = fitWork(tree, 8, 30)
   expect(workRows(narrow, 30) <= 8).toBe(true)
 })
@@ -3361,31 +3332,30 @@ const workSession = async ($: Parameters<TestBody>[0], on: On) => {
   return clock
 }
 
-test('the work tree renders the example: tasks, a farmer job, a sub-main box and the closing line', WORK_PANELS, async ($, on) => {
+test('the work tree renders the example: a sub-main header with its tree, a farmer job and no legend', WORK_PANELS, async ($, on) => {
   const clock = await workSession($, on)
   await clock.advance(11_000)
   await Promise.resolve()
   await Promise.resolve()
   const ui = await $.ui.mount({ ...pane(66), surface: 'terminal' })
-  expect(await ui.find({ text: /WORK · main's tasks/ })).toBeDefined()
-  expect(await ui.find({ text: /●●◐○○ 2\/5/ })).toBeDefined()
-  expect(await ui.find({ text: /^t3 flightdeck 0\.7\.0$/ })).toBeDefined()
-  expect(await ui.find({ text: /ring-panel ▸ Hydrogen xhigh/ })).toBeDefined()
-  expect(await ui.find({ text: /edit hooks\/register\.tsx · 4 files · 83 st/ })).toBeDefined()
-  expect(await ui.find({ text: /sub-main · t4/ })).toBeDefined()
-  expect(await ui.find({ text: /●●◐○○○ 2\/6/ })).toBeDefined()
-  expect(await ui.find({ text: /last ✔ step 2 jobs probe \(exit 0\)/ })).toBeDefined()
+  expect(await ui.find({ text: /running 3 · waiting 3/ })).toBeDefined()
+  expect(await ui.find({ text: /sub-main · t4 receipt/ })).toBeDefined()
+  expect(await ui.find({ text: /farmer ring-panel/ })).toBeDefined()
+  expect(await ui.find({ text: /▸ Hydrogen xhigh/ })).toBeDefined()
   expect(await ui.find({ text: /^builder$/ })).toBeDefined()
-  expect(await ui.find({ text: /receipt rows/ })).toBeDefined()
-  expect(await ui.find({ text: /○ t4 receipt · ○ t5 docs/ })).toBeDefined()
-  expect(await ui.find({ text: /● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel/ })).toBeDefined()
-  // The top main card carries the plan too: the strip, done/total and the doing task.
-  expect(await ui.find({ text: /▸ t3 flightdeck 0\.7\.0/ })).toBeDefined()
+  expect(await ui.find({ text: /3 steps left: receipt rows · tests · docs/ })).toBeDefined()
+  expect(await ui.find({ text: /● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel/ })).toBeUndefined()
+  // The top main card carries the plan: `plan 2/5`, every task's title, and `→ sub-main` on t4.
+  expect(await ui.find({ text: /^plan$/ })).toBeDefined()
+  expect(await ui.find({ text: /^2\/5$/ })).toBeDefined()
+  expect(await ui.find({ text: /t3 flightdeck 0\.7\.0/ })).toBeDefined()
+  expect(await ui.find({ text: /t4 receipt/ })).toBeDefined()
+  expect(await ui.find({ text: /→ sub-main/ })).toBeDefined()
   expect(spillsOf(await ui.drawn(), 66)).toEqual([])
   await ui.unmount()
 })
 
-test('a selected leaf expands to all its rows, and an ended box collapses to its line', WORK_PANELS, async ($, on) => {
+test('a selected leaf expands to all its rows', WORK_PANELS, async ($, on) => {
   const clock = await workSession($, on)
   await clock.advance(11_000)
   await Promise.resolve()
@@ -3415,22 +3385,22 @@ test('the work tree fits 40x20, 60x30 and 100x45, and a size change re-fits at o
     const h = heightOf(drawn)
     if (h > rows) failures.push(`${cols}x${rows}: ${h} rows`)
     for (const s of spillsOf(drawn, cols)) failures.push(`${cols}x${rows}: ${s}`)
-    expect(await ui.find({ text: /WORK · main's tasks/ })).toBeDefined()
-    if (cols < 56) expect(await ui.find({ text: /edit hooks\/register\.tsx/ })).toBeUndefined()
-    else expect(await ui.find({ text: /edit hooks\/register\.tsx · 4 files · 83 st/ })).toBeDefined()
+    expect(await ui.find({ text: /running 3 · waiting 3/ })).toBeDefined()
+    expect(await ui.find({ text: /farmer ring-panel/ })).toBeDefined()
     await ui.unmount()
   }
-  // Under 40 columns every box is one line: header, strip and clock; no worker lines.
+  // Under 40 columns a box is one line; its children are left out, main's loose workers stay.
   const props = { ...pane(36).props, scroll: { offset: 0, bodyRows: 30 } }
   const narrow = await $.ui.mount({ ...pane(36), props, surface: 'terminal' })
-  expect(await narrow.find({ text: /WORK · main's tasks/ })).toBeDefined()
+  expect(await narrow.find({ text: /running 3 · waiting 3/ })).toBeDefined()
   expect(await narrow.find({ text: /sub-main · t4/ })).toBeDefined()
-  expect(await narrow.find({ text: /ring-panel/ })).toBeUndefined()
+  expect(await narrow.find({ text: /^builder$/ })).toBeUndefined()
+  expect(await narrow.find({ text: /farmer ring-panel/ })).toBeDefined()
   expect(heightOf(await narrow.drawn()) <= 30).toBe(true)
   await narrow.unmount()
   // The same state drawn at another width: nothing about the layout is kept between renders.
   const wide = await $.ui.mount({ ...pane(100), surface: 'terminal' })
-  expect(await wide.find({ text: /edit hooks\/register\.tsx · 4 files · 83 st/ })).toBeDefined()
+  expect(await wide.find({ text: /3 steps left: receipt rows · tests · docs/ })).toBeDefined()
   await wide.unmount()
   expect(failures).toEqual([])
 })
@@ -3448,7 +3418,7 @@ test('an empty plan and no worker leave the work panel out', WORK_PANELS, async 
   await clock.advance(JOBS_NOW)
   await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
-  expect(await ui.find({ text: /WORK/ })).toBeUndefined()
+  expect(await ui.find({ text: /running \d+ · waiting \d+/ })).toBeUndefined()
   expect(await ui.find({ text: /▸/ })).toBeUndefined()
   await ui.unmount()
 })
@@ -3483,7 +3453,8 @@ test('an agy-job call shows as a ◇ real-repo leaf with its worker and a verify
   await Promise.resolve()
   await Promise.resolve()
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
-  expect(await ui.find({ text: /◇verify ▸ agy Sonnet high/ })).toBeDefined()
+  expect(await ui.find({ text: /◇verify/ })).toBeDefined()
+  expect(await ui.find({ text: /▸ agy Sonnet high/ })).toBeDefined()
   expect(await ui.find({ text: /^verify pending$/ })).toBeDefined()
   expect(spillsOf(await ui.drawn(), 64)).toEqual([])
   await ui.unmount()
@@ -3731,7 +3702,7 @@ test('TaskStop with a matching task_id ends the card as stopped', { options: { p
   await later.unmount()
 })
 
-test('an ended leaf is drawn at now = end + 60 s and gone at end + 121 s; a done box likewise', () => {
+test('an ended leaf is drawn at now = end + 60 s and gone at end + 61 s; a done box likewise', () => {
   const end = 1_000_000
   const tasks = [
     { id: 't1', status: 'done', subject: 'one' },
@@ -3752,46 +3723,35 @@ test('an ended leaf is drawn at now = end + 60 s and gone at end + 121 s; a done
     normalizeCard({ id: 'b', type: 'builder', status: 'done', spawnedAt: end - 30_000, endedAt: end, parentId: 'sm' }),
     normalizeCard({ id: 'solo', type: 'builder', status: 'done', spawnedAt: end - 30_000, endedAt: end }),
   ]
-  // At end + 60 s: all four leaf kinds and the box (not yet collapsed) remain drawn.
+  // At end + 60 s: all four leaf kinds and the box are still drawn.
   const at60 = buildWork({ jobs, issued, cards, tasks, run, now: end + 60_000 })
-  expect(DONE_KEEP_MS).toBe(120_000)
+  expect(DONE_KEEP_MS).toBe(60_000)
   expect(at60.entries.filter(e => e.kind === 'leaf').map(e => e.leaf?.kind).sort()).toEqual(['agy', 'card', 'consult', 'job'])
-  expect(at60.entries.some(e => e.kind === 'task' && e.text === 't1 one')).toBe(true)
   expect(at60.boxes.length).toBe(1)
-  expect(at60.boxes[0]?.collapsed).toBe(false)
-  // At end + 61 s .. 120 s: the box stays in its collapsed one-line form.
+  // At end + 61 s every ended leaf and the done box have left; probe & receipt still keep the job.
   const at61 = buildWork({ jobs, issued, cards, tasks, run, now: end + 61_000 })
-  expect(at61.boxes.length).toBe(1)
-  expect(at61.boxes[0]?.collapsed).toBe(true)
-  // At end + 121 s: ended leaves, the done box, and the done task row are all gone; probe & receipt still keep the job.
-  const at121 = buildWork({ jobs, issued, cards, tasks, run, now: end + 121_000 })
-  expect(at121.entries.some(e => e.kind === 'leaf')).toBe(false)
-  expect(at121.boxes.length).toBe(0)
-  expect(at121.entries.some(e => e.kind === 'task' && e.text === 't1 one')).toBe(false)
-  expect(orderJobs(jobs, end + 121_000).length).toBe(1)
-  expect(turnJobs(jobs, issued, end - 40_000, end + 121_000).length).toBe(2)
+  expect(at61.entries.length).toBe(0)
+  expect(at61.boxes.length).toBe(0)
+  expect(orderJobs(jobs, end + 61_000).length).toBe(1)
+  expect(turnJobs(jobs, issued, end - 40_000, end + 61_000).length).toBe(2)
 
-  // Task ordering: doing tasks first, then todo with leaves, then done with kept leaves.
+  // Running work first, then waiting, then ended: the loose leaves order.
   const ordered = buildWork({
     jobs: [
       normalizeJob({ jobid: 'jd', job: 'd', status: 'done', ts: 1, endedAt: end }),
       normalizeJob({ jobid: 'jt', job: 't', status: 'running', ts: 2 }),
       normalizeJob({ jobid: 'jg', job: 'g', status: 'running', ts: 3 }),
     ],
-    issued: normalizeIssued([
-      { callId: 'c1', kind: 'job', agentId: '', at: 1, task: 't1', jobid: 'jd' },
-      { callId: 'c2', kind: 'job', agentId: '', at: 2, task: 't3', jobid: 'jt' },
-      { callId: 'c3', kind: 'job', agentId: '', at: 3, task: 't2', jobid: 'jg' },
-    ]),
+    issued: [],
     cards: [],
     tasks,
     run: null,
     now: end + 30_000,
   })
-  expect(ordered.entries.filter(e => e.kind === 'task').map(e => e.text)).toEqual(['t2 two', 't3 three', 't1 one'])
+  expect(ordered.entries.filter(e => e.kind === 'leaf').map(e => e.leaf?.name)).toEqual(['g', 't', 'd'])
 })
 
-test('all tasks done, nothing live: body is all done · 3 tasks', { options: { panels: 'main,work' } }, async ($, on) => {
+test('all tasks done, nothing live: the work box is not drawn; the main card is all plan', { options: { panels: 'main,work' } }, async ($, on) => {
   const now = 2_000_000
   const allDoneTasks = [
     { id: 't1', status: 'done', subject: 'one' },
@@ -3799,35 +3759,12 @@ test('all tasks done, nothing live: body is all done · 3 tasks', { options: { p
     { id: 't3', status: 'done', subject: 'three' },
   ]
   const doneTree = buildWork({ jobs: [], issued: [], cards: [], tasks: allDoneTasks, run: null, now })
-  expect(doneTree.glyph).toBe('●')
   expect(doneTree.status).toBe('done')
-  expect(stripText(doneTree.strip)).toBe('●●● 3/3')
-  expect(doneTree.entries).toEqual([{ kind: 'closing', depth: 0, text: 'all done · 3 tasks' }])
-  expect(isWorkEmpty(doneTree)).toBe(false)
+  expect(isWorkEmpty(doneTree)).toBe(true)
 
-  // Header glyph is ◐ while anything is live even when every task is done or t3 is todo.
+  // Header glyph is ◐ while anything is live.
   const liveJob = normalizeJob({ jobid: 'jl', job: 'live', status: 'running', ts: (now - 10_000) / 1000, pid: 1 })
   expect(buildWork({ jobs: [liveJob], issued: [], cards: [], tasks: allDoneTasks, run: null, now }).glyph).toBe('◐')
-  expect(
-    buildWork({
-      jobs: [liveJob],
-      issued: [],
-      cards: [],
-      tasks: [allDoneTasks[0]!, allDoneTasks[1]!, { id: 't3', status: 'todo', subject: 'three' }],
-      run: null,
-      now,
-    }).glyph,
-  ).toBe('◐')
-  expect(
-    buildWork({
-      jobs: [],
-      issued: [],
-      cards: [],
-      tasks: [allDoneTasks[0]!, allDoneTasks[1]!, { id: 't3', status: 'todo', subject: 'three' }],
-      run: null,
-      now,
-    }).glyph,
-  ).toBe('○')
 
   const clock = engine(on)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -3842,11 +3779,224 @@ test('all tasks done, nothing live: body is all done · 3 tasks', { options: { p
   await clock.advance(JOBS_NOW)
   await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
   const ui = await $.ui.mount({ ...pane(66), surface: 'terminal' })
-  const headerGlyph = await ui.find({ type: 'Text', text: /^●$/ })
-  expect(headerGlyph?.props.color).toBe(PALETTES.theme.gate)
-  const bodyLine = await ui.find({ text: /^all done · 3 tasks$/ })
-  expect(bodyLine?.props.dimColor).toBe(true)
+  expect(await ui.find({ text: /running \d+ · waiting \d+/ })).toBeUndefined()
+  expect(await ui.find({ text: /^3\/3$/ })).toBeDefined()
+  for (const title of ['t1 one', 't2 two', 't3 three']) expect(await ui.find({ text: new RegExp(`^${title}$`) })).toBeDefined()
   expect(spillsOf(await ui.drawn(), 66)).toEqual([])
   await ui.unmount()
+})
+
+// ---------------------------------------------------------------- 0.9.0 pane rules
+
+test('the plan keeps the doing task first and folds what is left into +N done', () => {
+  const tasks = [
+    { id: 't1', status: 'done', subject: 'scaffold pane' },
+    { id: 't2', status: 'done', subject: 'worker tree' },
+    { id: 't3', status: 'doing', subject: 'polish pane' },
+    { id: 't4', status: 'todo', subject: 'tests' },
+    { id: 't5', status: 'todo', subject: 'docs' },
+  ]
+  expect(fitPlan(tasks, 5)).toEqual({ rows: tasks, more: 0, isDone: false })
+  const tight = fitPlan(tasks, 2)
+  expect(tight.rows.map(t => t.id)).toEqual(['t3'])
+  expect([tight.more, tight.isDone]).toEqual([2, true])
+  const wider = fitPlan(tasks, 4)
+  expect(wider.rows.map(t => t.id)).toEqual(['t3', 't4', 't5'])
+  expect([wider.more, wider.isDone]).toEqual([2, true])
+  expect(subMainTasks([
+    normalizeCard({ id: 'sm', type: 'sub-main', task: 't4' }),
+    normalizeCard({ id: 'b', type: 'builder', task: 't5', parentId: 'sm' }),
+  ])).toEqual(new Set(['t4']))
+})
+
+test('the question line is the first sentence, drawn only when it fits whole', () => {
+  expect(firstSentence('Which approach? Because it matters.')).toBe('Which approach?')
+  expect(firstSentence('Scope: do it now')).toBe('Scope:')
+  expect(firstSentence('Line one\nline two')).toBe('Line one')
+  expect(questionLine('Short question? And more', 40)).toBe('“Short question?”')
+  expect(questionLine('A very long question that will not fit?', 10)).toBe('')
+  expect(questionLine('', 40)).toBe('')
+})
+
+test('an engine model comes from its model field or the part after its first colon', () => {
+  expect(engineModel({ name: 'agy:gemini-4-argon-high' })).toBe('gemini-4-argon-high')
+  expect(engineModel({ name: 'nim:nvidia/nemotron-3-ultra' })).toBe('nvidia/nemotron-3-ultra')
+  expect(engineModel({ name: 'copilot', model: 'gpt-6.1-sol' })).toBe('gpt-6.1-sol')
+  expect(engineModel({ name: 'copilot' })).toBe('')
+  // Locked engines become one short note, never the raw `skipped: locked until ...` text.
+  const run = parseConsult(
+    JSON.stringify({
+      run: makeRun({
+        endedAt: 50_000,
+        engines: [
+          { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 20_000, reason: null, note: null },
+          { name: 'codex', state: 'skipped', startedAt: null, endedAt: null, reason: 'skipped: locked until 2026-11-16 22:54', note: null },
+          { name: 'gemini', state: 'skipped', startedAt: null, endedAt: null, reason: 'skipped: locked until 2026-11-16 23:10', note: null },
+        ],
+      }),
+      locks: {},
+    }),
+  )!.run!
+  expect(consultLockNote(run, [], 200)).toBe('⊘ codex until 22:54 · ⊘ gemini until 23:10')
+  expect(consultLockNote(run, [], 20)).toBe('⊘ codex until 22:54')
+  const summary = consultSummaryLine(run, 80)
+  expect(summary).toBe('✓ 1/3 answered · ⊘ codex · ⊘ gemini')
+  expect(consultSummaryLine(run, 20)).toContain('✓ 1/3 answered')
+  expect(summary).not.toContain('skipped')
+})
+
+test('the ring draws one dim model row centred under each label, truncated to its width + 4', () => {
+  const run = parseConsult(
+    JSON.stringify({
+      run: makeRun({
+        endedAt: null,
+        engines: [
+          { name: 'agy:gemini-4-argon-high', state: 'ok', startedAt: 10_000, endedAt: 20_000, reason: null, note: null },
+          { name: 'nim:nvidia/nemotron-3-ultra-550b', state: 'running', startedAt: 10_000, endedAt: null, reason: null, note: null },
+          { name: 'copilot', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null, model: 'gpt-6.1-sol' },
+          { name: 'plain', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null },
+        ],
+      }),
+      locks: {},
+    }),
+  )!.run!
+  const grid = buildConsultGrid(run, 60, PALETTES.theme, 30_000)
+  const models = grid.layout.nodes.map(nd => nd.model)
+  for (const [i, raw] of [
+    [0, 'gemini-4-argon-high'],
+    [1, 'nvidia/nemotron-3-ultra-550b'],
+    [2, 'gpt-6.1-sol'],
+  ] as const) {
+    const nd = grid.layout.nodes[i]!
+    expect(cellWidth(models[i]!)).toBeLessThanOrEqual(nd.width + 4)
+    expect(raw.startsWith(models[i]!.replace(/…$/, ''))).toBe(true)
+    if (cellWidth(raw) > cellWidth(models[i]!)) expect(models[i]).toContain('…')
+  }
+  expect(models[3]).toBeUndefined()
+  for (const nd of grid.layout.nodes.filter(x => x.model !== undefined)) {
+    expect(nd.modelY).toBe(nd.labelY + 1)
+    expect(cellWidth(nd.model!)).toBeLessThanOrEqual(nd.width + 4)
+    const centre = nd.modelX! + (cellWidth(nd.model!) - 1) / 2
+    expect(Math.abs(centre - (nd.labelX + (nd.width - 1) / 2))).toBeLessThanOrEqual(1)
+    const rowRun = (grid.rows[nd.modelY!] ?? []).find(r => nd.modelX! >= r.x && nd.modelX! < r.x + cellWidth(r.text))
+    expect([rowRun?.text, rowRun?.dim]).toEqual([nd.model, true])
+  }
+  // No model field and no colon in the label: no model row at all.
+  const bare = buildConsultGrid(
+    parseConsult(
+      JSON.stringify({
+        run: makeRun({
+          engines: [
+            { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 20_000, reason: null, note: null },
+            { name: 'codex', state: 'queued', startedAt: null, endedAt: null, reason: null, note: null },
+          ],
+        }),
+        locks: {},
+      }),
+    )!.run!,
+    60,
+    PALETTES.theme,
+    30_000,
+  )
+  expect(bare.layout.nodes.every(nd => nd.model === undefined)).toBe(true)
+})
+
+test('a locked engine draws a broken faint spoke ending in ⊘, with no clock', () => {
+  const run = parseConsult(
+    JSON.stringify({
+      run: makeRun({
+        endedAt: null,
+        engines: [
+          { name: 'copilot', state: 'ok', startedAt: 10_000, endedAt: 20_000, reason: null, note: null },
+          { name: 'codex', state: 'skipped', startedAt: null, endedAt: null, reason: 'skipped: locked until 2026-11-16 22:54', note: null },
+        ],
+      }),
+      locks: {},
+    }),
+  )!.run!
+  const grid = buildConsultGrid(run, 60, PALETTES.theme, 30_000)
+  const nd = grid.layout.nodes[1]!
+  expect(nd.label).toBe('⊘ codex')
+  expect(nd.label).not.toMatch(/\d+s/)
+  const sp = grid.layout.spokes[1]!
+  const mat = gridMatrix(grid)
+  expect(sp.length).toBeGreaterThan(2)
+  for (let k = 0; k < sp.length - 1; k += 1) {
+    const drawn = mat[sp[k]!.y]?.[sp[k]!.x]
+    expect(drawn === '·' ? k % 3 === 0 : drawn === undefined || drawn === ' ').toBe(true)
+  }
+  expect(mat[sp[sp.length - 1]!.y]?.[sp[sp.length - 1]!.x]).toBe('⊘')
+  const lastRun = (grid.rows[sp[sp.length - 1]!.y] ?? []).find(
+    r => sp[sp.length - 1]!.x >= r.x && sp[sp.length - 1]!.x < r.x + cellWidth(r.text),
+  )
+  expect(lastRun?.color).toBe(PALETTES.theme.amber)
+})
+
+test('plan and work glyphs take their colour from status, never from the role', { options: { panels: 'main,work' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('agent.spawn', (_$, e) => ({ model: 'claude-sonnet-5-5', agentId: e.description }))
+  const tasks = [
+    { id: 't1', status: 'done', subject: 'scaffold pane' },
+    { id: 't2', status: 'failed', subject: 'worker tree' },
+    { id: 't3', status: 'doing', subject: 'polish pane' },
+    { id: 't4', status: 'stopped', subject: 'tests' },
+    { id: 't5', status: 'todo', subject: 'docs' },
+  ]
+  on('process.run', (_$, e) => {
+    if (e.argv[2] === MESH_PY) return { value: { exitCode: 0, stdout: JSON.stringify(tasks), stderr: '' } } as never
+    if (e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.agent.spawn({ ...spawn('sub-main', 'demo'), prompt: 'do it\ntask: t4' })
+  const ui = await $.ui.mount({ ...pane(66), surface: 'terminal' })
+  const headerTexts = (await ui.findAll({ type: 'Text' })).map(n => n.text)
+  expect(headerTexts.some(x => /^FLIGHTDECK · /.test(x))).toBe(true)
+  expect(headerTexts.some(x => /^◐ t3 polish pane$/.test(x))).toBe(true)
+  const colorsOf = async (glyph: string) =>
+    (await ui.findAll({ type: 'Text', text: new RegExp(`^${glyph}$`) })).map(n => n.props.color)
+  expect(new Set(await colorsOf('✓'))).toEqual(new Set([PALETTES.theme.gate]))
+  expect(new Set(await colorsOf('✗'))).toEqual(new Set([PALETTES.theme.warn]))
+  expect(new Set(await colorsOf('◑'))).toEqual(new Set([PALETTES.theme.amber]))
+  expect(new Set(await colorsOf('◐'))).toEqual(new Set([PALETTES.theme.agent]))
+  expect(new Set(await colorsOf('○'))).toEqual(new Set([PALETTES.theme.faint]))
+  // The role is written as plain text: `sub-main`, not a colour.
+  const role = await ui.find({ text: /sub-main demo/ })
+  expect(role).toBeDefined()
+  expect(role?.props.color).toBeUndefined()
+  // No colour legend in the header, and no glyph legend in the work box.
+  expect(await ui.find({ key: 'legend' })).toBeUndefined()
+  expect(await ui.find({ text: /■ main/ })).toBeUndefined()
+  expect(await ui.find({ text: /● done  ◑ partial  ✗ failed  ◐ running  ○ to do  ◎ panel/ })).toBeUndefined()
+  // The work box is titled by its counts.
+  expect(await ui.find({ text: /running 1 · waiting 0/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a failed row stays until the next turn starts; a stale card draws ⊘ and leaves after a minute', () => {
+  const end = 1_000_000
+  const failed = normalizeJob({ jobid: 'jf', job: 'fail', status: 'failed', ts: (end - 10_000) / 1000, endedAt: end })
+  const done = normalizeJob({ jobid: 'jd', job: 'ok', status: 'done', ts: (end - 10_000) / 1000, endedAt: end })
+  const later = buildWork({ jobs: [failed, done], issued: [], cards: [], tasks: [], run: null, now: end + 120_000 })
+  expect(later.entries.filter(e => e.kind === 'leaf').map(e => e.leaf?.name)).toEqual(['fail'])
+  // The next turn started after the failure: it leaves then.
+  const nextTurn = buildWork({ jobs: [failed, done], issued: [], cards: [], tasks: [], run: null, now: end + 120_000, turnStartedAt: end + 10_000 })
+  expect(nextTurn.entries.length).toBe(0)
+  // The same turn started before it: still there.
+  const sameTurn = buildWork({ jobs: [failed, done], issued: [], cards: [], tasks: [], run: null, now: end + 120_000, turnStartedAt: end - 10_000 })
+  expect(sameTurn.entries.filter(e => e.kind === 'leaf').map(e => e.leaf?.name)).toEqual(['fail'])
+
+  const now = 2_000_000
+  const ghost = normalizeCard({ id: 'g', type: 'builder', description: 'ghost', status: 'running', spawnedAt: now - 20 * 60_000, lastAt: now - STALE_AFTER_MS - 1_000 })
+  const stale = buildWork({ jobs: [], issued: [], cards: [ghost], tasks: [], run: null, now })
+  const leaf = stale.entries.find(e => e.kind === 'leaf')?.leaf
+  expect([leaf?.glyph, leaf?.status, leaf?.isLive, leaf?.isStale]).toEqual(['⊘', 'stale', false, true])
+  const gone = buildWork({ jobs: [], issued: [], cards: [ghost], tasks: [], run: null, now: now + 61_000 })
+  expect(gone.entries.length).toBe(0)
 })
 

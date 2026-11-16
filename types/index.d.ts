@@ -80,7 +80,7 @@ export type CheckpointTail = {
   status: string
   /** Its `tests:` value. */
   tests: string
-  /** Step lines in the tail, oldest first, for a sub-main box's strip. */
+  /** Step lines in the tail, oldest first, for a sub-main's expanded rows. */
   steps: CheckpointStep[]
 }
 
@@ -114,6 +114,9 @@ export type AgentCard = {
   checkpoint: string
   /** The checkpoint's tail, as the last probe read it; null until one reads. */
   check: CheckpointTail | null
+  /** When an event last touched the card, in ms since the epoch: a running card with none for 10
+   *  minutes draws `⊘ stale`. 0 in state saved before it was kept. */
+  lastAt?: number
 }
 
 /** A model loop whose id matches no card: a workflow agent, a compaction or a memory fork. */
@@ -181,6 +184,8 @@ export type ConsultEngine = {
   endedAt: number | null
   reason: string | null
   note: string | null
+  /** The model the engine runs, drawn in one dim row under its label; absent = no model row. */
+  model?: string
 }
 
 export type ConsultRun = {

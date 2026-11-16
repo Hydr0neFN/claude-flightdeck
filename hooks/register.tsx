@@ -6,19 +6,21 @@ import {
   AGY_SHOW_MS,
   PYTHON_CANDIDATES,
   WORK_DETAIL_COLS,
-  WORK_LEGEND,
   WORK_NARROW,
-  WORK_STRIP_MAX,
   buildWork,
   checkpointOfAnswer,
   checkpointPath,
   checkpointProbe,
+  consultSummaryLine,
+  engineModel,
+  fitPlan,
   fitWork,
   isRunningStatus,
+  isTodoStatus,
   isWorkEmpty,
   parseCheckpoint,
-  stripOf,
-  stripText,
+  questionLine,
+  subMainTasks,
   treePrefixes,
   fmtSpan,
   workGlyph,
@@ -35,7 +37,6 @@ import {
   DEFAULT_VIEW,
   EDIT_TOOLS,
   SCHEMA_VERSION,
-  activeConsultLocks,
   afterCall,
   applyStep,
   bucketOf,
@@ -84,7 +85,6 @@ import {
   consultTimeline,
   describeInput,
   endConsult,
-  fitLegend,
   fmtClock,
   fmtCny,
   fmtDuration,
@@ -101,7 +101,6 @@ import {
   limitOf,
   fmtResetIn,
   feedLabel,
-  fmtSpeed,
   listOf,
   logRows,
   marksIn,
@@ -492,7 +491,7 @@ async function pollWorkers($: EngineInterface, lock: { inFlight: boolean; python
       }
       const found = res && res.exitCode === 0 ? parseJobText(`backend: ${res.stdout.trim()}`).backend : ''
       if (found && found !== c.worker) {
-        await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(x => (x.id === c.id ? { ...x, worker: found } : x)))
+        await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(x => (x.id === c.id ? { ...x, worker: found, lastAt: now } : x)))
       }
     }
   } catch {
@@ -641,7 +640,7 @@ async function pollCheckpoints($: EngineInterface, lock: CheckpointLock) {
         }
       }
       const tail = res && res.exitCode === 0 ? parseCheckpoint(res.stdout) : null
-      if (tail) await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(x => (x.id === c.id ? { ...x, check: tail } : x)))
+      if (tail) await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(x => (x.id === c.id ? { ...x, check: tail, lastAt: now } : x)))
     }
   } catch {
     // Silent: the card keeps the checkpoint rows it last read.
@@ -653,7 +652,8 @@ async function pollCheckpoints($: EngineInterface, lock: CheckpointLock) {
 /** Stores a checkpoint tail on a card, when it has one. */
 async function noteCheckpoint($: EngineInterface, id: string, tail: CheckpointTail | null) {
   if (!tail) return
-  await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(c => (c.id === id ? { ...c, check: tail } : c)))
+  const at = await $.clock.now()
+  await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(c => (c.id === id ? { ...c, check: tail, lastAt: at } : c)))
 }
 
 /** Marks a card ended (by `turn.complete` or `TaskStop`), reads its final checkpoint, logs and updates status. */
@@ -671,7 +671,7 @@ async function finishCard(
   await update($, agents, list =>
     listOf<unknown>(list)
       .map(normalizeCard)
-      .map(c => (c.id === card.id ? { ...c, status, endedAt: at, answer, checkpoint } : c)),
+      .map(c => (c.id === card.id ? { ...c, status, endedAt: at, answer, checkpoint, lastAt: at } : c)),
   )
   // One last read of the checkpoint, so an ended card shows its final status and tests.
   if (checkpoint) {
@@ -800,7 +800,7 @@ export const register: Register = (on, options) => {
         jobsLock.stopTimer = typeof stopJ === 'function' ? (stopJ as () => void) : undefined
       }
     }
-    // The plan behind the tree and the main card's tasks row: read even when only `main` shows it.
+    // The plan behind the main card's plan rows: read even when only `main` shows it.
     if (cfg.panels.includes('work') || cfg.panels.includes('main')) {
       await pollMesh($, meshLock)
       stopMeshTimer?.()
@@ -963,13 +963,14 @@ export const register: Register = (on, options) => {
     if (before && before.status !== 'running') {
       // Flipped in the write: a resume its agent.spawn already logged is not logged again.
       let isResumed = false
+      const at = await $.clock.now()
       await update($, agents, list =>
         listOf<unknown>(list)
           .map(normalizeCard)
           .map(c => {
             if (c.id !== id || c.status === 'running') return c
             isResumed = true
-            return resumeCard(c)
+            return { ...resumeCard(c), lastAt: at }
           }),
       )
       if (isResumed) {
@@ -981,7 +982,8 @@ export const register: Register = (on, options) => {
     const [cards, a] = await Promise.all([getCards($), getArchitect($)])
     if (cards.some(c => c.id === id)) {
       const step = { model: e.model, usage: result.usage, stopReason: result.stopReason }
-      await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(c => (c.id === id ? applyStep(c, step) : c)))
+      const at = await $.clock.now()
+      await update($, agents, list => listOf<unknown>(list).map(normalizeCard).map(c => (c.id === id ? { ...applyStep(c, step), lastAt: at } : c)))
       if (result.stopReason === 'max_tokens') await say($, await whoIs($, id), 'hit max_tokens', 'error', id)
     } else if (!a.ids.includes(id)) {
       const now = await $.clock.now()
@@ -1115,10 +1117,11 @@ export const register: Register = (on, options) => {
     const text = shorten(describeInput(e.tool, e), 64)
     if (e.agentId) {
       const id = e.agentId
+      const at = await $.clock.now()
       await update($, agents, list =>
         listOf<unknown>(list)
           .map(normalizeCard)
-          .map(c => (c.id === id ? noteJob(noteTool(c, { tool: e.tool, text, isError: hasFailed || ran.deny !== undefined }), didRun ? ran.text : '') : c)),
+          .map(c => (c.id === id ? { ...noteJob(noteTool(c, { tool: e.tool, text, isError: hasFailed || ran.deny !== undefined }), didRun ? ran.text : ''), lastAt: at } : c)),
       )
     }
     // The log keeps what is worth a glance: refusals, errors and edits; the rest is on the cards.
@@ -1174,13 +1177,15 @@ export const register: Register = (on, options) => {
     const type = e.name ?? e.subagentType
     const brief = spawnPrompt || briefs.get(e.description) || ''
     const cwd = brief || /builder/i.test(type) ? await $.session.cwd().catch(() => '') : ''
+    const at = await $.clock.now()
     const card: AgentCard = {
       ...normalizeCard({}),
       id,
       type,
       model: started.model,
       description: e.description,
-      spawnedAt: await $.clock.now(),
+      spawnedAt: at,
+      lastAt: at,
       parentId: e.parentAgentId ?? '',
       task: taskOfBrief(brief),
       checkpoint: checkpointPath(brief, type, cwd),
@@ -1310,7 +1315,7 @@ export const register: Register = (on, options) => {
     // The body rows the host gives the pane (the same way it gives bodyColumns): the hard height limit.
     const bodyRows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
     // The whole delegation as one tree, rebuilt on every render from the pane size (rule 6).
-    const work = buildWork({ jobs: jobsNow, issued: issuedNow, cards, tasks: meshTasks, run: cs?.run ?? null, now, expanded: v.expanded })
+    const work = buildWork({ jobs: jobsNow, issued: issuedNow, cards, tasks: meshTasks, run: cs?.run ?? null, now, expanded: v.expanded, turnStartedAt: t.startedAt })
     // A panel with nothing to show yet takes no room: most sessions never spawn an agent.
     const isEmpty: Record<Panel, boolean> = {
       main: false,
@@ -1359,11 +1364,13 @@ export const register: Register = (on, options) => {
         ? C.gate
         : s === 'partial' || s === 'stopped'
           ? C.amber
-          : s === 'failed' || s === 'refused' || s === 'blocked'
+          : s === 'failed' || s === 'refused' || s === 'blocked' || s === 'stale'
             ? C.warn
-            : isRunningStatus(s)
-              ? C.agent
-              : C.faint
+            : isTodoStatus(s)
+              ? C.faint
+              : isRunningStatus(s)
+                ? C.agent
+                : C.faint
 
     const isTerminal = e.surface === 'terminal'
     // A row of marks (gate checks, loop dots), sized by `marksIn`. Should a surface draw them wider
@@ -1373,10 +1380,6 @@ export const register: Register = (on, options) => {
         <Text wrap="truncate-start">{marks}</Text>
       </Box>
     )
-    // A terminal's border row stands apart from the text above it; a graphical surface draws the
-    // border flush against it, so the legend keeps one row of air there.
-    const legendGap = isTerminal ? 0 : 1
-
     // A line of coloured pieces, drawn as a row of boxes the way the log draws its lines. A Text nesting
     // coloured Texts truncates as one line in a terminal, but the desktop app wraps each nested piece on its
     // own, lays truncating ones out as blocks of their own, and collapses runs of spaces. So pieces sit `gap`
@@ -1411,14 +1414,13 @@ export const register: Register = (on, options) => {
     }
 
     // ---- main
-    const effortN = { low: 1, medium: 2, high: 3, xhigh: 4, max: 4 }[m.effort] ?? 0
     const ctxFill = contextFill(u, cfg.ctxBudget)
     const ctxGauge = ctxFill.pct !== null ? gauge(ctxFill.pct, 10) : null
     const showFeed = cfg.feedCommand.length > 0 && f !== null
     const hasFeedA = showFeed && (f.dsCny !== null || f.gem.length > 0)
     const hasFeedB = showFeed && (f.task !== '' || f.cwd !== '')
     // The main card: a fixed label column, then the row's pieces, so gauges line up from row to row.
-    const LABEL_W = 7
+    const LABEL_W = 5
     const row = (w: number, label: string, pieces: (Piece | null)[], gap = 1) => (
       <Box>
         <Box width={LABEL_W} flexShrink={0}>
@@ -1441,95 +1443,131 @@ export const register: Register = (on, options) => {
         ],
       }
     }
-    const mainPanel = (w: number) => (
-      <Box flexDirection="column" borderStyle="round" borderColor={C.main} paddingX={1} width={w}>
-        <Box justifyContent="space-between">
-          <Text color={C.main} bold wrap="truncate">
-            {modelName} · main
-          </Text>
-          <Box flexShrink={0}>
-            <Text color={m.isRunning ? C.main : C.dim}>{m.isRunning ? '● working' : '○ idle'}</Text>
+    // A permission mode is kept only when it is not the default, in its short form (`bypass`).
+    const shortMode = (mode: string): string => {
+      const s = mode.toLowerCase()
+      if (s.includes('bypass')) return 'bypass'
+      if (s.includes('accept')) return 'accept'
+      if (s.includes('plan')) return 'plan'
+      if (s.includes('dont') || s.includes("don't")) return 'dont-ask'
+      return mode
+    }
+    const showMode = m.mode !== '' && !/^default$/i.test(m.mode)
+    const planSet = subMainTasks(cards)
+    const planBudget = Math.max(1, bodyRows - 18)
+    const planFit = fitPlan(meshTasks, planBudget)
+    const planDone = meshTasks.filter(x => x.status === 'done' || x.status === 'ok').length
+    const planGlyph = (status: string) => {
+      const g = workGlyph(status)
+      return g === '●' ? '✓' : g
+    }
+    const isDoingTask = (status: string) => status === 'doing' || status === 'running'
+    const doingTask = meshTasks.find(x => isDoingTask(x.status))
+    const mainPanel = (w: number) => {
+      const inner = w - 4
+      const frame = (key: string, children: RenderChildren) => (
+        <Box key={key} width={w}>
+          <Text color={C.main}>│</Text>
+          <Box width={1} flexShrink={0} />
+          <Box width={inner} overflow="hidden">
+            {children}
           </Box>
+          <Box width={1} flexShrink={0} />
+          <Text color={C.main}>│</Text>
         </Box>
-        {row(w, 'effort', [
-          {
-            spans: [
-              { text: `${'▮'.repeat(effortN) + '▯'.repeat(4 - effortN)} `, color: C.main },
-              { text: m.effort || '—', color: C.main, bold: true },
-            ],
-          },
-          m.mode ? { lead: 2, spans: [{ text: m.mode, dim: true }] } : null,
-          { lead: 2, spans: [{ text: `${m.steps} req`, dim: true }] },
-        ])}
-        {ctxGauge
-          ? row(w, 'ctx', [
-              {
-                spans: [
-                  { text: ctxGauge.on, color: ctxFill.pct !== null && ctxFill.pct >= 80 ? C.warn : C.main },
-                  { text: ctxGauge.off, color: C.faint },
-                  { text: ` ${String(Math.round(ctxFill.pct ?? 0)).padStart(3)}%`, bold: true },
-                ],
-              },
-              u.tokens !== null
-                ? { lead: 1, spans: [{ text: `${u.isFillEstimate ? '~' : ''}${kTokens(u.tokens)}/${kTokens(ctxFill.window)}`, dim: true }] }
-                : null,
-              u.compactions > 0 ? { spans: [{ text: compactMark(u), color: C.amber }], lead: 1 } : null,
-              // Left out first when the line is short; the ~ in the mark still says it.
-              u.compactions > 0 && u.isCompactEstimate ? { spans: [{ text: '(estimated)', color: C.faint }] } : null,
-            ])
-          : null}
-        {u.limits.length > 0
-          ? row(
-              w,
-              'claude',
-              // Both windows with their reset times fit from 58 columns; narrower, the times are left out.
-              u.limits.slice(0, 2).map((l, i) => meter(limitLabel(l.kind), l.pct, l.resetsAt ?? null, w, i > 0 ? 2 : 0)),
-            )
-          : null}
-        {hasFeedA && f && f.gem.length > 0
-          ? row(
-              w,
-              'agy',
-              f.gem.slice(0, 2).map((gm, i) => meter(feedLabel(gm.label), gm.pct, gm.resetsAt, w, i > 0 ? 2 : 0)),
-            )
-          : null}
-        {u.costUsd !== null || (hasFeedA && f && f.dsCny !== null)
-          ? row(w, 'spend', [
-              u.costUsd !== null
-                ? { spans: [{ text: fmtUsd(u.costUsd), color: C.text, bold: true }, { text: ' session', dim: true }] }
-                : null,
-              hasFeedA && f && f.dsCny !== null
-                ? { lead: 2, spans: [{ text: 'DS ', dim: true }, { text: fmtCny(f.dsCny), color: C.text, bold: true }] }
-                : null,
-            ])
-          : null}
-        {hasFeedB && f && f.task ? row(w, 'task', [{ fill: true, spans: [{ text: f.task, color: C.text }] }]) : null}
-        {hasFeedB && f && f.cwd
-          ? row(w, 'cwd', [
-              { spans: [{ text: f.cwd, dim: true }] },
-              f.branch ? { spans: [{ text: f.branch, color: C.main }] } : null,
-            ])
-          : null}
-        {m.speed ? row(w, 'last', [{ spans: [{ text: fmtSpeed(m.speed), dim: true }] }]) : null}
-        {meshTasks.length > 0 ? (() => {
-          // The plan at a glance: the strip, done/total, and the task being done now.
-          const st = stripOf(meshTasks.map(x => x.status))
-          const doing = meshTasks.find(x => x.status === 'doing')
-          return row(w, 'tasks', [
-            {
-              spans: [
-                ...meshTasks.slice(0, WORK_STRIP_MAX).map(t => ({ text: workGlyph(t.status), color: toneOfStatus(t.status) })),
-                ...(st.more > 0 ? [{ text: `+${st.more}`, color: C.faint }] : []),
+      )
+      const rows: RenderChildren[] = []
+      rows.push(
+        frame(
+          'main-ctx',
+          row(w, 'ctx', [
+            ...(ctxGauge && ctxFill.pct !== null
+              ? [
+                  {
+                    spans: [
+                      { text: ctxGauge.on, color: ctxFill.pct >= 80 ? C.warn : C.main },
+                      { text: ctxGauge.off, color: C.faint },
+                      { text: ` ${String(Math.round(ctxFill.pct)).padStart(3)}%`, bold: true },
+                    ],
+                  },
+                  ...(u.tokens !== null
+                    ? [{ lead: 1, spans: [{ text: `${u.isFillEstimate ? '~' : ''}${kTokens(u.tokens)}/${kTokens(ctxFill.window)}`, dim: true }] }]
+                    : []),
+                  ...(u.compactions > 0 ? [{ spans: [{ text: compactMark(u), color: C.amber }], lead: 1 }] : []),
+                  ...(u.compactions > 0 && u.isCompactEstimate ? [{ spans: [{ text: '(estimated)', color: C.faint }], lead: 1 }] : []),
+                ]
+              : u.compactions > 0
+                ? [{ spans: [{ text: compactMark(u), color: C.amber }] }]
+                : []),
+            { lead: 2, spans: [{ text: 'effort ', dim: true }, { text: m.effort || '—', color: C.main, bold: true }] },
+            showMode ? { lead: 2, spans: [{ text: shortMode(m.mode), dim: true }] } : null,
+          ]),
+        ),
+      )
+      if (u.limits.length > 0 || u.costUsd !== null || (hasFeedA && f && f.dsCny !== null)) {
+        rows.push(
+          frame(
+            'main-windows',
+            line(
+              [
+                ...u.limits.slice(0, 2).map((l, i) => meter(limitLabel(l.kind), l.pct, l.resetsAt ?? null, w, i > 0 ? 2 : 0)),
+                u.costUsd !== null
+                  ? { lead: 2, spans: [{ text: fmtUsd(u.costUsd), color: C.text, bold: true }] }
+                  : hasFeedA && f && f.dsCny !== null
+                    ? { lead: 2, spans: [{ text: 'DS ', dim: true }, { text: fmtCny(f.dsCny), color: C.text, bold: true }] }
+                    : null,
               ],
-            },
-            { spans: [{ text: `${st.done}/${st.total}`, dim: true }] },
-            doing
-              ? { fill: true, spans: [{ text: `▸ ${doing.id}${doing.subject ? ` ${doing.subject}` : ''}`, color: C.text }] }
-              : null,
-          ])
-        })() : null}
-      </Box>
-    )
+              inner,
+              2,
+            ),
+          ),
+        )
+      }
+      if (hasFeedA && f && f.gem.length > 0) {
+        rows.push(
+          frame(
+            'main-agy',
+            row(w, 'agy', f.gem.slice(0, 2).map((gm, i) => meter(feedLabel(gm.label), gm.pct, gm.resetsAt, w, i > 0 ? 2 : 0))),
+          ),
+        )
+      }
+      if (meshTasks.length > 0) {
+        rows.push(frame('main-plan', row(w, 'plan', [{ spans: [{ text: `${planDone}/${meshTasks.length}`, bold: true }] }])))
+        planFit.rows.forEach(task => {
+          const isDoing = isDoingTask(task.status)
+          rows.push(
+            frame(
+              `main-plan-${task.id}`,
+              <Box width={inner} columnGap={1} overflow="hidden">
+                <Text color={toneOfStatus(task.status)}>{planGlyph(task.status)}</Text>
+                <Box flexShrink={1}>
+                  <Text wrap="truncate">{`${task.id}${task.subject ? ` ${task.subject}` : ''}`}</Text>
+                </Box>
+                <Box flexGrow={1} />
+                {isDoing ? <Box flexShrink={0}>{clock(`plan-${task.id}`, t.startedAt, null, C.dim, true)}</Box> : null}
+                {planSet.has(task.id) ? (
+                  <Box flexShrink={0}>
+                    <Text color={C.dim}>→ sub-main</Text>
+                  </Box>
+                ) : null}
+              </Box>,
+            ),
+          )
+        })
+        if (planFit.more > 0) {
+          rows.push(frame('main-plan-more', <Text color={C.faint} wrap="truncate">{`+${planFit.more} ${planFit.isDone ? 'done' : 'more'}`}</Text>))
+        }
+      } else if (hasFeedB && f && f.task) {
+        rows.push(frame('main-task', row(w, 'task', [{ fill: true, spans: [{ text: f.task, color: C.text }] }])))
+      }
+      return (
+        <Box flexDirection="column" width={w}>
+          <Text color={C.main} wrap="truncate">{`╭ main ${'─'.repeat(Math.max(0, w - 8))}╮`}</Text>
+          {rows}
+          <Text color={C.main} wrap="truncate">{`╰${'─'.repeat(Math.max(0, w - 2))}╯`}</Text>
+        </Box>
+      )
+    }
 
     // ---- architect
     const lastConsult = a.consults[a.consults.length - 1]
@@ -1838,17 +1876,12 @@ export const register: Register = (on, options) => {
     }, 0)
     // The rows every other shown panel needs; the tree gets what is left of the pane's body.
     const otherPanelRows = (): number => {
-      let n = 1 + 1 + legendGap // the pane's header and legend
+      let n = 1 // the pane's header
       if (workHas('main')) {
-        n += 2 + 1 + 1 // border, header, effort
-        if (ctxGauge) n += 1
-        if (u.limits.length > 0) n += 1
+        n += 2 + 1 + 1 // border, ctx/effort, windows/spend
         if (hasFeedA && f && f.gem.length > 0) n += 1
-        if (u.costUsd !== null || (hasFeedA && f && f.dsCny !== null)) n += 1
-        if (hasFeedB && f && f.task) n += 1
-        if (hasFeedB && f && f.cwd) n += 1
-        if (m.speed) n += 1
-        if (meshTasks.length > 0) n += 1
+        if (meshTasks.length > 0) n += 1 + planFit.rows.length + (planFit.more > 0 ? 1 : 0)
+        else if (hasFeedB && f && f.task) n += 1
       }
       if (workHas('architect')) n += 2 + 1 + 1 + 1 + (cfg.moments ? (W < 70 ? 2 : 1) : 0) + (a.lastAdvice ? 1 : 0)
       if (workHas('gate')) {
@@ -1870,12 +1903,11 @@ export const register: Register = (on, options) => {
       const run = cs?.run
       if (workHas('consult') && run) {
         const narrow = W < 40 || run.engines.length > 10
-        n += 2 + 1 + (narrow ? run.engines.length + 2 : (run.engines.length <= 6 ? 11 : 13) + 1 + (run.round >= 2 || run.kind === 'round2' ? 1 : 0))
-        if (run.question) n += 1
-        n += 1
-        if (!narrow) n += Math.min(3, run.engines.filter(e => (e.state === 'failed' || e.state === 'skipped') && e.reason).length)
-        n += activeConsultLocks(cs?.locks ?? {}, now).length
-        if (run.endedAt !== null && run.summary) n += 1
+        n += 2 + 1 + (narrow ? run.engines.length : (run.engines.length <= 6 ? 11 : 13) + 1 + (run.round >= 2 || run.kind === 'round2' ? 1 : 0))
+        if (questionLine(run.question, W - 4)) n += 1
+        n += 1 // the glyph legend, dropped when the box has under 3 spare rows
+        if (!narrow) n += Math.min(3, run.engines.filter(e => e.state === 'failed' && e.reason).length)
+        if (run.endedAt !== null) n += 1
       }
       return n + workRailRows
     }
@@ -1886,8 +1918,17 @@ export const register: Register = (on, options) => {
     const drawnWorkRows = workHas('work') && workBudget > 0 ? Math.min(workBudget, workRows(fittedWork, workCols)) : 0
 
     const workClock = (key: string, since: number, endAt: number | null) => clock(key, since, endAt, C.dim, true)
+    const agoText = (endAt: number) => `${Math.max(0, Math.round((now - endAt) / 1000))}s ago`
+    // Ended rows fade in place: `done 30s ago`, or `failed 30s ago` in red, until the tree lets them go.
+    const workEndView = (endAt: number | null, status: string, stale = false) => {
+      if (stale) return <Text color={C.warn}>⊘ stale</Text>
+      if (endAt === null) return null
+      if (status === 'failed' || status === 'refused') return <Text color={C.warn}>{`failed ${agoText(endAt)}`}</Text>
+      if (status === 'partial' || status === 'stopped') return <Text color={C.amber}>{`stopped ${agoText(endAt)}`}</Text>
+      return <Text dimColor>{`done ${agoText(endAt)}`}</Text>
+    }
 
-    const workLeafView = (l: WorkLeaf, w: number, prefix: string, done = false) => {
+    const workLeafView = (l: WorkLeaf, w: number, prefix: string) => {
       const cost = l.cost === null || l.isLive ? '' : l.cost === 0 ? 'free' : `+${fmtWorkerCost(l.cost)}`
       return (
         <Box key={`work-leaf-${l.id}`} width={w} columnGap={1} overflow="hidden">
@@ -1895,15 +1936,19 @@ export const register: Register = (on, options) => {
           <Button key={`work-${l.id}`} plain onPress={expandOnPress(l.id)}>
             <Text color={toneOfStatus(l.status)}>{l.glyph}</Text>
           </Button>
-          <Box flexShrink={1}>
-            <Text dimColor={done} wrap="truncate">{`${l.isRealRepo ? '◇' : ''}${l.name}${l.worker ? ` ▸ ${l.worker}` : ''}`}</Text>
-          </Box>
-          {l.note ? <Text dimColor wrap="truncate">{l.note}</Text> : null}
+          <Text dimColor={!l.isLive} wrap="truncate">
+            {l.kind === 'consult'
+              ? `${l.name}${l.note ? ` ${l.note}` : ''}`
+              : `${l.role && !l.name.toLowerCase().startsWith(l.role.toLowerCase()) ? `${l.role} ` : ''}${l.isRealRepo ? '◇' : ''}${l.name}`}
+          </Text>
+          {l.worker ? <Text dimColor wrap="truncate">{`▸ ${l.worker}`}</Text> : null}
+          {l.kind !== 'consult' && l.note ? <Text dimColor wrap="truncate">{l.note}</Text> : null}
           {l.verifyPending ? <Text color={C.amber} wrap="truncate">verify pending</Text> : null}
-          {cost ? <Text color={l.cost === 0 ? C.dim : C.agent} wrap="truncate">{cost}</Text> : null}
-          {/* The clock sits at the right edge, in one column with the box header's clock. */}
+          {cost ? <Text color={l.cost === 0 ? C.dim : C.text} wrap="truncate">{cost}</Text> : null}
           <Box flexGrow={1} />
-          <Box flexShrink={0}>{workClock(`work-clock-${l.id}`, l.startedAt, l.endedAt)}</Box>
+          <Box flexShrink={0}>
+            {l.isLive ? workClock(`work-clock-${l.id}`, l.startedAt, l.endedAt) : workEndView(l.endedAt, l.status, l.isStale)}
+          </Box>
         </Box>
       )
     }
@@ -1911,13 +1956,20 @@ export const register: Register = (on, options) => {
     // `p`: the row's tree glyph from treePrefixes (`├`, `└`, `│`, ' ' or '').
     const workEntryView = (e: WorkEntry, w: number, p = '') => {
       const lead = p ? `${p} ` : ''
-      if (e.kind === 'box' && e.box) return workBoxView(e.box, w - 1)
-      if (e.kind === 'leaf' && e.leaf) return workLeafView(e.leaf, w, p, e.done)
-      // The one detail line under a running leaf, from 56 columns; the fit drops it when the pane is short.
+      if (e.kind === 'leaf' && e.leaf) return workLeafView(e.leaf, w, p)
       if (e.kind === 'detail' && e.leaf) {
         return workCols >= WORK_DETAIL_COLS && e.leaf.detail ? (
           <Text dimColor wrap="truncate">{`${p ? `${p}   ` : '  '}${e.leaf.detail}`}</Text>
         ) : null
+      }
+      if (e.kind === 'step') {
+        return (
+          <Box key={`work-step-${e.text}`} width={w} columnGap={1} overflow="hidden">
+            {p ? <Text color={C.faint}>{p}</Text> : null}
+            <Text color={C.faint}>○</Text>
+            <Text dimColor wrap="truncate">{e.text}</Text>
+          </Box>
+        )
       }
       if (e.kind === 'task') {
         return (
@@ -1928,15 +1980,6 @@ export const register: Register = (on, options) => {
         )
       }
       if (e.kind === 'last') return <Text color={C.dim} wrap="truncate">{`last ${e.text}`}</Text>
-      if (e.kind === 'step') {
-        return (
-          <Box key={`work-step-${e.text}`} width={w} columnGap={1} overflow="hidden">
-            {p ? <Text color={C.faint}>{p}</Text> : null}
-            <Text color={C.faint}>○</Text>
-            <Text dimColor wrap="truncate">{e.text}</Text>
-          </Box>
-        )
-      }
       if (e.kind === 'more') return <Text color={C.faint} wrap="truncate">{`${lead}+${e.count ?? 0} more`}</Text>
       if (e.kind === 'expand') {
         return (
@@ -1949,77 +1992,69 @@ export const register: Register = (on, options) => {
       return null
     }
 
-    const workBoxLine = (b: WorkBox, w: number) => (
-      <Box key={`work-boxline-${b.id}`} width={w} columnGap={1} overflow="hidden">
+    const workBoxHeader = (b: WorkBox, w: number) => (
+      <Box key={`work-boxheader-${b.id}`} width={w} columnGap={1} overflow="hidden">
         <Text color={toneOfStatus(b.status)}>{b.glyph}</Text>
         <Box flexShrink={1}>
-          <Text bold wrap="truncate">{`${b.title} ${stripText(b.strip)}`}</Text>
+          <Text bold wrap="truncate">{b.title}</Text>
         </Box>
-        <Box flexShrink={0}>{workClock(`work-box-${b.id}`, b.startedAt, b.endedAt)}</Box>
+        <Box flexGrow={1} />
+        <Box flexShrink={0}>
+          {b.isLive ? workClock(`work-box-${b.id}`, b.startedAt, b.endedAt) : workEndView(b.endedAt, b.status, b.status === 'stale')}
+        </Box>
       </Box>
     )
 
-    const workBoxView = (b: WorkBox, w: number) => {
-      if (b.collapsed || w < WORK_NARROW) return workBoxLine(b, w)
-      const inner = Math.max(4, w - 4)
-      return (
-        <Box
-          key={`work-box-${b.id}`}
-          flexDirection="column"
-          borderStyle="round"
-          borderColor={b.isLive ? C.agent : C.gate}
-          borderDimColor={!b.isLive}
-          paddingX={1}
-          marginLeft={1}
-          width={w}
-        >
-          <Box justifyContent="space-between">
-            <Box flexShrink={1} columnGap={1}>
-              <Text color={toneOfStatus(b.status)} bold>
-                {b.glyph}
-              </Text>
-              <Text bold wrap="truncate">{b.title}</Text>
-              <Text color={C.dim}>{stripText(b.strip)}</Text>
-            </Box>
-            <Box flexShrink={0}>{workClock(`work-box-${b.id}`, b.startedAt, b.endedAt)}</Box>
-          </Box>
-          {(pre => b.entries.map((e, i) => workEntryView(e, inner, pre[i])))(treePrefixes(b.entries, 0))}
-        </Box>
-      )
-    }
-
     const workPanel = (w: number) => {
-      if (workBudget < 1) return null
-      // Under 40 columns: header and strip, then one line per box.
-      if (fittedWork.collapsed || w < WORK_NARROW || workBudget < 3) {
-        const lines = [
-          <Box key="work-main-line" width={w} columnGap={1} overflow="hidden">
+      if (workBudget < 1 || isWorkEmpty(fittedWork)) return null
+      const inner = Math.max(4, w - 4)
+      // Under 40 columns, or with no room for a body: the title, then one line per unit, no frame.
+      if (w < WORK_NARROW || workBudget < 3) {
+        const lines: RenderChildren[] = [
+          <Box key="work-narrow-title" width={w} columnGap={1} overflow="hidden">
             <Text color={toneOfStatus(fittedWork.status)}>{fittedWork.glyph}</Text>
-            <Box flexShrink={1}>
-              <Text bold wrap="truncate">{`${fittedWork.title} ${stripText(fittedWork.strip)}`}</Text>
-            </Box>
-            <Box flexShrink={0}>{workClock('work-main', fittedWork.startedAt, fittedWork.endedAt)}</Box>
+            <Text bold wrap="truncate">{fittedWork.title}</Text>
           </Box>,
-          ...fittedWork.boxes.map(b => workBoxLine(b, w)),
+          ...fittedWork.entries.map(e => (e.kind === 'box' && e.box ? workBoxHeader(e.box, w) : workEntryView(e, w))),
         ]
         return <Box flexDirection="column" width={w}>{lines.slice(0, Math.max(0, workBudget))}</Box>
       }
-      const inner = Math.max(4, w - 4)
-      return (
-        <Box flexDirection="column" borderStyle="round" borderColor={C.main} borderDimColor={!fittedWork.isLive} paddingX={1} width={w}>
-          <Box justifyContent="space-between">
-            <Box flexShrink={1} columnGap={1}>
-              <Text color={toneOfStatus(fittedWork.status)} bold>
-                {fittedWork.glyph}
-              </Text>
-              <Text bold wrap="truncate">{fittedWork.title}</Text>
-              <Text color={C.dim}>{stripText(fittedWork.strip)}</Text>
-            </Box>
-            <Box flexShrink={0}>{workClock('work-main', fittedWork.startedAt, fittedWork.endedAt)}</Box>
+      const title = fittedWork.title
+      const top = `╭ ${title} ${'─'.repeat(Math.max(0, w - 4 - cellWidth(title)))}╮`
+      const bottom = `╰${'─'.repeat(Math.max(0, w - 2))}╯`
+      const frame = (key: string, children: RenderChildren) => (
+        <Box key={key} width={w}>
+          <Text color={C.faint}>│</Text>
+          <Box width={1} flexShrink={0} />
+          <Box width={inner} overflow="hidden">
+            {children}
           </Box>
-          {(pre => fittedWork.entries.map((e, i) => workEntryView(e, inner, pre[i])))(treePrefixes(fittedWork.entries, 1))}
-          <Text color={C.faint} wrap="truncate">
-            {WORK_LEGEND}
+          <Box width={1} flexShrink={0} />
+          <Text color={C.faint}>│</Text>
+        </Box>
+      )
+      const rows: RenderChildren[] = []
+      for (const e of fittedWork.entries) {
+        if (e.kind === 'box' && e.box) {
+          rows.push(frame(`work-head-${e.box.id}`, workBoxHeader(e.box, inner)))
+          const pre = treePrefixes(e.box.entries, 0)
+          e.box.entries.forEach((c, i) => {
+            const v = workEntryView(c, inner, pre[i])
+            if (v) rows.push(frame(`work-row-${e.box.id}-${i}`, v))
+          })
+        } else {
+          const v = workEntryView(e, inner)
+          if (v) rows.push(frame(`work-row-${rows.length}`, v))
+        }
+      }
+      return (
+        <Box flexDirection="column" width={w}>
+          <Text color={fittedWork.isLive ? C.main : C.faint} wrap="truncate">
+            {top}
+          </Text>
+          {rows}
+          <Text color={fittedWork.isLive ? C.main : C.faint} wrap="truncate">
+            {bottom}
           </Text>
         </Box>
       )
@@ -2174,8 +2209,10 @@ export const register: Register = (on, options) => {
       const caption = grid?.isDebate ? grid.rows[grid.height - 1]?.[0] : null
       const ringHeight = grid ? grid.height - (caption ? 1 : 0) : 0
       const ringRows = grid?.rows.slice(0, ringHeight) ?? []
-      const reasons = run.engines.filter(eng => (eng.state === 'failed' || eng.state === 'skipped') && eng.reason).slice(0, 3)
-      const locks = activeConsultLocks(cs?.locks ?? {}, now)
+      const reasons = run.engines.filter(eng => eng.state === 'failed' && eng.reason).slice(0, 3)
+      const summary = run.endedAt !== null ? consultSummaryLine(run, innerW) : ''
+      const question = questionLine(run.question, innerW)
+      const showLegend = bodyRows - otherPanelRows() >= 3
       return (
         <Box flexDirection="column" borderStyle="round" borderColor={run.stale ? C.amber : C.agent} borderDimColor={run.endedAt !== null} paddingX={1} width={w}>
           <Box justifyContent="space-between">
@@ -2195,7 +2232,7 @@ export const register: Register = (on, options) => {
                 const dur = consultEngineDuration(eng, run, now)
                 const maxName = innerW < 28 ? Math.min(12, Math.max(5, innerW - 9)) : 12
                 const name = shortConsultEngine(eng.name, maxName)
-                const reason = eng.reason ? shorten(eng.reason, Math.max(8, innerW - 4)) : ''
+                const reason = eng.state !== 'skipped' && eng.reason ? shorten(eng.reason, Math.max(8, innerW - 4)) : ''
                 const fixedW = 1 + 1 + cellWidth(name) + (dur ? 1 + cellWidth(dur) : 0)
                 const canFill = Boolean(reason) && innerW - fixedW >= 4
                 return line(
@@ -2237,37 +2274,34 @@ export const register: Register = (on, options) => {
               </Text>
             </Box>
           ) : null}
-          {run.question ? (
+          {question ? (
             <Text dimColor wrap="truncate">
-              {`“${shorten(run.question, Math.max(8, innerW - 2))}”`}
+              {question}
             </Text>
           ) : null}
-          {line(
-            [
-              { spans: [{ text: '●', color: C.gate }, { text: ' done', dim: true }] },
-              { spans: [{ text: '◐', color: C.agent }, { text: ' running', dim: true }] },
-              { spans: [{ text: '○', color: C.faint }, { text: ' queued', dim: true }] },
-              { spans: [{ text: '✗', color: C.warn }, { text: ' failed', dim: true }] },
-              { spans: [{ text: '⊘', color: C.amber }, { text: ' locked', dim: true }] },
-            ],
-            innerW,
-            2,
-          )}
+          {showLegend
+            ? line(
+                [
+                  { spans: [{ text: '●', color: C.gate }, { text: ' done', dim: true }] },
+                  { spans: [{ text: '◐', color: C.agent }, { text: ' running', dim: true }] },
+                  { spans: [{ text: '○', color: C.faint }, { text: ' queued', dim: true }] },
+                  { spans: [{ text: '✗', color: C.warn }, { text: ' failed', dim: true }] },
+                  { spans: [{ text: '⊘', color: C.amber }, { text: ' locked', dim: true }] },
+                ],
+                innerW,
+                2,
+              )
+            : null}
           {!isNarrow
             ? reasons.map(eng => (
-                <Text color={eng.state === 'failed' ? C.warn : C.amber} wrap="truncate">
-                  {`${consultGlyph(eng.state)} ${shortConsultEngine(eng.name)}: ${shorten(eng.reason ?? '', Math.max(8, innerW - 16))}`}
+                <Text color={C.warn} wrap="truncate">
+                  {`✗ ${shortConsultEngine(eng.name)}: ${shorten(eng.reason ?? '', Math.max(8, innerW - 16))}`}
                 </Text>
               ))
             : null}
-          {locks.map(lk => (
-            <Text color={C.amber} wrap="truncate">
-              {`⊘ ${lk.engine} locked until ${lk.hhmm}`}
-            </Text>
-          ))}
-          {run.endedAt !== null && run.summary ? (
+          {summary ? (
             <Text dimColor wrap="truncate">
-              {run.summary}
+              {summary}
             </Text>
           ) : null}
         </Box>
@@ -2275,16 +2309,13 @@ export const register: Register = (on, options) => {
     }
 
     // ---- log: whatever rows the other panels leave, 4 to 8
-    // The main box's speed line, the legend's gap and the gap above the log are a row each; the work
+    // The pane's header, the main card's fixed rows and the gap above the log are rows each; the work
     // tree takes the rows it was given before the log is sized.
     const used =
-      2 +
-      legendGap +
-      5 +
-      (m.speed ? 1 : 0) +
-      (hasFeedA ? 1 : 0) +
-      (hasFeedB ? 1 : 0) +
-      (meshTasks.length > 0 ? 1 : 0) +
+      1 +
+      4 +
+      (hasFeedA && f && f.gem.length > 0 ? 1 : 0) +
+      (meshTasks.length > 0 ? 1 + planFit.rows.length + (planFit.more > 0 ? 1 : 0) : hasFeedB && f && f.task ? 1 : 0) +
       1 +
       (showArchitect ? 6 : 0) +
       (showConsult && cfg.panels.includes('consult') ? 15 : 0) +
@@ -2461,16 +2492,6 @@ export const register: Register = (on, options) => {
       )
     }
 
-    const legend = fitLegend(
-      [
-        { label: 'main', color: C.main },
-        { label: 'agents', color: C.agent },
-        { label: cfg.gateLabel.toLowerCase(), color: C.gate },
-        ...(showArchitect ? [{ label: cfg.architectLabel.toLowerCase(), color: C.arch }] : []),
-      ],
-      W,
-    )
-
     const body = isWide ? (
       <Box flexDirection="column">
         <Box columnGap={2}>
@@ -2486,34 +2507,23 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column" width={W}>
-        {/* Below 40 columns the frame's own title names the pane, so the header starts at the model. */}
-        {line(
-          [
-            W >= 40 ? { spans: [{ text: 'FLIGHTDECK', bold: true }, { text: ' ·', color: C.dim, bold: true }] } : null,
-            { spans: [{ text: modelName.toUpperCase(), color: C.main, bold: true }, { text: m.isRunning ? ' WORKS' : ' IDLE', bold: true }] },
-            showArchitect
-              ? {
-                  spans: [
-                    { text: '· ', color: C.dim, bold: true },
-                    { text: cfg.architectLabel, color: C.arch, bold: true },
-                    { text: advising ? ' ADVISING' : ' ON CALL', bold: true },
-                  ],
-                }
-              : null,
-          ],
-          W,
-          1,
-          'center',
-        )}
-        <Box key="legend" justifyContent="center" columnGap={2} marginBottom={legendGap}>
-          {legend.map(l => (
-            <Box flexShrink={0}>
-              <Text>
-                <Text color={l.color}>■</Text>
-                <Text dimColor>{` ${l.label}`}</Text>
+        {/* Below 40 columns the frame's own title names the pane, so the header starts at the model.
+            One line: the model, then the doing task (or idle/working), with main's clock on the right. */}
+        <Box width={W} justifyContent="space-between" columnGap={1} overflow="hidden">
+          <Box flexShrink={1} columnGap={1} overflow="hidden">
+            <Text color={C.main} bold wrap="truncate">{`${W >= 40 ? 'FLIGHTDECK · ' : ''}${modelName.toUpperCase()}`}</Text>
+            <Text color={C.dim} bold>·</Text>
+            {doingTask ? (
+              <Text color={toneOfStatus(doingTask.status)} bold wrap="truncate">
+                {`${planGlyph(doingTask.status)} ${doingTask.id}${doingTask.subject ? ` ${doingTask.subject}` : ''}`}
               </Text>
-            </Box>
-          ))}
+            ) : (
+              <Text bold wrap="truncate">{m.isRunning ? 'working' : 'idle'}</Text>
+            )}
+          </Box>
+          {m.isRunning && t.startedAt > 0 ? (
+            <Box flexShrink={0}>{clock('main-clock', t.startedAt, null, C.dim, true)}</Box>
+          ) : null}
         </Box>
         {body}
         {svgLanes}
