@@ -2920,6 +2920,14 @@ export const engineModel = (e: Pick<ConsultEngine, 'name' | 'model'>): string =>
   return i >= 0 ? e.name.slice(i + 1).trim() : ''
 }
 
+/** A model id as the ring shows it: no `vendor/` path, no `:free` tag, no `-preview` suffix. */
+export const shortModel = (model: string): string => {
+  let s = model.trim()
+  s = s.slice(s.lastIndexOf('/') + 1)
+  s = s.replace(/:free$/i, '').replace(/-preview$/i, '')
+  return s || model.trim()
+}
+
 /** `✓ 8/9 answered · ⊘ codex` at the end of a run: names shorten, the counts never do. */
 export const consultSummaryLine = (run: ConsultRun, width: number): string => {
   const total = run.engines.length
@@ -3424,23 +3432,32 @@ export const ringLayout = (
       y = nd.labelY + 1
     }
     const labelCentre = nd.labelX + (nd.width - 1) / 2
-    const room = Math.floor(Math.min(labelCentre - 1, cols - 1 - labelCentre)) * 2 + 1
-    const maxW = Math.max(1, Math.min(nd.width + 4, cols - 2, room))
-    const text = shorten(raw.trim(), maxW)
-    const width = cellWidth(text)
-    let x = Math.round(labelCentre - (width - 1) / 2)
-    x = Math.max(1, Math.min(cols - 1 - width, x))
     if (y < 0 || y >= rows) continue
-    // Keep out of every other label or model row; a model that cannot fit is left out.
-    const blocked = placed.some(
-      (o, j) =>
-        j !== i &&
-        ((y === o.labelY && x < o.labelX + o.width && x + width > o.labelX) ||
-          (o.model !== undefined && o.modelWidth !== undefined && o.modelX !== undefined && y === o.modelY && x < o.modelX + o.modelWidth && x + width > o.modelX)),
-    )
-    if (blocked) continue
-    const inCentre = y >= centre.y && y < centre.y + centre.height && x < centre.x + centre.width && x + width > centre.x
-    if (inCentre) continue
+    // Owner: show the whole model name. Try the short name in full (up to 26 cells; under 56 columns only the label width + 4), then cut it
+    // to the label's width + 4; centred under the label and slid in from the pane edge.
+    const short = shortModel(raw)
+    let text = ''
+    let x = 0
+    let width = 0
+    for (const maxW of [cols >= 56 ? Math.min(26, cols - 2) : nd.width + 4, Math.min(nd.width + 4, cols - 2)]) {
+      const t = shorten(short, Math.max(1, maxW))
+      const w = cellWidth(t)
+      const tx = Math.max(1, Math.min(cols - 1 - w, Math.round(labelCentre - (w - 1) / 2)))
+      // Keep out of every other label or model row and out of the hub.
+      const blocked = placed.some(
+        (o, j) =>
+          j !== i &&
+          ((y === o.labelY && tx < o.labelX + o.width && tx + w > o.labelX) ||
+            (o.model !== undefined && o.modelWidth !== undefined && o.modelX !== undefined && y === o.modelY && tx < o.modelX + o.modelWidth && tx + w > o.modelX)),
+      )
+      const inCentre = y >= centre.y && y < centre.y + centre.height && tx < centre.x + centre.width && tx + w > centre.x
+      if (blocked || inCentre) continue
+      text = t
+      x = tx
+      width = w
+      break
+    }
+    if (!text) continue
     nd.model = text
     nd.modelX = x
     nd.modelY = y

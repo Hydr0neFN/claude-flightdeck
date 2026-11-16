@@ -126,6 +126,7 @@ import {
   consultLockNote,
   consultSummaryLine,
   engineModel,
+  shortModel,
   firstSentence,
   fitPlan,
   questionLine,
@@ -3870,7 +3871,7 @@ test('an engine model comes from its model field or the part after its first col
   expect(summary).not.toContain('skipped')
 })
 
-test('the ring draws one dim model row centred under each label, truncated to its width + 4', () => {
+test("the ring draws one dim model row under each label with the whole short model name", () => {
   const run = parseConsult(
     JSON.stringify({
       run: makeRun({
@@ -3887,22 +3888,15 @@ test('the ring draws one dim model row centred under each label, truncated to it
   )!.run!
   const grid = buildConsultGrid(run, 60, PALETTES.theme, 30_000)
   const models = grid.layout.nodes.map(nd => nd.model)
-  for (const [i, raw] of [
-    [0, 'gemini-4-argon-high'],
-    [1, 'nvidia/nemotron-3-ultra-550b'],
-    [2, 'gpt-6.1-sol'],
-  ] as const) {
-    const nd = grid.layout.nodes[i]!
-    expect(cellWidth(models[i]!)).toBeLessThanOrEqual(nd.width + 4)
-    expect(raw.startsWith(models[i]!.replace(/…$/, ''))).toBe(true)
-    if (cellWidth(raw) > cellWidth(models[i]!)) expect(models[i]).toContain('…')
-  }
+  // Owner: the whole short model name shows when it fits (no vendor path, no :free / -preview).
+  expect(models.slice(0, 3)).toEqual(['gemini-4-argon-high', 'nemotron-3-ultra-550b', 'gpt-6.1-sol'])
+  expect(shortModel('baidu/ernie-5.5-flash-preview:free')).toBe('ernie-5.5-flash')
   expect(models[3]).toBeUndefined()
   for (const nd of grid.layout.nodes.filter(x => x.model !== undefined)) {
     expect(nd.modelY).toBe(nd.labelY + 1)
-    expect(cellWidth(nd.model!)).toBeLessThanOrEqual(nd.width + 4)
-    const centre = nd.modelX! + (cellWidth(nd.model!) - 1) / 2
-    expect(Math.abs(centre - (nd.labelX + (nd.width - 1) / 2))).toBeLessThanOrEqual(1)
+    expect(cellWidth(nd.model!)).toBeLessThanOrEqual(26)
+    // Under its label: the model row overlaps the label's columns.
+    expect(nd.modelX! < nd.labelX + nd.width && nd.modelX! + cellWidth(nd.model!) > nd.labelX).toBe(true)
     const rowRun = (grid.rows[nd.modelY!] ?? []).find(r => nd.modelX! >= r.x && nd.modelX! < r.x + cellWidth(r.text))
     expect([rowRun?.text, rowRun?.dim]).toEqual([nd.model, true])
   }
