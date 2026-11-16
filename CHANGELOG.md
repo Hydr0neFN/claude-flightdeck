@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.7 (yu)
+
+- A finished job names the model whose work was kept (`state.json` `backend`), not its last attempt: a job that fell back to an agy last-resort model which failed showed that model. A card that just ended is probed once more.
+- `backend:` and `jobdir:` lines are read also from Read-tool output with line numbers.
+- New option `ctxBudget` (default 0; the owner's settings set 300000): the context gauge measures against it when it is smaller than the host's window. 0 = the host's window.
+
 ## 0.6.6 (yu)
 
 - A resumed session fills the main box at start, not at its first request: the model (`$.session.model()`), the effort (`effortLevel`) and the permission mode (`permissions.defaultMode`) from the settings. The context gauge shows a local estimate (`~59k/400k`, no request sent) until the first response gives the real count, so you can see how full a resumed session is before you send anything.

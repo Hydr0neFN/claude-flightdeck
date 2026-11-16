@@ -59,7 +59,29 @@ import {
   fmtWorkerCost,
   jobsCost,
   shortWorker,
+  workerProbe,
 } from '../hooks/core'
+
+test('a context budget smaller than the window is what the gauge measures against', () => {
+  const u = { tokens: 150_000, window: 1_000_000, compactWindow: null }
+  expect(contextFill(u, 300_000)).toEqual({ window: 300_000, pct: 50 })
+  expect(contextFill(u, 0).window).toBe(1_000_000)
+  expect(contextFill({ ...u, compactWindow: 200_000 }, 300_000).window).toBe(200_000)
+})
+
+test('job lines are read from Read-tool output with line numbers too', () => {
+  expect(parseJobText('     5\tbackend: paid-flash\n    12\tjobdir: /j').backend).toBe('paid-flash')
+  expect(parseJobText('5→backend: agy:gemini-4-argon-high').backend).toBe('agy:gemini-4-argon-high')
+})
+
+test("the probe prefers a finished job's kept backend over its last attempt", () => {
+  const argv = workerProbe('python3', '/j')
+  expect(argv[0]).toBe('python3')
+  expect(argv[3]).toBe('/j')
+  // state.json first: its backend wins once the status is no longer running or parked.
+  expect(argv[2]!.indexOf('state.json')).toBeLessThan(argv[2]!.indexOf('trying'))
+  expect(argv[2]).toContain('("running","parked",None)')
+})
 
 test('a job runner backend reads as a short model name', () => {
   expect(shortWorker('agy:gemini-4-hydrogen-high')).toBe('Hydrogen')

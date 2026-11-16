@@ -174,7 +174,7 @@ async function refreshStatus($: EngineInterface, cfg: Config) {
   const [u, a, g, cards] = await Promise.all([getUsage($), getArchitect($), getGate($), getCards($)])
   const running = cards.filter(c => c.status === 'running').length
   const s = gateSummary(g)
-  const ctxFill = contextFill(u)
+  const ctxFill = contextFill(u, cfg.ctxBudget)
   const parts = [
     ctxFill.pct !== null ? `ctx ${Math.round(ctxFill.pct)}%` : null,
     cards.length > 0 ? `agents ${running}/${cards.length}` : null,
@@ -350,7 +350,8 @@ async function pollWorkers($: EngineInterface, lock: { inFlight: boolean; python
   if (lock.inFlight) return
   lock.inFlight = true
   try {
-    const todo = (await getCards($)).filter(c => c.status === 'running' && c.jobdir)
+    const now = await $.clock.now()
+    const todo = (await getCards($)).filter(c => c.jobdir && (c.status === 'running' || (c.endedAt !== null && now - c.endedAt < 3 * WORKER_INTERVAL_MS)))
     for (const c of todo) {
       let res: { exitCode: number; stdout: string } | null = null
       for (const py of lock.python ? [lock.python] : ['python3', 'python']) {
@@ -952,7 +953,7 @@ export const register: Register = (on, options) => {
 
     // ---- main
     const effortN = { low: 1, medium: 2, high: 3, xhigh: 4, max: 4 }[m.effort] ?? 0
-    const ctxFill = contextFill(u)
+    const ctxFill = contextFill(u, cfg.ctxBudget)
     const ctxGauge = ctxFill.pct !== null ? gauge(ctxFill.pct, 10) : null
     const showFeed = cfg.feedCommand.length > 0 && f !== null
     const hasFeedA = showFeed && (f.dsCny !== null || f.gem.length > 0)

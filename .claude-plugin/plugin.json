@@ -1,6 +1,6 @@
 {
   "name": "flightdeck",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "description": "Flightdeck: a live agent dashboard for Claude Code. Main model vitals, an on-call architect, every permission check, subagent cards and swimlanes, a turn receipt and a session log, all from real session events",
   "author": {
     "name": "Stephen Casella",
@@ -118,6 +118,12 @@
       "description": "JSON array of strings (argv) for an external status feed command. Leave empty to disable.",
       "type": "string",
       "default": ""
+    },
+    "ctxBudget": {
+      "title": "Context budget",
+      "description": "Tokens the context gauge measures against, when fewer than the model's or compaction window (e.g. 300000 to retire a session at 300k). 0 = the host's window.",
+      "type": "number",
+      "default": 0
     }
   }
 }

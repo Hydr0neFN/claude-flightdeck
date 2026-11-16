@@ -120,6 +120,8 @@ export type Config = {
   openOnStart: boolean
   statusLine: boolean
   feedCommand: string[]
+  /** Tokens the context gauge measures against when fewer than the host's window; 0 = the host's window. */
+  ctxBudget: number
 }
 
 const safeRegExp = (source: string, fallback: string) => {
@@ -169,6 +171,7 @@ export const parseConfig = (o: Readonly<Record<string, unknown>>): Config => {
     openOnStart: bool('openOnStart', true),
     statusLine: bool('statusLine', true),
     feedCommand: parseFeedCommand(o.feedCommand),
+    ctxBudget: typeof o.ctxBudget === 'number' && Number.isFinite(o.ctxBudget) && o.ctxBudget > 0 ? Math.round(o.ctxBudget) : 0,
   }
 }
 
@@ -262,7 +265,7 @@ export const shortWorker = (backend: string): string => {
 /** The last `key: value` of `key` in a job runner's printed block, '' when none. */
 const lastField = (text: string, key: string) => {
   let found = ''
-  for (const m of text.matchAll(new RegExp(`^${key}: *(\\S.*)$`, 'gm'))) found = (m[1] ?? '').trim()
+  for (const m of text.matchAll(new RegExp(`^(?: *\\d+[\\t→])?${key}: *(\\S.*)$`, 'gm'))) found = (m[1] ?? '').trim()
   return found
 }
 
@@ -314,13 +317,15 @@ export const jobsCost = (cards: AgentCard[], since: number): number | null => {
 }
 
 /**
- * The argv that prints a running job's worker: its `trying` file (the attempt now running), else the
- * `backend` its `state.json` holds. Prints nothing when neither says.
+ * The argv that prints a job's worker: a finished job's `backend` from its `state.json` (the model whose
+ * work was kept), else the `trying` file (the attempt now running), else `backend`. Prints nothing when none says.
  */
 export const workerProbe = (python: string, jobdir: string): string[] => [
   python,
   '-c',
-  'import json,os,sys\nd=sys.argv[1]\ntry:\n print(open(os.path.join(d,"trying")).read().strip())\nexcept Exception:\n try:\n  print(json.load(open(os.path.join(d,"state.json"))).get("backend") or "")\n except Exception:\n  pass',
+  'import json,os,sys\nd=sys.argv[1]\ntry:\n s=json.load(open(os.path.join(d,"state.json")))\nexcept Exception:\n s={}\n'
+    + 'if s.get("backend") and s.get("status") not in ("running","parked",None):\n print(s["backend"])\nelse:\n'
+    + ' try:\n  print(open(os.path.join(d,"trying")).read().strip())\n except Exception:\n  print(s.get("backend") or "")',
   jobdir,
 ]
 
@@ -420,8 +425,10 @@ export const compactWindowOf = (b: { rawMaxTokens: number; isAutoCompactEnabled:
  * What the context gauge measures: the compaction window when one is set smaller than the model's,
  * else the model's window, and the fill of it from the real `tokens` reading. No gauge (null) without one.
  */
-export const contextFill = (u: Pick<Usage, 'tokens' | 'window' | 'compactWindow'>): { pct: number | null; window: number } => {
-  const window = u.compactWindow !== null && u.compactWindow > 0 && u.compactWindow < u.window ? u.compactWindow : u.window
+export const contextFill = (u: Pick<Usage, 'tokens' | 'window' | 'compactWindow'>, budget = 0): { pct: number | null; window: number } => {
+  const host = u.compactWindow !== null && u.compactWindow > 0 && u.compactWindow < u.window ? u.compactWindow : u.window
+  // A budget (option ctxBudget) smaller than the host's window is the one the person works to.
+  const window = budget > 0 && (host <= 0 || budget < host) ? budget : host
   return { window, pct: u.tokens !== null && window > 0 ? (u.tokens * 100) / window : null }
 }
 
