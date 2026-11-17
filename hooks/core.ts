@@ -497,9 +497,10 @@ export const PYTHON_CANDIDATES: readonly (readonly string[])[] = [['python3'], [
 
 /**
  * A pid liveness test that is right on both systems: `os.kill(pid, 0)` is not a liveness test on Windows,
- * where `OpenProcess` + `GetExitCodeProcess` (259 = still active) is. The caller supplies `os`.
+ * where `OpenProcess` + `GetExitCodeProcess` (259 = still active) is. When `not_after > 0`, a process created
+ * more than 2 s later counts as a reused pid (gone) when its start time is readable. The caller supplies `os`.
  */
-export const PID_ALIVE_PY = String.raw`def alive(pid):
+export const PID_ALIVE_PY = String.raw`def alive(pid, not_after=0):
  try:
   if os.name == "nt":
    import ctypes
@@ -507,11 +508,46 @@ export const PID_ALIVE_PY = String.raw`def alive(pid):
    h = k.OpenProcess(0x1000, False, int(pid))
    if not h:
     return False
-   code = ctypes.c_ulong()
-   ok = k.GetExitCodeProcess(h, ctypes.byref(code))
-   k.CloseHandle(h)
-   return bool(ok) and code.value == 259
-  os.kill(int(pid), 0)
+   try:
+    code = ctypes.c_ulong()
+    ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+    if not (bool(ok) and code.value == 259):
+     return False
+    if not_after > 0:
+     try:
+      creation = ctypes.c_ulonglong()
+      exit_t = ctypes.c_ulonglong()
+      kernel = ctypes.c_ulonglong()
+      user = ctypes.c_ulonglong()
+      if k.GetProcessTimes(h, ctypes.byref(creation), ctypes.byref(exit_t), ctypes.byref(kernel), ctypes.byref(user)):
+       if creation.value / 1e7 - 11644473600 > not_after + 2:
+        return False
+     except Exception:
+      pass
+    return True
+   finally:
+    k.CloseHandle(h)
+  try:
+   os.kill(int(pid), 0)
+  except PermissionError:
+   if not_after <= 0:
+    raise
+  if not_after > 0:
+   try:
+    with open("/proc/%d/stat" % int(pid), "r") as fh:
+     s = fh.read()
+    ticks = int(s.rsplit(")", 1)[1].split()[19])
+    btime = 0
+    with open("/proc/stat", "r") as fh:
+     for line in fh:
+      if line.startswith("btime "):
+       btime = int(line.split()[1])
+       break
+    clk = os.sysconf("SC_CLK_TCK")
+    if btime > 0 and clk > 0 and btime + ticks / clk > not_after + 2:
+     return False
+   except Exception:
+    pass
   return True
  except PermissionError:
   return True
@@ -1597,10 +1633,11 @@ def main():
   log = read_text(os.path.join(d, "job.log"), 65536)
   tree = tree_of(d, jobid, state, log)
   job = {"jobid": jobid, "job": str(state.get("job") or jobid), "status": status, "ts": ts, "pid": pid or None, "backend": str(state.get("backend") or ""), "tier": str(state.get("tier") or ""), "profile": str(state.get("profile") or ""), "phase": str(state.get("phase") or ""), "rc": rc, "dir": d, "tree": tree, "live": live, "stale": False, "endedAt": None if live else int(mt * 1000), "mtime": int(start_mt * 1000), "trying": trying, "stageLines": stage_lines(log), "hasTrying": bool(trying), "hasHandoff": bool(handoff.strip()), "handoff": {"backend": fields.get("backend", ""), "files_changed": fields.get("files_changed", ""), "ds": fields.get("ds", ""), "not_verified": fields.get("not_verified", "")}}
-  job["stale"] = bool(live and status == "running" and not (pid and alive(pid)))
+  pid_live = bool(live and pid and alive(pid, mt))
+  job["stale"] = bool(live and status == "running" and not pid_live)
   if job["stale"]:
    job["endedAt"] = int(mt * 1000)
-  if live and (job["stale"] or not (pid and alive(pid))) and time.time() - mt > 1800:
+  if live and (job["stale"] or not pid_live) and time.time() - mt > 1800:
    continue
   if live and not job["stale"]:
    if trying.startswith("agy:"):
@@ -1628,7 +1665,8 @@ except Exception:
 /**
  * The argv that prints the job dirs under `root` (or `~/.claude/state/ds-jobs`) as one JSON array, newest
  * first, at most 8: live jobs, and ended ones whose `state.json` changed in the last 30 minutes. A live job
- * whose pid is gone is `stale`. `cache` maps a jobid to the agy conversation db already matched to it.
+ * whose pid is gone (or reused after `state.json` was written) is `stale` and dropped past 30 minutes.
+ * `cache` maps a jobid to the agy conversation db already matched to it.
  */
 export const jobsProbe = (python: string | readonly string[], root: string, cache: Record<string, string> = {}): string[] => [
   ...(typeof python === 'string' ? [python] : python),

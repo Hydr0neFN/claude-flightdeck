@@ -2706,11 +2706,15 @@ test('the jobs dir option is read leniently and the python fallback is python3, 
 test('the pid helper both probes share tests the Windows branch first, and os.kill elsewhere', () => {
   // The nt branch asks OpenProcess/GetExitCodeProcess (259 = active) before os.kill; the fallback
   // treats PermissionError as alive. Both probes carry the helper, so both read pids right on Windows.
+  // When not_after is passed (by the jobs probe), GetProcessTimes / /proc reject reused pids.
   expect(PID_ALIVE_PY.indexOf('os.name == "nt"')).toBeLessThan(PID_ALIVE_PY.indexOf('os.kill'))
   expect(PID_ALIVE_PY).toContain('OpenProcess(0x1000, False, int(pid))')
   expect(PID_ALIVE_PY).toContain('code.value == 259')
+  expect(PID_ALIVE_PY).toContain('GetProcessTimes')
+  expect(PID_ALIVE_PY).toContain('11644473600')
   expect(PID_ALIVE_PY).toContain('except PermissionError:\n  return True')
   expect(jobsProbe('python3', '').at(2)).toContain(PID_ALIVE_PY)
+  expect(JOBS_PY).toContain('alive(pid, mt)')
   expect(consultProbe('python3', '').at(2)).toContain(PID_ALIVE_PY)
 })
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.1
+
+- Jobs probe: a reused pid no longer keeps a dead farmer job live.
+
 ## 0.10.0
 
 - Reworked the inline `mini` layout above the prompt (at most 8 rows) to match the 0.9 full pane:
