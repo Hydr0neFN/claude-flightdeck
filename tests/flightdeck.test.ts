@@ -140,6 +140,7 @@ import {
   checkpointPath,
   checkpointProbe,
   fitWork,
+  flattenWork,
   fmtSpan,
   jobStartOf,
   treePrefixes,
@@ -461,8 +462,10 @@ test('inline above the prompt, the pane is a summary of at most 8 rows', async (
     const ui = await $.ui.mount({ ...pane(80), props: { ...pane(80).props, placement: 'inline' as const }, surface })
     const root = (await ui.drawn()) as { children?: unknown[] }
     expect((root.children ?? []).filter(Boolean).length <= 8).toBe(true)
-    expect(await ui.find({ text: /\+2 more agents/ })).toBeDefined()
-    expect(await ui.find({ text: /1 allowed/ })).toBeDefined()
+    expect(await ui.find({ text: /running 5 · waiting 0/ })).toBeDefined()
+    expect(await ui.find({ text: /general-purpose task one/ })).toBeDefined()
+    expect(await ui.find({ text: /\+2 more · \/flightdeck open for the tree/ })).toBeDefined()
+    expect(await ui.find({ text: /1 allowed/ })).toBeUndefined()
     expect(await ui.find({ text: /session log/ })).toBeUndefined()
     await ui.unmount()
   }
@@ -763,7 +766,7 @@ test('on a graphical surface, rows of marks hold fewer marks, keep the newest an
   }
 })
 
-test("the inline summary's strip holds fewer marks on a graphical surface and keeps the newest", async ($, on) => {
+test("the inline summary's strip holds fewer marks on a graphical surface and keeps the newest", { options: { panels: 'main,work,gate' } }, async ($, on) => {
   engine(on)
   on('tool.check', (_$, e) => ({ decision: e.tool_use_id === 'n59' ? 'deny' : 'allow' }))
   for (let i = 0; i < 60; i += 1) await $.tool.check({ tool: 'Bash', input: { command: `ls ${i}` }, tool_use_id: `n${i}` })
@@ -1768,7 +1771,7 @@ test('external feed polls on start and every 30s, keeps last good on error, skip
   expect(await narrow.find({ text: /↻/ })).toBeUndefined()
   await narrow.unmount()
 
-  // Width check across surfaces and placements (mini remains unchanged).
+  // Width check across surfaces and placements.
   const failures: string[] = []
   for (const surface of ['terminal', 'desktop'] as const) {
     for (const cols of [24, 32, 40, 64, 120]) {
@@ -1776,7 +1779,7 @@ test('external feed polls on start and every 30s, keeps last good on error, skip
         const checkUi = await $.ui.mount({ ...pane(cols), props: { ...pane(cols).props, placement }, surface })
         for (const s of spillsOf(await checkUi.drawn(), cols)) failures.push(`${surface} ${placement} ${cols}: ${s}`)
         for (const f of desktopFaults(await checkUi.drawn(), [])) failures.push(`${surface} ${placement} ${cols}: ${f}`)
-        if (placement === 'inline') expect(await checkUi.find({ text: /DS ¥57\.7/ })).toBeUndefined()
+        if (placement === 'inline') expect(await checkUi.find({ text: /DS ¥57\.7/ })).toBeDefined()
         await checkUi.unmount()
       }
     }
@@ -4142,4 +4145,143 @@ test('three consult calls that match the same run draw one consult row', () => {
   issued = bindConsultRun(issued, run)
   const tree = buildWork({ jobs: [], issued, cards: [], tasks: [], run, now: 10_000 })
   expect(JSON.stringify(tree).split('"id":"consult:r"').length - 1).toBe(1)
+})
+
+test('flattenWork flattens sub-main boxes and leaves without step or expand rows, live first then waiting then ended', () => {
+  const now = 2_000_000
+  const cards = [
+    normalizeCard({
+      id: 'sm',
+      type: 'sub-main',
+      status: 'running',
+      spawnedAt: now - 40_000,
+      lastAt: now - 5_000,
+      task: 't4',
+      check: { last: 'step 1', next: 'step 2', open: ['step 2', 'step 3'], status: '', tests: '' },
+    }),
+    normalizeCard({ id: 'b-done', type: 'builder', description: 'ended worker', status: 'done', spawnedAt: now - 30_000, endedAt: now - 10_000, parentId: 'sm' }),
+    normalizeCard({ id: 'b-wait', type: 'builder', description: 'waiting worker', status: 'todo', spawnedAt: now - 25_000, parentId: 'sm' }),
+    normalizeCard({ id: 'b-live', type: 'builder', description: 'live worker', status: 'running', spawnedAt: now - 20_000, lastAt: now - 2_000, parentId: 'sm' }),
+  ]
+  const jobs = [
+    normalizeJob({ jobid: 'j-end', job: 'ended-job', status: 'done', ts: (now - 30_000) / 1000, endedAt: now - 15_000 }),
+    normalizeJob({ jobid: 'j-wait', job: 'wait-job', status: 'dry', ts: (now - 25_000) / 1000, endedAt: now - 5_000 }),
+    normalizeJob({ jobid: 'j-live', job: 'live-job', status: 'running', ts: (now - 10_000) / 1000, pid: 1 }),
+  ]
+  const tree = buildWork({ jobs, issued: [], cards, tasks: [{ id: 't4', status: 'doing', subject: 'tests' }], run: null, now, expanded: 'b-live' })
+  const flat = flattenWork(tree)
+  expect(flat.map(item => item.id)).toEqual(['sm', 'b-live', 'job:j-live', 'b-wait', 'job:j-wait', 'b-done', 'job:j-end'])
+})
+
+test('inline mini header shows the doing task id and the plan row shows plan 1/4 and next <id>', async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  const tasks = [
+    { id: 't1', status: 'done', subject: 'scaffold' },
+    { id: 't2', status: 'doing', subject: 'build mini' },
+    { id: 't3', status: 'todo', subject: 'add tests' },
+    { id: 't4', status: 'todo', subject: 'polish docs' },
+  ]
+  on('process.run', (_$, e) => {
+    if (e.argv[2] === MESH_PY) return { value: { exitCode: 0, stdout: JSON.stringify(tasks), stderr: '' } } as never
+    if (e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...pane(80), props: { ...pane(80).props, placement: 'inline' as const }, surface: 'terminal' })
+  expect(await ui.find({ text: /FLIGHTDECK/ })).toBeUndefined()
+  expect(await ui.find({ text: /◐ t2 build mini/ })).toBeDefined()
+  expect(await ui.find({ text: /plan 1\/4/ })).toBeDefined()
+  expect(await ui.find({ text: /next t3 add tests/ })).toBeDefined()
+  expect(await ui.find({ text: /✓◐○○/ })).toBeDefined()
+  await ui.unmount()
+
+  const failures: string[] = []
+  for (const surface of ['terminal', 'desktop'] as const) {
+    for (const cols of [24, 40, 80]) {
+      const checkUi = await $.ui.mount({ ...pane(cols), props: { ...pane(cols).props, placement: 'inline' as const }, surface })
+      const drawn = await checkUi.drawn()
+      if (heightOf(drawn) > 8) failures.push(`${surface} ${cols}: height ${heightOf(drawn)}`)
+      for (const s of spillsOf(drawn, cols)) failures.push(`${surface} ${cols}: ${s}`)
+      for (const f of desktopFaults(drawn, [])) failures.push(`${surface} ${cols}: ${f}`)
+      await checkUi.unmount()
+    }
+  }
+  expect(failures).toEqual([])
+})
+
+test('inline mini draws an agy row when the feed has gem meters and respects the 8-row budget', { options: { feedCommand: '["feed-cmd"]', panels: 'main,work,gate,architect,receipt' } }, async ($, on) => {
+  const clock = engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('tool.check', () => ({ decision: 'allow' }))
+  let ag = 0
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: `ag${++ag}` }))
+  const tasks = [
+    { id: 't1', status: 'done', subject: 'setup' },
+    { id: 't2', status: 'doing', subject: 'feed row' },
+    { id: 't3', status: 'todo', subject: 'verify' },
+  ]
+  on('process.run', (_$, e) => {
+    if (e.argv[0] === 'feed-cmd') {
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            ds_cny: 18.5,
+            gem: [
+              { label: 'gem pro', pct: 42, resets_at: new Date(JOBS_NOW + 3_600_000).toISOString() },
+              { label: 'gem fl', pct: 84, resets_at: new Date(JOBS_NOW + 3_600_000).toISOString() },
+              { label: 'gem argon', pct: 15, resets_at: new Date(JOBS_NOW + 3_600_000).toISOString() },
+            ],
+          }),
+          stderr: '',
+        },
+      } as never
+    }
+    if (e.argv[2] === MESH_PY) return { value: { exitCode: 0, stdout: JSON.stringify(tasks), stderr: '' } } as never
+    if (e.argv[2] === JOBS_PY) return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+    return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+  })
+  await clock.advance(JOBS_NOW)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { window: 200_000, tokens: 80_000, percent: 40 }, rateLimits: [], changed: ['context'] })
+
+  const ui = await $.ui.mount({ ...pane(80), props: { ...pane(80).props, placement: 'inline' as const }, surface: 'terminal' })
+  expect(await ui.find({ text: /^agy$/ })).toBeDefined()
+  expect(await ui.find({ text: /42%/ })).toBeDefined()
+  expect(await ui.find({ text: /84%/ })).toBeDefined()
+  expect(await ui.find({ text: /15%/ })).toBeDefined()
+  expect(await ui.find({ text: /↻/ })).toBeUndefined()
+  await ui.unmount()
+
+  // Narrow drops trailing gem meters rather than spilling.
+  const narrow = await $.ui.mount({ ...pane(24), props: { ...pane(24).props, placement: 'inline' as const }, surface: 'terminal' })
+  expect(await narrow.find({ text: /^agy$/ })).toBeDefined()
+  expect(await narrow.find({ text: /42%/ })).toBeDefined()
+  expect(await narrow.find({ text: /84%/ })).toBeUndefined()
+  expect(spillsOf(await narrow.drawn(), 24)).toEqual([])
+  await narrow.unmount()
+
+  // With header, vitals, agy, plan, gate, 3 workers and an ended turn receipt all active,
+  // the 8-row budget drops the receipt first while keeping work and gate within 8 rows.
+  await $.turn.start({ text: 'go', turnId: 'B1' })
+  await $.tool.check({ tool: 'Read', input: { file_path: '/a' }, tool_use_id: 'g1' })
+  for (const d of ['alpha', 'beta', 'gamma']) await $.agent.spawn(spawn('general-purpose', d))
+  await $.turn.complete({ answer: 'ok', durationMs: 5_000, isAborted: false, turnId: 'B1', reason: 'answer' })
+  const full = await $.ui.mount({ ...pane(80), props: { ...pane(80).props, placement: 'inline' as const }, surface: 'terminal' })
+  const drawn = await full.drawn()
+  expect(heightOf(drawn)).toBeLessThanOrEqual(8)
+  expect(await full.find({ text: /last turn/ })).toBeUndefined()
+  expect(await full.find({ text: /\+2 more · \/flightdeck open for the tree/ })).toBeDefined()
+  expect(spillsOf(drawn, 80)).toEqual([])
+  expect(desktopFaults(drawn, [])).toEqual([])
+  await full.unmount()
 })

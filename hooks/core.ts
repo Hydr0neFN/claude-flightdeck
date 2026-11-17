@@ -2827,6 +2827,28 @@ export const buildWork = (input: WorkInput): WorkTree => {
 /** Whether the tree has anything to draw: no worker and no task takes no room. */
 export const isWorkEmpty = (w: WorkTree) => w.entries.length === 0
 
+const workItemRank = (item: WorkBox | WorkLeaf) => (item.isLive ? 0 : isTodoStatus(item.status) ? 1 : 2)
+
+/**
+ * Flattens a work tree into sub-main boxes and worker leaves (no detail, step or expand rows),
+ * ordered live first, then waiting, then ended.
+ */
+export const flattenWork = (tree: WorkTree): (WorkBox | WorkLeaf)[] => {
+  const out: (WorkBox | WorkLeaf)[] = []
+  const walk = (entries: readonly WorkEntry[]) => {
+    for (const e of entries) {
+      if (e.kind === 'box' && e.box) {
+        out.push(e.box)
+        walk(e.box.entries)
+      } else if (e.kind === 'leaf' && e.leaf) {
+        out.push(e.leaf)
+      }
+    }
+  }
+  walk(tree.entries)
+  return out.sort((a, b) => workItemRank(a) - workItemRank(b))
+}
+
 /** How many rows a box takes when drawn: its header line plus a line per body entry. */
 export const workBoxRows = (b: WorkBox, _cols = 0): number => 1 + b.entries.length
 

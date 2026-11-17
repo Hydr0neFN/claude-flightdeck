@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.0
+
+- Reworked the inline `mini` layout above the prompt (at most 8 rows) to match the 0.9 full pane:
+  - Header without `FLIGHTDECK · `, showing `<MODEL> · <glyph> <doing task>` in its status tone (or `working` / `idle`) and main's elapsed clock on the right while running.
+  - Vitals row with the 6-cell `ctx` gauge (warn at ≥ 80%) and compaction count, up to two rate-limit meters (`5h` / `7d`), spend (`$…`, or `DS ¥…` when there is no Claude cost), short permission mode when non-default, and `architect` only when `panels` includes it.
+  - `agy` feed row with up to `MAX_GEM` meters, dropped from the end when narrow.
+  - `plan <done>/<total>` row with status-toned `planGlyph` marks and dim `next <id> <title>` (or feed `task <text>` without mesh tasks).
+  - Flattened `work` rows (`running N · waiting M` header, then sub-main headers and worker leaves with `▸ worker` and live/ended clocks, ordered live → waiting → ended, at most 4 rows with `+N more · /flightdeck open for the tree` when cut); keeps one `gate` strip row before work only when `panels` includes `gate`.
+  - One-line `receipt` row when idle, dropping receipt, `agy`, `plan`, then work rows down to 1 under the 8-row limit.
+- Added `flattenWork` in `hooks/core.ts` and updated `README.md` and tests for the new inline layout.
+
 ## 0.9.6
 
 - The `agy` feed meters draw no reset timer (`↻`). The Claude 5h / weekly meters keep it.

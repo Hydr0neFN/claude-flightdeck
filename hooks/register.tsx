@@ -15,6 +15,7 @@ import {
   engineModel,
   fitPlan,
   fitWork,
+  flattenWork,
   isRunningStatus,
   isTodoStatus,
   isWorkEmpty,
@@ -2432,40 +2433,168 @@ export const register: Register = (on, options) => {
 
     // Inline above the prompt (the terminal's main screen), the pane is a summary of at most 8 rows.
     const isMini = layout === 'mini' || (layout === 'auto' && e.props.placement === 'inline')
+    const miniWorkRow = (item: WorkBox | WorkLeaf, w: number) => {
+      const isBox = 'entries' in item
+      const label = (
+        isBox
+          ? item.title
+          : item.kind === 'consult'
+            ? `${item.name}${item.note ? ` ${item.note}` : ''}`
+            : `${item.role && !item.name.toLowerCase().startsWith(item.role.toLowerCase()) ? `${item.role} ` : ''}${item.isRealRepo ? '◇' : ''}${item.name}`
+      ).trim()
+      return (
+        <Box key={`mini-work-${item.id}`} width={w} columnGap={1} overflow="hidden">
+          <Text color={toneOfStatus(item.status)}>{item.glyph}</Text>
+          <Box flexShrink={1} overflow="hidden">
+            <Text bold={isBox} dimColor={!isBox && !item.isLive} wrap="truncate">
+              {label}
+            </Text>
+          </Box>
+          {!isBox && item.worker ? (
+            <Box flexShrink={1} overflow="hidden">
+              <Text dimColor wrap="truncate">
+                {`▸ ${item.worker}`}
+              </Text>
+            </Box>
+          ) : null}
+          <Box flexGrow={1} />
+          <Box flexShrink={0}>
+            {item.isLive
+              ? workClock(`mini-clock-${item.id}`, item.startedAt, item.endedAt)
+              : workEndView(item.endedAt, item.status, isBox ? item.status === 'stale' : item.isStale)}
+          </Box>
+        </Box>
+      )
+    }
     if (isMini) {
-      const live = [...cards.filter(c => c.status === 'running'), ...cards.filter(c => c.status !== 'running').reverse()].slice(0, 3)
+      const mg = ctxFill.pct !== null ? gauge(ctxFill.pct, 6) : null
       const counts = `${s.rule} allowed · ${s.cleared} ${decider}${s.ask > 0 ? ` · ${s.ask} pending` : ''} · ${s.deny} denied`
       const strip = g.recent.slice(-Math.max(4, marksIn(W - cfg.gateLabel.length - 2 - counts.length, isTerminal)))
-      const mg = ctxFill.pct !== null ? gauge(ctxFill.pct, 6) : null
+
+      const vitals: Piece[] = []
+      if (mg && ctxFill.pct !== null) {
+        vitals.push({
+          spans: [
+            { text: 'ctx ', dim: true },
+            { text: mg.on, color: ctxFill.pct >= 80 ? C.warn : C.main },
+            { text: mg.off, color: C.faint },
+            { text: ` ${Math.round(ctxFill.pct)}%`, ...(ctxFill.pct >= 80 ? { color: C.warn } : {}), bold: true },
+            ...(u.compactions > 0 ? [{ text: ` ${compactMark(u)}`, color: C.amber }] : []),
+          ],
+        })
+      } else if (u.compactions > 0) {
+        vitals.push({ spans: [{ text: compactMark(u), color: C.amber }] })
+      }
+      u.limits.slice(0, 2).forEach((l, i) => {
+        vitals.push(meter(limitLabel(l.kind), l.pct, l.resetsAt ?? null, W, vitals.length > 0 || i > 0 ? 2 : 0))
+      })
+      if (u.costUsd !== null) {
+        vitals.push({ spans: [{ text: fmtUsd(u.costUsd), color: C.text, bold: true }] })
+      } else if (hasFeedA && f && f.dsCny !== null) {
+        vitals.push({ spans: [{ text: 'DS ', dim: true }, { text: fmtCny(f.dsCny), color: C.text, bold: true }] })
+      }
+      if (showMode) {
+        vitals.push({ spans: [{ text: shortMode(m.mode), dim: true }] })
+      }
+      if (cfg.panels.includes('architect') && showArchitect) {
+        vitals.push({
+          spans: [{ text: `${vitals.length > 0 ? '· ' : ''}${cfg.architectLabel.toLowerCase()} ${advising ? 'advising' : a.consults.length}`, color: C.arch }],
+        })
+      }
+
+      const planTasks = meshTasks.filter(task => task.id)
+      const doingIdx = doingTask ? planTasks.indexOf(doingTask) : -1
+      const nextTask =
+        (doingIdx >= 0 ? planTasks.slice(doingIdx + 1).find(task => isTodoStatus(task.status)) : undefined) ??
+        planTasks.find(task => isTodoStatus(task.status))
+      const planHead = `${planDone}/${meshTasks.length}`
+      const planStripCap = Math.max(1, marksIn(Math.max(1, W - (5 + planHead.length) - (nextTask ? 3 : 1)), isTerminal))
+      const planStripTasks = fitPlan(meshTasks, planStripCap).rows
+
+      const showGate = cfg.panels.includes('gate') && strip.length > 0
+      const hasWork = !isWorkEmpty(work)
+      const workItems = hasWork ? flattenWork(work) : []
+      let showReceipt = !m.isRunning && r !== null
+      let showAgy = Boolean(hasFeedA && f && f.gem.length > 0)
+      let showPlan = meshTasks.length > 0 || Boolean(hasFeedB && f && f.task)
+
+      // 8-row hard budget: count rows 1-4 (plus optional gate) and receipt first; drop receipt,
+      // then agy, then plan when full so the work section always keeps at least 1 row.
+      const fixedRows = () =>
+        1 +
+        (vitals.length > 0 ? 1 : 0) +
+        (showAgy ? 1 : 0) +
+        (showPlan ? 1 : 0) +
+        (showGate ? 1 : 0) +
+        (hasWork ? 1 : 0) +
+        (showReceipt ? 1 : 0)
+      const minWorkBody = hasWork ? (workItems.length > 1 ? 2 : 1) : 0
+      while (fixedRows() + minWorkBody > 8) {
+        if (showReceipt) {
+          showReceipt = false
+          continue
+        }
+        if (showAgy) {
+          showAgy = false
+          continue
+        }
+        if (showPlan) {
+          showPlan = false
+          continue
+        }
+        break
+      }
+      const workRoom = hasWork ? Math.min(4, Math.max(1, 8 - fixedRows())) : 0
+      const workCut = hasWork && workItems.length > workRoom
+      const shownWork = workCut ? workItems.slice(0, Math.max(1, workRoom - 1)) : workItems.slice(0, workRoom)
+      const cutCount = workItems.length - shownWork.length
+
+      const costText = r && r.costDelta !== null ? `· +${fmtUsd(r.costDelta)}` : ''
+      const jobsText = r ? jobsLabel(r).trimStart() : ''
+      const costFits = Boolean(costText) && 11 + cellWidth(costText) <= W
+      const jobsFits = Boolean(jobsText) && 10 + (costFits ? 1 + cellWidth(costText) : 0) + 1 + cellWidth(jobsText) <= W
+
       return (
         <Box flexDirection="column" width={W}>
-          {line(
-            [
-              {
-                spans: [
-                  { text: modelName, color: C.main, bold: true },
-                  { text: m.isRunning ? ' ● working' : ' ○ idle', color: m.isRunning ? C.main : C.dim },
-                ],
-              },
-              mg
-                ? {
-                    spans: [
-                      { text: '· ctx ', dim: true },
-                      { text: mg.on, color: (ctxFill.pct ?? 0) >= 80 ? C.warn : C.main },
-                      { text: mg.off, color: C.faint },
-                      { text: ` ${Math.round(ctxFill.pct ?? 0)}%` },
-                      ...(u.compactions > 0 ? [{ text: ` ${compactMark(u)}`, color: C.amber }] : []),
-                    ],
-                  }
-                : u.compactions > 0
-                  ? { spans: [{ text: compactMark(u), color: C.amber }] }
-                  : null,
-              u.costUsd !== null ? { spans: [{ text: `· ${fmtUsd(u.costUsd)}`, dim: true }] } : null,
-              showArchitect ? { spans: [{ text: `· ${cfg.architectLabel.toLowerCase()} ${advising ? 'advising' : a.consults.length}`, color: C.arch }] } : null,
-            ],
-            W,
-          )}
-          {strip.length > 0 ? (
+          <Box width={W} justifyContent="space-between" columnGap={1} overflow="hidden">
+            <Box flexShrink={1} columnGap={1} overflow="hidden">
+              <Text color={C.main} bold wrap="truncate">{modelName.toUpperCase()}</Text>
+              <Text color={C.dim} bold>·</Text>
+              {doingTask ? (
+                <Text color={toneOfStatus(doingTask.status)} bold wrap="truncate">
+                  {`${planGlyph(doingTask.status)} ${doingTask.id}${doingTask.subject ? ` ${doingTask.subject}` : ''}`}
+                </Text>
+              ) : (
+                <Text bold wrap="truncate">{m.isRunning ? 'working' : 'idle'}</Text>
+              )}
+            </Box>
+            {m.isRunning && t.startedAt > 0 ? (
+              <Box flexShrink={0}>{clock('main-clock', t.startedAt, null, C.dim, true)}</Box>
+            ) : null}
+          </Box>
+          {vitals.length > 0 ? line(vitals, W) : null}
+          {showAgy && f
+            ? line([{ spans: [{ text: 'agy', dim: true }] }, ...f.gem.slice(0, MAX_GEM).map(gm => meter(feedLabel(gm.label), gm.pct, null, W, 2))], W)
+            : null}
+          {showPlan
+            ? meshTasks.length > 0
+              ? line(
+                  [
+                    { spans: [{ text: 'plan ', dim: true }, { text: planHead, bold: true }] },
+                    ...(planStripTasks.length > 0
+                      ? [{ spans: planStripTasks.map(task => ({ text: planGlyph(task.status), color: toneOfStatus(task.status) })) }]
+                      : []),
+                    nextTask
+                      ? { fill: true, spans: [{ text: `next ${nextTask.id}${nextTask.subject ? ` ${nextTask.subject}` : ''}`, dim: true }] }
+                      : null,
+                  ],
+                  W,
+                )
+              : f?.task
+                ? line([{ spans: [{ text: 'task', dim: true }] }, { fill: true, spans: [{ text: f.task, color: C.text }] }], W)
+                : null
+            : null}
+          {showGate ? (
             <Box columnGap={1}>
               <Text dimColor>{cfg.gateLabel.toLowerCase()}</Text>
               {markRow(strip.map(checkMark))}
@@ -2474,25 +2603,25 @@ export const register: Register = (on, options) => {
               </Text>
             </Box>
           ) : null}
-          {live.map(c => (
-            <Box columnGap={1}>
-              <Text color={statusColor(c)}>{glyph(c)}</Text>
-              <Box width={Math.max(6, W - 30)} flexShrink={0}>
-                <Text wrap="truncate">{cardTitle(c)}</Text>
-              </Box>
-              {c.steps > 0 ? <Text dimColor>{`ctx ${kTokens(c.ctx)}`}</Text> : null}
-              {clock(`mini-clock-${c.id}`, c.spawnedAt, c.endedAt, C.dim)}
+          {hasWork ? (
+            <Box width={W} columnGap={1} overflow="hidden">
+              <Text color={toneOfStatus(fittedWork.status)} bold>{fittedWork.glyph}</Text>
+              <Text color={toneOfStatus(fittedWork.status)} bold wrap="truncate">{fittedWork.title}</Text>
             </Box>
-          ))}
-          {cards.length > live.length ? (
-            <Text color={C.faint} wrap="truncate">{`+${cards.length - live.length} more agents · /flightdeck layout compact for all`}</Text>
           ) : null}
-          {lp.length > 0 ? <Text dimColor wrap="truncate">{`other loops ${lp.length} · ${lp.filter(l => isLoopActive(l, now)).length} active`}</Text> : null}
-          {!m.isRunning && r ? (
-            <Text dimColor wrap="truncate">
-              {`${receiptSummary(r)}${r.costDelta !== null ? ` · +${fmtUsd(r.costDelta)}` : ''}${jobsLabel(r)}`}
-            </Text>
-          ) : null}
+          {shownWork.map(item => miniWorkRow(item, W))}
+          {workCut ? <Text color={C.faint} wrap="truncate">{`+${cutCount} more · /flightdeck open for the tree`}</Text> : null}
+          {showReceipt && r
+            ? line(
+                [
+                  { spans: [{ text: r.reason === 'answer' ? '✓' : '✗', color: r.reason === 'answer' ? C.gate : C.warn }] },
+                  { spans: [{ text: receiptSummary(r) }], fill: true },
+                  costFits ? { spans: [{ text: costText, color: C.main }] } : null,
+                  jobsFits ? { spans: [{ text: jobsText, color: C.agent }] } : null,
+                ],
+                W,
+              )
+            : null}
         </Box>
       )
     }
