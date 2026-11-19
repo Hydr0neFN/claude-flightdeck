@@ -1207,17 +1207,23 @@ HOME = os.path.expanduser("~")
 ` + PID_ALIVE_PY + String.raw`
 
 d = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else os.path.join(HOME, ".claude", "state", "consult-runs")
+sid = sys.argv[2] if len(sys.argv) > 2 else ""
 lp = os.path.join(HOME, ".claude", "state", "consult-locks.json")
 run = None
 try:
  files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json") and not f.startswith(".")]
  files = [f for f in files if os.path.isfile(f)]
- if files:
-  files.sort(key=lambda p: (os.stat(p).st_mtime_ns, os.path.basename(p)), reverse=True)
-  with open(files[0], "r", encoding="utf-8", errors="replace") as fh:
-   data = json.load(fh)
-  if isinstance(data, dict):
+ files.sort(key=lambda p: (os.stat(p).st_mtime_ns, os.path.basename(p)), reverse=True)
+ # With a session id, only a run that session started counts (its "session" field); without one, the newest run.
+ for f in files[:40] if sid else files[:1]:
+  try:
+   with open(f, "r", encoding="utf-8", errors="replace") as fh:
+    data = json.load(fh)
+  except Exception:
+   continue
+  if isinstance(data, dict) and (not sid or data.get("session") == sid):
    run = data
+   break
 except Exception:
  run = None
 if isinstance(run, dict) and run.get("endedAt") is None:
@@ -1240,12 +1246,15 @@ print(json.dumps({"run": run, "locks": locks}))`
 /**
  * The argv that prints `{ run, locks }` from `dir` (or `~/.claude/state/consult-runs` when empty) and
  * `~/.claude/state/consult-locks.json`. Marks `run.stale = true` when `endedAt` is null and the pid is gone.
+ * With `sessionId`, the run is the newest one whose `session` field matches (a run from another session,
+ * or one with no `session`, never shows); with '' it is the newest run in `dir`.
  */
-export const consultProbe = (python: string | readonly string[], dir: string): string[] => [
+export const consultProbe = (python: string | readonly string[], dir: string, sessionId = ''): string[] => [
   ...(typeof python === 'string' ? [python] : python),
   '-c',
   CONSULT_PY,
   dir,
+  sessionId,
 ]
 
 // ---------------------------------------------------------------- farmer jobs

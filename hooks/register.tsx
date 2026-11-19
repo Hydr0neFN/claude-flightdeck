@@ -436,16 +436,17 @@ type ConsultLock = {
 }
 
 /**
- * Polls the newest external consult run file and locks file via `consultProbe`.
+ * Polls the newest external consult run file this session started, and the locks file, via `consultProbe`.
  * Keeps the last good state on failure and skips overlapping calls.
  */
 async function pollConsult($: EngineInterface, dir: string, lock: ConsultLock): Promise<boolean | null> {
   if (lock.inFlight || lock.stopped) return null
   lock.inFlight = true
   try {
+    const sid = await $.session.id().catch(() => '')
     let res: { exitCode: number; stdout: string } | null = null
     for (const py of lock.python.length > 0 ? [lock.python] : PYTHON_CANDIDATES) {
-      res = await $.process.run(consultProbe(py, dir), { timeoutMs: CONSULT_TIMEOUT_MS }).catch(() => null)
+      res = await $.process.run(consultProbe(py, dir, typeof sid === 'string' ? sid : ''), { timeoutMs: CONSULT_TIMEOUT_MS }).catch(() => null)
       if (res && res.exitCode === 0) {
         lock.python = py
         break

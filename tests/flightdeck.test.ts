@@ -2701,6 +2701,10 @@ test('the jobs dir option is read leniently and the python fallback is python3, 
   expect(consultProbe('python3', '/r')[0]).toBe('python3')
   expect(consultProbe('python3', '/r')[3]).toBe('/r')
   expect(consultProbe(['py', '-3'], '/r').slice(0, 3)).toEqual(['py', '-3', '-c'])
+  // The session id goes last; the script keeps only runs whose `session` field matches it.
+  expect(consultProbe('python3', '/r', 'sess-1').slice(3)).toEqual(['/r', 'sess-1'])
+  expect(consultProbe('python3', '/r').at(4)).toBe('')
+  expect(CONSULT_PY).toContain('data.get("session") == sid')
 })
 
 test('the pid helper both probes share tests the Windows branch first, and os.kill elsewhere', () => {
