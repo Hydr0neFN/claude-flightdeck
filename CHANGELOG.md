@@ -1,9 +1,9 @@
 # Changelog
 
-
 ## 0.10.2
 
 - The consult panel shows only a run that this session started. The run file names its session (`session`, written by consult-cli from `CLAUDE_CODE_SESSION_ID`). A run from another session, or one with no `session`, does not show. A host with no session id shows the newest run, as before.
+
 ## 0.10.1
 
 - Jobs probe: a reused pid no longer keeps a dead farmer job live.
