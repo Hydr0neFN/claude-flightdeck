@@ -136,7 +136,7 @@ import {
   WORK_STRIP_MAX,
   buildWork,
   compactMark,
-  headerTaskText,
+  taskLabel,
   cardForTaskStop,
   checkpointOfAnswer,
   checkpointPath,
@@ -3211,8 +3211,9 @@ test('the tree hangs work under its sub-main headers, running before waiting bef
   expect(tree2.boxes[0]?.title).toBe('flux-ab-4 · t4 FLUX Klein A/B continue 4 ▸ Sonnet 5.5')
   expect(tree2.boxes[0]!.entries.find(e => e.leaf?.name === 'builder')?.leaf?.worker).toBe('Haiku 5.5')
   const long = [...workTasks.filter(t => t.id !== 't4'), { id: 't4', status: 'todo', subject: 'FLUX 3 Klein (+ web model/LoRA research) tuned A/B vs tuned Qwen' }]
-  expect(buildWork({ ...wi, tasks: long }).boxes[0]?.title).toBe('sub-main · t4 FLUX 3 Klein (+ web model/L…')
-  expect(headerTaskText(long.at(-1)!)).toBe('t4 FLUX 3 Klein (+ web model/L…')
+  expect(buildWork({ ...wi, tasks: long }).boxes[0]?.title).toBe('sub-main · t4 FLUX 3 Klein (+…')
+  expect(taskLabel(long.at(-1)!)).toBe('t4 FLUX 3 Klein (+…')
+  expect(taskLabel({ id: 't9', subject: 'x'.repeat(80) }).length).toBeLessThanOrEqual(20)
   expect(compactMark({ compactions: 2, isCompactEstimate: true })).toBe('cmp×~2')
   expect(isWorkEmpty(tree)).toBe(false)
   expect(isWorkEmpty(buildWork({ jobs: [], issued: [], cards: [], tasks: [], run: null, now }))).toBe(true)

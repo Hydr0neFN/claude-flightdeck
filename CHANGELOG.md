@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.4
+
+- Hard cap on task labels: a task shows at most 20 cells, id included (`t4 FLUX 3 Klein (+…`). The cap applies to the pane header, the plan rows, the `next` line and the work box title. Before, the header overflowed its width at 28 cells.
+
 ## 0.10.3
 
 - The compaction count reads `cmp×2` (estimated: `cmp×~2`). The old `↺2` looked like the reset timers' `↻` and drew as a stray letter in some fonts.

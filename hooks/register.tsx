@@ -78,7 +78,7 @@ import {
   afterResponse,
   claimCompactRead,
   compactMark,
-  headerTaskText,
+  taskLabel,
   contextFill,
   faultKey,
   forgetCompactRead,
@@ -1549,7 +1549,7 @@ export const register: Register = (on, options) => {
               <Box width={inner} columnGap={1} overflow="hidden">
                 <Text color={toneOfStatus(task.status)}>{planGlyph(task.status)}</Text>
                 <Box flexShrink={1}>
-                  <Text wrap="truncate">{`${task.id}${task.subject ? ` ${task.subject}` : ''}`}</Text>
+                  <Text wrap="truncate">{taskLabel(task)}</Text>
                 </Box>
                 <Box flexGrow={1} />
                 {isDoing ? <Box flexShrink={0}>{clock(`plan-${task.id}`, t.startedAt, null, C.dim, true)}</Box> : null}
@@ -2566,7 +2566,7 @@ export const register: Register = (on, options) => {
               <Text color={C.dim} bold>·</Text>
               {doingTask ? (
                 <Text color={toneOfStatus(doingTask.status)} bold wrap="truncate">
-                  {`${planGlyph(doingTask.status)} ${headerTaskText(doingTask)}`}
+                  {`${planGlyph(doingTask.status)} ${taskLabel(doingTask)}`}
                 </Text>
               ) : (
                 <Text bold wrap="truncate">{m.isRunning ? 'working' : 'idle'}</Text>
@@ -2589,7 +2589,7 @@ export const register: Register = (on, options) => {
                       ? [{ spans: planStripTasks.map(task => ({ text: planGlyph(task.status), color: toneOfStatus(task.status) })) }]
                       : []),
                     nextTask
-                      ? { fill: true, spans: [{ text: `next ${nextTask.id}${nextTask.subject ? ` ${nextTask.subject}` : ''}`, dim: true }] }
+                      ? { fill: true, spans: [{ text: `next ${taskLabel(nextTask)}`, dim: true }] }
                       : null,
                   ],
                   W,
@@ -2655,7 +2655,7 @@ export const register: Register = (on, options) => {
             <Text color={C.dim} bold>·</Text>
             {doingTask ? (
               <Text color={toneOfStatus(doingTask.status)} bold wrap="truncate">
-                {`${planGlyph(doingTask.status)} ${headerTaskText(doingTask)}`}
+                {`${planGlyph(doingTask.status)} ${taskLabel(doingTask)}`}
               </Text>
             ) : (
               <Text bold wrap="truncate">{m.isRunning ? 'working' : 'idle'}</Text>
