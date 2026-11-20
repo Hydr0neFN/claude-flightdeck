@@ -264,6 +264,14 @@ export const shorten = (s: string, n: number) => {
   return n <= 0 ? '' : one.length > n ? `${one.slice(0, Math.max(0, n - 1)).trimEnd()}…` : one
 }
 
+/** Cells a task subject keeps in the pane header and a work box title; the plan rows show it whole. */
+export const HEADER_SUBJECT_MAX = 28
+export const BOX_SUBJECT_MAX = 28
+
+/** The doing task as the pane header writes it: `t4 FLUX 3 Klein (+ web model/LoRA…`. */
+export const headerTaskText = (t: { id: string; subject?: string }) =>
+  `${t.id}${t.subject ? ` ${shorten(t.subject, HEADER_SUBJECT_MAX)}` : ''}`
+
 // ---------------------------------------------------------------- delegated workers
 
 /**
@@ -719,9 +727,12 @@ export const afterResponse = (u: Usage): Usage => (u.hasFill ? u : { ...u, hasFi
 export const afterCompactHooked = (u: Usage): Usage =>
   u.isCompactHooked ? u : { ...u, isCompactHooked: true, ...(u.isCompactEstimate ? { compactions: 0, lastCompactAt: null, isCompactEstimate: false } : {}) }
 
-/** The compaction count as the pane marks it: `↺2`, or `↺~2` when estimated; empty before the first. */
+/**
+ * The compaction count as the pane marks it: `cmp×2`, or `cmp×~2` when estimated; empty before the first.
+ * Plain text: an arrow glyph read as the reset timers' `↻` and draws as a stray letter in some fonts.
+ */
 export const compactMark = (u: Pick<Usage, 'compactions' | 'isCompactEstimate'>) =>
-  u.compactions > 0 ? `↺${u.isCompactEstimate ? '~' : ''}${u.compactions}` : ''
+  u.compactions > 0 ? `cmp×${u.isCompactEstimate ? '~' : ''}${u.compactions}` : ''
 
 /** A gauge of `width` cells: ▰ filled, ▱ empty. */
 export const gauge = (pct: number, width: number) => {
@@ -2642,7 +2653,8 @@ const cardWorkLeaf = (c: AgentCard, now: number): WorkLeaf => {
     glyph: stale ? '⊘' : workGlyph(c.status),
     role: c.type || 'agent',
     name: cardTitle(c),
-    worker: c.worker ? workerDisplay(c.worker) : '',
+    // The model that does the work: the job runner's backend when one is known, else the subagent's own model.
+    worker: c.worker ? workerDisplay(c.worker) : c.model ? prettyModel(c.model) : '',
     note: '',
     status: stale ? 'stale' : c.status,
     startedAt: c.spawnedAt,
@@ -2818,12 +2830,16 @@ export const buildWork = (input: WorkInput): WorkTree => {
     const startedEnds = [c.spawnedAt, ...workers.map(w => w.startedAt)].filter(n => n > 0)
     const boxStatus = isBoxLive ? 'running' : cardStale ? 'stale' : sumStatus(statuses)
     const role = c.type || 'sub-main'
-    const subject = taskById.get(c.task)?.subject ?? ''
+    // The job it does: its own spawn description, else its task's subject cut short (the plan rows show it whole).
+    const desc = c.description && c.description !== role ? c.description : ''
+    const subject = desc ? '' : shorten(taskById.get(c.task)?.subject ?? '', BOX_SUBJECT_MAX)
+    const job = desc || subject
+    const model = c.model ? ` ▸ ${prettyModel(c.model)}` : ''
     return {
       id: c.id,
       role,
       task: c.task,
-      title: `${role}${c.task ? ` · ${c.task}${subject ? ` ${subject}` : ''}` : ''}`,
+      title: `${role}${c.task ? ` · ${c.task}` : ''}${job ? `${c.task ? ' ' : ' · '}${job}` : ''}${model}`,
       glyph: workGlyph(boxStatus),
       status: boxStatus,
       strip: stripOf(statuses),

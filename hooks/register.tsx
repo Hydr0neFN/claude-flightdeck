@@ -78,6 +78,7 @@ import {
   afterResponse,
   claimCompactRead,
   compactMark,
+  headerTaskText,
   contextFill,
   faultKey,
   forgetCompactRead,
@@ -2559,11 +2560,13 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column" width={W}>
           <Box width={W} justifyContent="space-between" columnGap={1} overflow="hidden">
             <Box flexShrink={1} columnGap={1} overflow="hidden">
-              <Text color={C.main} bold wrap="truncate">{modelName.toUpperCase()}</Text>
+              <Box flexShrink={0}>
+                <Text color={C.main} bold>{modelName.toUpperCase()}</Text>
+              </Box>
               <Text color={C.dim} bold>·</Text>
               {doingTask ? (
                 <Text color={toneOfStatus(doingTask.status)} bold wrap="truncate">
-                  {`${planGlyph(doingTask.status)} ${doingTask.id}${doingTask.subject ? ` ${doingTask.subject}` : ''}`}
+                  {`${planGlyph(doingTask.status)} ${headerTaskText(doingTask)}`}
                 </Text>
               ) : (
                 <Text bold wrap="truncate">{m.isRunning ? 'working' : 'idle'}</Text>
@@ -2646,11 +2649,13 @@ export const register: Register = (on, options) => {
             One line: the model, then the doing task (or idle/working), with main's clock on the right. */}
         <Box width={W} justifyContent="space-between" columnGap={1} overflow="hidden">
           <Box flexShrink={1} columnGap={1} overflow="hidden">
-            <Text color={C.main} bold wrap="truncate">{`${W >= 40 ? 'FLIGHTDECK · ' : ''}${modelName.toUpperCase()}`}</Text>
+            <Box flexShrink={0}>
+              <Text color={C.main} bold>{`${W >= 40 ? 'FLIGHTDECK · ' : ''}${modelName.toUpperCase()}`}</Text>
+            </Box>
             <Text color={C.dim} bold>·</Text>
             {doingTask ? (
               <Text color={toneOfStatus(doingTask.status)} bold wrap="truncate">
-                {`${planGlyph(doingTask.status)} ${doingTask.id}${doingTask.subject ? ` ${doingTask.subject}` : ''}`}
+                {`${planGlyph(doingTask.status)} ${headerTaskText(doingTask)}`}
               </Text>
             ) : (
               <Text bold wrap="truncate">{m.isRunning ? 'working' : 'idle'}</Text>

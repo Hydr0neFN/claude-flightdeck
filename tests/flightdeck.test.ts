@@ -135,6 +135,8 @@ import {
   subMainTasks,
   WORK_STRIP_MAX,
   buildWork,
+  compactMark,
+  headerTaskText,
   cardForTaskStop,
   checkpointOfAnswer,
   checkpointPath,
@@ -1081,7 +1083,7 @@ const fillHost = ($: Parameters<TestBody>[0], on: On) => {
     /** The compaction mark the main box shows, whether it says `(estimated)`, and how many log lines say compacted. */
     shown: async () => {
       const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
-      const mark = (await ui.find({ type: 'Text', text: /^↺/ }))?.text ?? null
+      const mark = (await ui.find({ type: 'Text', text: /^cmp×/ }))?.text ?? null
       const isEstimated = (await ui.find({ type: 'Text', text: /^\(estimated\)$/ })) !== undefined
       const logged = (await ui.findAll({ type: 'Text', text: /^context compacted/ })).map(n => n.text)
       await ui.unmount()
@@ -1097,11 +1099,11 @@ test('under the built-in guard a request that finds the context emptied counts a
   await h.request(60_000)
   expect(await h.shown()).toEqual({ mark: null, isEstimated: false, logged: [] })
   await h.request(undefined)
-  expect(await h.shown()).toEqual({ mark: '↺~1', isEstimated: true, logged: ['context compacted (estimated)'] })
+  expect(await h.shown()).toEqual({ mark: 'cmp×~1', isEstimated: true, logged: ['context compacted (estimated)'] })
   // Compacted again after one response, as auto-compaction can within a turn; a subagent's own window is not the main one.
   await h.request(undefined)
   await h.request(undefined, 'sub1')
-  expect((await h.shown()).mark).toBe('↺~2')
+  expect((await h.shown()).mark).toBe('cmp×~2')
   // The label is left out where the line is short; nothing spills.
   const spills: string[] = []
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -1118,11 +1120,11 @@ test('under the built-in guard a request that finds the context emptied counts a
   await $.session.end({ reason: 'clear', sessionId: 's' } as never)
   await h.request(undefined)
   await h.measure(30_000)
-  expect((await h.shown()).mark).toBe('↺~2')
+  expect((await h.shown()).mark).toBe('cmp×~2')
   // So can a /resume into another conversation, before its first response.
   await $.session.end({ reason: 'resume', sessionId: 's' } as never)
   await h.request(undefined)
-  expect((await h.shown()).mark).toBe('↺~2')
+  expect((await h.shown()).mark).toBe('cmp×~2')
 })
 
 test('once session.compact reaches Flightdeck its count is the real one: estimates before it are dropped, none after', { options: { panels: 'main,log' } }, async ($, on) => {
@@ -1130,12 +1132,12 @@ test('once session.compact reaches Flightdeck its count is the real one: estimat
   await h.measure(60_000)
   await h.request(60_000)
   await h.request(undefined) // a rewind to the first prompt reads like a compaction
-  expect((await h.shown()).mark).toBe('↺~1')
+  expect((await h.shown()).mark).toBe('cmp×~1')
   await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'the summary', toolUses: [] }] })
   await h.request(undefined)
   await h.request(60_000)
   await h.request(undefined)
-  expect(await h.shown()).toEqual({ mark: '↺1', isEstimated: false, logged: ['context compacted (estimated)', 'context compacted (auto)'] })
+  expect(await h.shown()).toEqual({ mark: 'cmp×1', isEstimated: false, logged: ['context compacted (estimated)', 'context compacted (auto)'] })
 })
 
 test('a compaction that comes back skipped is neither counted nor logged', { options: { panels: 'main,log' } }, async ($, on) => {
@@ -1147,7 +1149,7 @@ test('a compaction that comes back skipped is neither counted nor logged', { opt
   expect(await h.shown()).toEqual({ mark: null, isEstimated: false, logged: [] })
   h.vetoCompactions(undefined)
   await compact()
-  expect(await h.shown()).toEqual({ mark: '↺1', isEstimated: false, logged: ['context compacted (manual)'] })
+  expect(await h.shown()).toEqual({ mark: 'cmp×1', isEstimated: false, logged: ['context compacted (manual)'] })
 })
 
 test("a surface module's fault key is the same for the hook's path, either separator, and the drawing's name", () => {
@@ -3201,6 +3203,17 @@ test('the tree hangs work under its sub-main headers, running before waiting bef
     'step:3 steps left: receipt rows · tests · docs',
   ])
   expect(tree.boxes[0]!.entries[0]?.leaf?.isLive).toBe(true)
+  // A box names its own job and model; a long task subject is cut; a card leaf names its model.
+  const wi = workTreeInput(now)
+  const named = { ...wi.cards[0]!, type: 'flux-ab-4', description: 'FLUX Klein A/B continue 4', model: 'claude-sonnet-5-5' }
+  const kid = { ...wi.cards[1]!, parentId: named.id, model: 'claude-haiku-5-5' }
+  const tree2 = buildWork({ ...wi, cards: [named, kid] })
+  expect(tree2.boxes[0]?.title).toBe('flux-ab-4 · t4 FLUX Klein A/B continue 4 ▸ Sonnet 5.5')
+  expect(tree2.boxes[0]!.entries.find(e => e.leaf?.name === 'builder')?.leaf?.worker).toBe('Haiku 5.5')
+  const long = [...workTasks.filter(t => t.id !== 't4'), { id: 't4', status: 'todo', subject: 'FLUX 3 Klein (+ web model/LoRA research) tuned A/B vs tuned Qwen' }]
+  expect(buildWork({ ...wi, tasks: long }).boxes[0]?.title).toBe('sub-main · t4 FLUX 3 Klein (+ web model/L…')
+  expect(headerTaskText(long.at(-1)!)).toBe('t4 FLUX 3 Klein (+ web model/L…')
+  expect(compactMark({ compactions: 2, isCompactEstimate: true })).toBe('cmp×~2')
   expect(isWorkEmpty(tree)).toBe(false)
   expect(isWorkEmpty(buildWork({ jobs: [], issued: [], cards: [], tasks: [], run: null, now }))).toBe(true)
 

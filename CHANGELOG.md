@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.3
+
+- The compaction count reads `cmp×2` (estimated: `cmp×~2`). The old `↺2` looked like the reset timers' `↻` and drew as a stray letter in some fonts.
+- The pane header keeps the whole model name. It cuts the doing task's subject to 28 cells; the plan rows show the subject in full.
+- A work box title shows the job the agent does (its spawn description) and its model, for example `flux-ab-4 · t4 FLUX Klein A/B continue 4 ▸ Sonnet 5.5`. With no description, the title cuts the task subject to 28 cells.
+- A subagent leaf with no job-runner backend shows its own model (`▸ Haiku 5.5`).
+
 ## 0.10.2
 
 - The consult panel shows only a run that this session started. The run file names its session (`session`, written by consult-cli from `CLAUDE_CODE_SESSION_ID`). A run from another session, or one with no `session`, does not show. A host with no session id shows the newest run, as before.
