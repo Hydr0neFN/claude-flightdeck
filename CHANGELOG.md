@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Fork (yu): the manifest carries no `version`, so Claude Code versions the plugin by commit sha and every push to this branch reaches installed copies. Merge note: after taking upstream's plugin.json, delete a `version` line that comes back.
+- Fork (yu): the manifest carries no `version`, so Claude Code versions the plugin by commit sha and every push to this branch reaches installed copies at the next session start (checked on this fork 2026-11-23). Merge note: after taking upstream's plugin.json, delete a `version` line that comes back.
 
 ## 0.10.4
 
