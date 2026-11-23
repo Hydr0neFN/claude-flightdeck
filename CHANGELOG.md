@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fork (yu): the manifest carries no `version`, so Claude Code versions the plugin by commit sha and every push to this branch reaches installed copies. Merge note: after taking upstream's plugin.json, delete a `version` line that comes back.
+
 ## 0.10.4
 
 - Hard cap on task labels: a task shows at most 20 cells, id included (`t4 FLUX 3 Klein (+…`). The cap applies to the pane header, the plan rows, the `next` line and the work box title. Before, the header overflowed its width at 28 cells.
