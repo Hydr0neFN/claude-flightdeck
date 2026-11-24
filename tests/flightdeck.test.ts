@@ -2346,7 +2346,9 @@ test('consult probe parsing handles live, ended, stale, missing file and bad JSO
   expect(live?.run?.stale).toBe(false)
   expect(isConsultLive(live)).toBe(true)
   expect(shortConsultEngine('copilot:gpt-5')).toBe('copilot')
-  expect(shortConsultEngine('openrouter/deepseek:r1')).toBe('openrouter')
+  expect(shortConsultEngine('openrouter/deepseek:r1')).toBe('orouter')
+  expect(shortConsultEngine('gemini:gemini-3.6-flash')).toBe('GemAPI')
+  expect(shortConsultEngine('agy:gemini-4-neon-high')).toBe('agy')
   expect(shortConsultEngine('superlongenginenamehere')).toBe('superlongen…')
 
   const ended = parseConsult(JSON.stringify({ run: makeRun({ endedAt: 50_000, summary: '3 ok · 1 failed · 1 skipped' }), locks: {} }))
@@ -3898,10 +3900,10 @@ test('an engine model comes from its model field or the part after its first col
       locks: {},
     }),
   )!.run!
-  expect(consultLockNote(run, [], 200)).toBe('⊘ codex until 22:54 · ⊘ gemini until 23:10')
+  expect(consultLockNote(run, [], 200)).toBe('⊘ codex until 22:54 · ⊘ GemAPI until 23:10')
   expect(consultLockNote(run, [], 20)).toBe('⊘ codex until 22:54')
   const summary = consultSummaryLine(run, 80)
-  expect(summary).toBe('✓ 1/3 answered · ⊘ codex · ⊘ gemini')
+  expect(summary).toBe('✓ 1/3 answered · ⊘ codex · ⊘ GemAPI')
   expect(consultSummaryLine(run, 20)).toContain('✓ 1/3 answered')
   expect(summary).not.toContain('skipped')
 })
@@ -3926,6 +3928,7 @@ test("the ring draws one dim model row under each label with the whole short mod
   // Owner: the whole short model name shows when it fits (no vendor path, no :free / -preview).
   expect(models.slice(0, 3)).toEqual(['gemini-4-argon-high', 'nemotron-3-ultra-550b', 'gpt-6.1-sol'])
   expect(shortModel('baidu/ernie-5.5-flash-preview:free')).toBe('ernie-5.5-flash')
+  expect(shortModel('nvidia/nemotron-3-ultra-550b-a55b')).toBe('nemotron-3-ultra')
   expect(models[3]).toBeUndefined()
   for (const nd of grid.layout.nodes.filter(x => x.model !== undefined)) {
     expect(nd.modelY).toBe(nd.labelY + 1)

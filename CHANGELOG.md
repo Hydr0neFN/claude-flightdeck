@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Consult ring names: the Gemini API engine shows as `GemAPI` (the `agy` engine also runs Gemini models), and `openrouter` shows as `orouter`. A model name drops its MoE size suffix (`nemotron-3-ultra-550b-a55b` → `nemotron-3-ultra`), so the nim model row no longer runs into the next label.
 - Fork (yu): the manifest carries no `version`, so Claude Code versions the plugin by commit sha and every push to this branch reaches installed copies at the next session start (checked on this fork 2026-11-23). Merge note: after taking upstream's plugin.json, delete a `version` line that comes back.
 
 ## 0.10.4

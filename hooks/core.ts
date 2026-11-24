@@ -3021,11 +3021,14 @@ export const engineModel = (e: Pick<ConsultEngine, 'name' | 'model'>): string =>
   return i >= 0 ? e.name.slice(i + 1).trim() : ''
 }
 
-/** A model id as the ring shows it: no `vendor/` path, no `:free` tag, no `-preview` suffix. */
+/**
+ * A model id as the ring shows it: no `vendor/` path, no `:free` tag, no `-preview` suffix,
+ * no MoE size suffix (`nemotron-3-ultra-550b-a55b` → `nemotron-3-ultra`).
+ */
 export const shortModel = (model: string): string => {
   let s = model.trim()
   s = s.slice(s.lastIndexOf('/') + 1)
-  s = s.replace(/:free$/i, '').replace(/-preview$/i, '')
+  s = s.replace(/:free$/i, '').replace(/-preview$/i, '').replace(/-\d+b-a\d+b$/i, '')
   return s || model.trim()
 }
 
@@ -3174,13 +3177,22 @@ const KIND_LABELS: Record<string, string> = {
 
 export const consultKindLabel = (kind: string) => KIND_LABELS[kind] ?? (kind || 'consult')
 
-/** Strip `:model` suffix / `/` variant and cap to `max` cells (default 12). */
+/**
+ * Display names for consult engines. `gemini` is the Gemini API engine; the name says so,
+ * because `agy` also runs Gemini models. `openrouter` is too long for a ring node.
+ */
+const CONSULT_ENGINE_ALIASES: Record<string, string> = {
+  gemini: 'GemAPI',
+  openrouter: 'orouter',
+}
+
+/** Strip `:model` suffix / `/` variant, apply the display alias, and cap to `max` cells (default 12). */
 export const shortConsultEngine = (name: string, max = 12): string => {
   const clean = name.trim()
   if (!clean) return '?'
   const noModel = clean.split(':')[0] ?? clean
   const base = noModel.split('/')[0] ?? noModel
-  return shorten(base || clean, max)
+  return shorten(CONSULT_ENGINE_ALIASES[base] ?? (base || clean), max)
 }
 
 export const consultGlyph = (state: ConsultEngineState): string =>
