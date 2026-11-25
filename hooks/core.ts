@@ -3532,43 +3532,61 @@ export const ringLayout = (
   const boxH = isDebate ? 4 : 1 + 2 * halfH
   const centre: RingBox = { x: boxX, y: isDebate ? cy - 1 : cy - halfH, width: boxW, height: boxH }
 
+  // A bottom label with a model moves up one row; its model takes the row under it. Done for every
+  // node before any model row is placed, so a side engine's model row sees the label's final row.
+  for (let i = 0; i < placed.length; i += 1) {
+    const nd = placed[i]!
+    const raw = nodes[i]!.model
+    if (typeof raw !== 'string' || raw.trim() === '' || nd.labelY + 1 < rows) continue
+    nd.labelY -= 1
+    if (nd.align === 'center') nd.anchorY -= 1
+  }
+
   // One dim model row under each label, centred and truncated to the label's width + 4.
   for (let i = 0; i < placed.length; i += 1) {
     const nd = placed[i]!
     const raw = nodes[i]!.model
     if (typeof raw !== 'string' || raw.trim() === '') continue
-    let y = nd.labelY + 1
-    if (y >= rows) {
-      // A bottom label moves up one row; its model takes the row under it.
-      nd.labelY -= 1
-      if (nd.align === 'center') nd.anchorY -= 1
-      y = nd.labelY + 1
-    }
+    const y = nd.labelY + 1
     const labelCentre = nd.labelX + (nd.width - 1) / 2
     if (y < 0 || y >= rows) continue
     // Owner: show the whole model name. Try the short name in full (up to 26 cells; under 56 columns only the label width + 4), then cut it
     // to the label's width + 4; centred under the label and slid in from the pane edge.
     const short = shortModel(raw)
+    // Keep two blank cells between this row and every other label or model row (one space reads as one
+    // phrase: `orouter 26s nemotron`), and stay out of the hub.
+    const free = (tx: number, w: number): boolean =>
+      !placed.some(
+        (o, j) =>
+          j !== i &&
+          ((y === o.labelY && tx < o.labelX + o.width + 2 && tx + w + 2 > o.labelX) ||
+            (o.model !== undefined && o.modelWidth !== undefined && o.modelX !== undefined && y === o.modelY && tx < o.modelX + o.modelWidth + 2 && tx + w + 2 > o.modelX)),
+      ) && !(y >= centre.y && y < centre.y + centre.height && tx < centre.x + centre.width && tx + w > centre.x)
     let text = ''
     let x = 0
     let width = 0
-    for (const maxW of [cols >= 56 ? Math.min(26, cols - 2) : nd.width + 4, Math.min(nd.width + 4, cols - 2)]) {
+    // Last resort in a tight row: cut the name further, down to 6 cells, before dropping the row.
+    const cut = Math.min(nd.width + 4, cols - 2)
+    const widths = [cols >= 56 ? Math.min(26, cols - 2) : nd.width + 4, cut]
+    for (let w = Math.min(cut, cellWidth(short)) - 1; w >= 6; w -= 1) widths.push(w)
+    for (const maxW of widths) {
       const t = shorten(short, Math.max(1, maxW))
       const w = cellWidth(t)
-      const tx = Math.max(1, Math.min(cols - 1 - w, Math.round(labelCentre - (w - 1) / 2)))
-      // Keep out of every other label or model row and out of the hub.
-      const blocked = placed.some(
-        (o, j) =>
-          j !== i &&
-          ((y === o.labelY && tx < o.labelX + o.width && tx + w > o.labelX) ||
-            (o.model !== undefined && o.modelWidth !== undefined && o.modelX !== undefined && y === o.modelY && tx < o.modelX + o.modelWidth && tx + w > o.modelX)),
-      )
-      const inCentre = y >= centre.y && y < centre.y + centre.height && tx < centre.x + centre.width && tx + w > centre.x
-      if (blocked || inCentre) continue
-      text = t
-      x = tx
-      width = w
-      break
+      const lo = 1
+      const hi = cols - 1 - w
+      const home = Math.max(lo, Math.min(hi, Math.round(labelCentre - (w - 1) / 2)))
+      // Centred first; else slide sideways, nearest first, while the row still sits under its label.
+      for (let shift = 0; shift <= w + nd.width && !text; shift += 1) {
+        for (const tx of shift === 0 ? [home] : [home + shift, home - shift]) {
+          if (tx < lo || tx > hi || tx > nd.labelX + nd.width - 1 || tx + w - 1 < nd.labelX) continue
+          if (!free(tx, w)) continue
+          text = t
+          x = tx
+          width = w
+          break
+        }
+      }
+      if (text) break
     }
     if (!text) continue
     nd.model = text

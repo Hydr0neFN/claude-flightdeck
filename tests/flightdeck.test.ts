@@ -4161,6 +4161,52 @@ test('9-engine consult ring at 64 columns grows a 5-row hub so opencode and agy 
   }
 })
 
+test('10-engine consult ring: no label or model row touches another, and the bottom label never lands on a side model row', () => {
+  const done = (name: string, secs: number, model: string) => ({ name, state: 'ok', startedAt: 10_000, endedAt: 10_000 + secs * 1000, reason: null, note: null, model })
+  const run = parseConsult(
+    JSON.stringify({
+      run: makeRun({
+        engines: [
+          done('copilot', 38, 'auto'),
+          { name: 'codex', state: 'skipped', startedAt: null, endedAt: null, reason: 'locked', note: null, model: 'default' },
+          done('deepseek', 12, 'v4.1flash'),
+          done('vertex', 82, 'gemini-4-neon'),
+          done('nim', 120, 'nvidia/nemotron-3-ultra-550b-a55b'),
+          done('openrouter', 26, 'ernie-5.5-flash'),
+          done('opencode', 25, 'beam-free'),
+          done('azure', 44, 'gpt-6.2-astra'),
+          done('gemini', 69, 'gemini-3.6-flash'),
+          done('vertex', 40, 'glm-5.2-maas'),
+        ],
+      }),
+      locks: {},
+    }),
+  )!.run!
+  for (let cols = 46; cols <= 80; cols += 1) {
+    const grid = buildConsultGrid(run, cols, PALETTES.theme, 200_000)
+    const L = grid.layout
+    const spans: { who: string; y: number; x: number; w: number }[] = []
+    for (const nd of L.nodes) {
+      spans.push({ who: `${nd.label}`, y: nd.labelY, x: nd.labelX, w: nd.width })
+      if (nd.model !== undefined) spans.push({ who: `${nd.label} model ${nd.model}`, y: nd.modelY!, x: nd.modelX!, w: nd.modelWidth! })
+    }
+    for (let a = 0; a < spans.length; a += 1) {
+      for (let b = a + 1; b < spans.length; b += 1) {
+        const p = spans[a]!
+        const q = spans[b]!
+        if (p.y !== q.y) continue
+        // A model row keeps two blank cells from its neighbours; two labels keep at least one.
+        const gap = p.who.includes(' model ') || q.who.includes(' model ') ? 2 : 1
+        const gapOk = p.x + p.w + gap <= q.x || q.x + q.w + gap <= p.x
+        expect([cols, p.who, q.who, gapOk]).toEqual([cols, p.who, q.who, true])
+      }
+    }
+    // Every engine keeps a model row; from 56 columns the whole name.
+    expect([cols, L.nodes.filter(nd => nd.model === undefined).map(nd => nd.label)]).toEqual([cols, []])
+    if (cols >= 56) expect([cols, L.nodes.filter(nd => nd.model!.endsWith('…')).map(nd => nd.label)]).toEqual([cols, []])
+  }
+})
+
 test('three consult calls that match the same run draw one consult row', () => {
   const mk = (callId: string, at: number) => ({ kind: 'consult' as const, name: '', repo: '', model: '', effort: '', handoff: '', callId, agentId: '', at, task: '' })
   let issued = issueCall([], mk('c1', 1_000))
