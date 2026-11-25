@@ -1,9 +1,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AgentCard, Architect, Bucket, Check, CheckpointTail, ConsultState, Feed, Gate, Issued, Job, Layout, LogLine, Loop, Main, MeshTask, Roster, Turn, Usage, View } from '../types'
+import type { AgentCard, Architect, Bucket, Check, CheckpointTail, ConsultEngineState, ConsultState, Feed, Gate, Issued, Job, Layout, LogLine, Loop, Main, MeshTask, Roster, Turn, Usage, View } from '../types'
 import {
   AGY_SHOW_MS,
+  CONSULT_TABLE_DUR_W,
   PYTHON_CANDIDATES,
   WORK_DETAIL_COLS,
   WORK_NARROW,
@@ -46,7 +47,9 @@ import {
   consultEngineDuration,
   consultGlyph,
   consultKindLabel,
+  consultListLayout,
   consultProbe,
+  consultUsesTable,
   piecesThatFit,
   cardTitle,
   afterCompactHooked,
@@ -140,7 +143,7 @@ import {
   stepSpeed,
   stepLoop,
 } from './core'
-import type { Config, Panel, RingGridRun, WorkBox, WorkEntry, WorkLeaf } from './core'
+import type { Config, ConsultList, Panel, RingGridRun, WorkBox, WorkEntry, WorkLeaf } from './core'
 
 const PANE = 'flightdeck'
 const TITLE = 'Flightdeck'
@@ -1910,8 +1913,10 @@ export const register: Register = (on, options) => {
       }
       const run = cs?.run
       if (workHas('consult') && run) {
-        const narrow = W < 40 || run.engines.length > 10
-        n += 2 + 1 + (narrow ? run.engines.length : (run.engines.length <= 6 ? 11 : 13) + 1 + (run.round >= 2 || run.kind === 'round2' ? 1 : 0))
+        const narrow = W < 40
+        const tableRows = !narrow && consultUsesTable(run) ? consultListLayout(run, Math.max(12, W - 4), now).rows.length : 0
+        const isDebateRun = run.round >= 2 || run.kind === 'round2'
+        n += 2 + 1 + (narrow ? run.engines.length : tableRows > 0 ? tableRows : (run.engines.length <= 6 ? 11 : 13) + 1 + (isDebateRun ? 1 : 0))
         if (questionLine(run.question, W - 4)) n += 1
         n += 1 // the glyph legend, dropped when the box has under 3 spare rows
         if (!narrow) n += Math.min(3, run.engines.filter(e => e.state === 'failed' && e.reason).length)
@@ -2205,14 +2210,63 @@ export const register: Register = (on, options) => {
       )
     }
 
+    // The consult engine table. Each piece sits in a fixed-width box, so the columns line up without
+    // padding spaces (the desktop app collapses runs of spaces inside a Text).
+    const consultGlyphColor = (s: ConsultEngineState) =>
+      s === 'ok' ? C.gate : s === 'running' ? C.agent : s === 'failed' ? C.warn : s === 'skipped' ? C.amber : C.faint
+    const consultTable = (t: ConsultList, innerW: number) => (
+      <Box key="consult-table" flexDirection="column" width={innerW}>
+        {t.rows.map(r => (
+          <Box width={innerW} columnGap={1}>
+            {r.flatMap((c, k) => [
+              k > 0 ? (
+                <Box width={1} flexShrink={0}>
+                  <Text color={C.faint}>│</Text>
+                </Box>
+              ) : null,
+              <Box width={t.cellW} flexShrink={0} columnGap={1}>
+                {c ? (
+                  <Box width={1} flexShrink={0}>
+                    <Text color={consultGlyphColor(c.state)}>{c.glyph}</Text>
+                  </Box>
+                ) : null}
+                {c ? (
+                  <Box width={t.nameW} flexShrink={0}>
+                    <Text color={c.state === 'queued' || c.state === 'skipped' ? C.faint : C.text} wrap="truncate">
+                      {c.name}
+                    </Text>
+                  </Box>
+                ) : null}
+                {c && t.modelW > 0 ? (
+                  <Box width={t.modelW} flexShrink={0}>
+                    {c.model ? (
+                      <Text dimColor wrap="truncate">
+                        {c.model}
+                      </Text>
+                    ) : null}
+                  </Box>
+                ) : null}
+                {c ? (
+                  <Box width={CONSULT_TABLE_DUR_W} flexShrink={0} justifyContent="flex-end">
+                    {c.dur ? <Text dimColor>{c.dur}</Text> : null}
+                  </Box>
+                ) : null}
+              </Box>,
+            ])}
+          </Box>
+        ))}
+      </Box>
+    )
+
     const consultPanel = (w: number) => {
       const run = cs?.run
       if (!run) return null
       const innerW = Math.max(12, w - 4)
       const answered = run.engines.filter(eng => eng.state === 'ok').length
       const total = run.engines.length
-      const isNarrow = w < 40 || total > 10
-      const grid = isNarrow ? null : buildConsultGrid(run, innerW, C, now)
+      const isNarrow = w < 40
+      const table = !isNarrow && consultUsesTable(run) ? consultListLayout(run, innerW, now) : null
+      const grid = isNarrow || table ? null : buildConsultGrid(run, innerW, C, now)
       // Keep the caption outside the animated Client, as one centred text line.
       const caption = grid?.isDebate ? grid.rows[grid.height - 1]?.[0] : null
       const ringHeight = grid ? grid.height - (caption ? 1 : 0) : 0
@@ -2254,27 +2308,29 @@ export const register: Register = (on, options) => {
                   1,
                 )
               })
-            : grid
-              ? cfg.motion && hasRing
-                ? (
-                    <els.Client
-                      key="consult-ring"
-                      module="./ring.tsx"
-                      width={innerW}
-                      height={ringHeight}
-                      props={{
-                        active: grid.active,
-                        width: innerW,
-                        height: ringHeight,
-                        mono,
-                        rows: ringRows,
-                        paths: grid.paths,
-                        spinners: grid.spinners,
-                      }}
-                    />
-                  )
-                : staticRing(ringRows, innerW, ringHeight)
-              : null}
+            : table
+              ? consultTable(table, innerW)
+              : grid
+                ? cfg.motion && hasRing
+                  ? (
+                      <els.Client
+                        key="consult-ring"
+                        module="./ring.tsx"
+                        width={innerW}
+                        height={ringHeight}
+                        props={{
+                          active: grid.active,
+                          width: innerW,
+                          height: ringHeight,
+                          mono,
+                          rows: ringRows,
+                          paths: grid.paths,
+                          spinners: grid.spinners,
+                        }}
+                      />
+                    )
+                  : staticRing(ringRows, innerW, ringHeight)
+                : null}
           {caption ? (
             <Box justifyContent="center" width={innerW}>
               <Text color={caption.color} dimColor wrap="truncate">

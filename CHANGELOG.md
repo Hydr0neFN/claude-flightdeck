@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Consult panel: a run with 8 or more engines (outside a debate), or more than 10 in any run, draws an engine table instead of the ring. One row per engine: glyph, name, model and clock in fixed columns, so nothing overlaps. Two columns, filled top to bottom, when each cell keeps at least 12 cells for the model name. The ring stays for 7 or fewer engines and for debates up to 10.
 - Consult ring: a model row no longer runs into the bottom engine's label (`orouter 26snemotron-3-ultra`). The bottom label moves up before any model row is placed, so a side engine's model row sees the label's final row. A model row keeps two blank cells from other text. When its centred place is taken, it slides sideways under its own label, then cuts its name down to 6 cells before it drops the row.
 - Consult ring names: the Gemini API engine shows as `GemAPI` (the `agy` engine also runs Gemini models), and `openrouter` shows as `orouter`. A model name drops its MoE size suffix (`nemotron-3-ultra-550b-a55b` → `nemotron-3-ultra`), so the nim model row no longer runs into the next label.
 - Fork (yu): the manifest carries no `version`, so Claude Code versions the plugin by commit sha and every push to this branch reaches installed copies at the next session start (checked on this fork 2026-11-23). Merge note: after taking upstream's plugin.json, delete a `version` line that comes back.

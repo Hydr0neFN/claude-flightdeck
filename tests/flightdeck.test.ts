@@ -66,7 +66,9 @@ import {
   PALETTES,
   activeConsultLocks,
   buildConsultGrid,
+  consultListLayout,
   consultProbe,
+  consultUsesTable,
   isConsultLive,
   isConsultShown,
   parseConsult,
@@ -2432,7 +2434,7 @@ test('consult panel hides when empty or ended > 10 min ago, and uses narrow fall
     await narrow.unmount()
   }
 
-  // > 10 engines also triggers compact list even at 64 cols.
+  // > 10 engines draw the engine table, not the ring, at 64 cols.
   const eleven = Array.from({ length: 11 }, (_, i) => ({
     name: `eng${i}`,
     state: i === 0 ? 'ok' : 'queued',
@@ -2691,6 +2693,58 @@ test('with motion off, consult ring draws static grid with ◐ and no Client', {
   expect(await ui.find({ text: /^answers pass round the ring$/ })).toBeDefined()
   await ui.unmount()
   expect(faultKey('desktop', 'hooks/ring.tsx')).toBe('desktop:ring.tsx')
+})
+
+const tenEngineDone = (name: string, secs: number, model: string) => ({
+  name,
+  state: 'ok',
+  startedAt: 10_000,
+  endedAt: 10_000 + secs * 1000,
+  reason: null,
+  note: null,
+  model,
+})
+
+const tenEngineList = [
+  tenEngineDone('copilot', 38, 'auto'),
+  { name: 'codex', state: 'skipped', startedAt: null, endedAt: null, reason: 'locked', note: null, model: 'default' },
+  tenEngineDone('deepseek', 12, 'v4.1flash'),
+  tenEngineDone('vertex', 82, 'gemini-4-neon'),
+  tenEngineDone('nim', 120, 'nvidia/nemotron-3-ultra-550b-a55b'),
+  tenEngineDone('openrouter', 26, 'ernie-5.5-flash'),
+  tenEngineDone('opencode', 25, 'beam-free'),
+  tenEngineDone('azure', 44, 'gpt-6.2-astra'),
+  tenEngineDone('gemini', 69, 'gemini-3.6-flash'),
+  tenEngineDone('vertex', 40, 'glm-5.2-maas'),
+]
+
+test('consult panel draws engine table for 10 non-debate engines at 64 and 120 columns', async ($, on) => {
+  engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('process.run', () => ({
+    value: {
+      exitCode: 0,
+      stdout: JSON.stringify({ run: makeRun({ engines: tenEngineList }), locks: {} }),
+      stderr: '',
+    },
+  }) as never)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const ui64 = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await ui64.find({ key: 'consult-ring' })).toBeUndefined()
+  expect(await ui64.find({ key: 'consult-table' })).toBeDefined()
+  expect(await ui64.find({ text: /^GemAPI$/ })).toBeDefined()
+  expect(await ui64.find({ text: /MAIN/ })).toBeUndefined()
+  await ui64.unmount()
+
+  const ui120 = await $.ui.mount({ ...pane(120), surface: 'terminal' })
+  expect(await ui120.find({ key: 'consult-ring' })).toBeUndefined()
+  expect(await ui120.find({ key: 'consult-table' })).toBeDefined()
+  expect(await ui120.find({ text: /^GemAPI$/ })).toBeDefined()
+  expect(await ui120.find({ text: /MAIN/ })).toBeUndefined()
+  expect(await ui120.find({ text: /^nemotron-3-ultra$/ })).toBeDefined()
+  await ui120.unmount()
 })
 
 // ---------------------------------------------------------------- farmer jobs
@@ -4158,6 +4212,53 @@ test('9-engine consult ring at 64 columns grows a 5-row hub so opencode and agy 
     expect(opencodeEnd.y).toBeGreaterThanOrEqual(c.y)
     expect(opencodeEnd.y).toBeLessThan(c.y + c.height)
     expect([opencodeEnd.x, mat[opencodeEnd.y]![opencodeEnd.x]]).toEqual([c.x - 1, '→'])
+  }
+})
+
+const tenEngineRun = () =>
+  parseConsult(
+    JSON.stringify({
+      run: makeRun({
+        engines: tenEngineList,
+      }),
+      locks: {},
+    }),
+  )!.run!
+
+test('consult table: 8+ engines outside a debate, or more than 10, use the table; the ring keeps 7 and debates up to 10', () => {
+  const run = tenEngineRun()
+  expect(consultUsesTable(run)).toBe(true)
+  expect(consultUsesTable({ ...run, engines: run.engines.slice(0, 7) })).toBe(false)
+  expect(consultUsesTable({ ...run, engines: run.engines.slice(0, 8) })).toBe(true)
+  expect(consultUsesTable({ ...run, round: 2, rounds: 2 })).toBe(false)
+  expect(consultUsesTable({ ...run, round: 2, rounds: 2, engines: [...run.engines, run.engines[0]!] })).toBe(true)
+})
+
+test('consult table: one column at 54 cells with whole model names, two columns filled top to bottom at 112', () => {
+  const run = tenEngineRun()
+  const one = consultListLayout(run, 54, 200_000)
+  expect([one.columns, one.cellW, one.nameW, one.rows.length]).toEqual([1, 54, 8, 10])
+  expect(one.rows.map(r => r[0]!.name)).toEqual(['copilot', 'codex', 'deepseek', 'vertex', 'nim', 'orouter', 'opencode', 'azure', 'GemAPI', 'vertex'])
+  expect(one.rows[4]![0]!.model).toBe('nemotron-3-ultra')
+  expect(one.rows[1]![0]!.dur).toBe('')
+  expect(one.rows[4]![0]!.dur).toBe('2m00s')
+  const two = consultListLayout(run, 112, 200_000)
+  expect([two.columns, two.rows.length]).toEqual([2, 5])
+  expect(two.rows[0]!.map(c => c?.name)).toEqual(['copilot', 'orouter'])
+  expect(two.rows[4]!.map(c => c?.name)).toEqual(['nim', 'vertex'])
+  const nine = consultListLayout({ ...run, engines: run.engines.slice(0, 9) }, 112, 200_000)
+  expect(nine.rows.length).toBe(5)
+  expect(nine.rows[4]![1]).toBeNull()
+})
+
+test('consult table: every width from 36 to 140 fits its cells and keeps model text inside the model column', () => {
+  const run = tenEngineRun()
+  for (let w = 36; w <= 140; w += 1) {
+    const t = consultListLayout(run, w, 200_000)
+    expect([w, t.columns * t.cellW + (t.columns - 1) * 3 <= w]).toEqual([w, true])
+    if (t.modelW > 0) expect([w, 1 + t.nameW + t.modelW + 5 + 3]).toEqual([w, t.cellW])
+    for (const r of t.rows) for (const c of r) if (c) expect([w, cellWidth(c.model) <= t.modelW]).toEqual([w, true])
+    if (t.columns === 2) expect([w, t.modelW >= 12]).toEqual([w, true])
   }
 })
 

@@ -3846,6 +3846,49 @@ export const consultEngineDuration = (e: ConsultEngine, run: ConsultRun, now: nu
   return ''
 }
 
+export type ConsultListCell = { state: ConsultEngineState; glyph: string; name: string; model: string; dur: string }
+export type ConsultList = { columns: 1 | 2; cellW: number; nameW: number; modelW: number; rows: (ConsultListCell | null)[][] }
+
+/** True when the consult panel draws the engine table, not the ring: 8+ engines outside a debate, or more than 10 in any run. */
+export const consultUsesTable = (run: ConsultRun): boolean => {
+  const isDebate = run.round >= 2 || run.kind === 'round2'
+  return run.engines.length > 10 || (!isDebate && run.engines.length >= 8)
+}
+
+/** Width of the clock column in the engine table (`1m09s`, `2h05m`). */
+export const CONSULT_TABLE_DUR_W = 5
+
+/**
+ * The consult panel as a table: one cell per engine (glyph, name, model, clock), one blank cell
+ * between pieces, the clock right-aligned in a fixed 5-cell column. Two columns, filled top to
+ * bottom, when each cell keeps a model column of at least 12 cells; else one column.
+ */
+export const consultListLayout = (run: ConsultRun, innerW: number, now: number): ConsultList => {
+  const raw = run.engines.map(e => ({
+    state: e.state,
+    glyph: consultGlyph(e.state),
+    name: shortConsultEngine(e.name, 12),
+    model: shortModel(engineModel(e)),
+    dur: e.state === 'skipped' ? '' : consultEngineDuration(e, run, now),
+  }))
+  const nameW = Math.max(1, ...raw.map(c => cellWidth(c.name)))
+  // glyph (1) + name + model + clock, three 1-cell gaps between the four pieces.
+  const roomIn = (cellW: number) => cellW - 1 - nameW - CONSULT_TABLE_DUR_W - 3
+  const half = Math.floor((innerW - 3) / 2) // ' │ ' between the two columns
+  const columns: 1 | 2 = raw.length >= 2 && roomIn(half) >= 12 ? 2 : 1
+  const cellW = columns === 2 ? half : innerW
+  const modelW = Math.max(0, roomIn(cellW))
+  const cells: ConsultListCell[] = raw.map(c => ({ ...c, model: modelW > 0 && c.model ? shorten(c.model, modelW) : '' }))
+  const rows: (ConsultListCell | null)[][] = []
+  if (columns === 1) {
+    for (const c of cells) rows.push([c])
+  } else {
+    const h = Math.ceil(cells.length / 2)
+    for (let r = 0; r < h; r += 1) rows.push([cells[r]!, cells[r + h] ?? null])
+  }
+  return { columns, cellW, nameW, modelW, rows }
+}
+
 /** Builds the coloured cell runs, animated paths and spinners for the consult/debate ring panel. */
 export const buildConsultGrid = (run: ConsultRun, cols: number, colors: Colors, now: number): RingGrid => {
   const isDebate = run.round >= 2 || run.kind === 'round2'
