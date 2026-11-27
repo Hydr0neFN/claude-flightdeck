@@ -487,6 +487,22 @@ test('/clear starts the pane fresh', async ($, on) => {
   await ui.unmount()
 })
 
+test('a /resume into another conversation starts the pane fresh: no agent or log line of the last one', { options: { panels: 'main,agents,log' } }, async ($, on) => {
+  engine(on)
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'c1' }))
+  await $.turn.start({ text: 'go', turnId: 'C1' })
+  await $.agent.spawn(spawn('Explore', 'look around'))
+  const before = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await before.find({ text: /look around/ })).toBeDefined()
+  await before.unmount()
+  await $.session.end({ reason: 'resume', sessionId: 's' } as never)
+  const after = await $.ui.mount({ ...pane(64), surface: 'terminal' })
+  expect(await after.find({ text: /look around/ })).toBeUndefined()
+  expect(await after.find({ text: /spawned/ })).toBeUndefined()
+  await after.unmount()
+})
+
 test('colours come from the theme by default, raw hex only when asked', async ($, on) => {
   engine(on)
   const ui = await $.ui.mount({ ...pane(64), surface: 'terminal' })
@@ -1118,15 +1134,19 @@ test('under the built-in guard a request that finds the context emptied counts a
     }
   }
   expect(spills).toEqual([])
-  // A /clear empties the context too, and isn't a compaction.
+  // A /clear starts the count over, and the context it empties isn't a compaction.
   await $.session.end({ reason: 'clear', sessionId: 's' } as never)
   await h.request(undefined)
   await h.measure(30_000)
-  expect((await h.shown()).mark).toBe('cmp×~2')
-  // So can a /resume into another conversation, before its first response.
+  expect((await h.shown()).mark).toBe(null)
+  // The new conversation counts its own from one.
+  await h.request(30_000)
+  await h.request(undefined)
+  expect((await h.shown()).mark).toBe('cmp×~1')
+  // A /resume into another conversation does the same: nothing carried, nothing counted before its first response.
   await $.session.end({ reason: 'resume', sessionId: 's' } as never)
   await h.request(undefined)
-  expect((await h.shown()).mark).toBe('cmp×~2')
+  expect((await h.shown()).mark).toBe(null)
 })
 
 test('once session.compact reaches Flightdeck its count is the real one: estimates before it are dropped, none after', { options: { panels: 'main,log' } }, async ($, on) => {

@@ -304,6 +304,12 @@ async function openPane($: EngineInterface, cfg: Config) {
   return $.ui.open({ id: PANE, title: TITLE, columns: cfg.paneColumns, rows: 8 })
 }
 
+/**
+ * Empties everything one conversation put in the pane. The state is the process's, not the conversation's:
+ * a /clear or a /resume keeps the process and changes the session id, so without this the next conversation
+ * would show the last one's agents, jobs, consult and compaction count. The model, mode, compaction window,
+ * rate limits and roster are the process's and stay.
+ */
 async function resetAll($: EngineInterface) {
   await update($, main, m => ({ ...DEFAULT_MAIN, model: normalize(DEFAULT_MAIN, m).model, mode: normalize(DEFAULT_MAIN, m).mode }))
   await update($, architect, () => DEFAULT_ARCHITECT)
@@ -317,8 +323,22 @@ async function resetAll($: EngineInterface) {
   await update($, turn, () => DEFAULT_TURN)
   await update($, receipt, () => null)
   await update($, view, () => DEFAULT_VIEW)
+  await update($, consult, () => null)
+  // The feed's mesh step is the old session's; the next feed poll reads the new one's.
+  await update($, feed, f => {
+    const x = normalizeFeed(f)
+    return x ? { ...x, task: '' } : null
+  })
   // The context gauge waits for the next measurement rather than showing the pre-clear fill.
-  await update($, usage, x => ({ ...normalize(DEFAULT_USAGE, x), pct: null, tokens: null }))
+  // The compaction count is the conversation's: the next one starts at none.
+  await update($, usage, x => ({
+    ...normalize(DEFAULT_USAGE, x),
+    pct: null,
+    tokens: null,
+    compactions: 0,
+    lastCompactAt: null,
+    isCompactEstimate: false,
+  }))
 }
 
 /**
@@ -729,6 +749,16 @@ export const register: Register = (on, options) => {
   let stopMeshTimer: (() => void) | undefined
   const checkLock: CheckpointLock = { inFlight: false, python: [] }
   let stopCheckTimer: (() => void) | undefined
+  // After resetAll the polls must write again even when a probe prints what it printed before the reset.
+  const forget = () => {
+    callLoop.clear()
+    briefs.clear()
+    jobsLock.lastJobs = ''
+    jobsLock.lastAgy = ''
+    meshLock.last = ''
+    consultLock.lastJson = ''
+    consultLock.boundRun = ''
+  }
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -833,10 +863,13 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', async ($, e, next) => {
-    if (e.reason === 'clear') {
+    // A /clear or a /resume: the process goes on under another session id, with no session.start, so the
+    // timers keep running and the pane starts over for the new conversation.
+    if (e.reason === 'clear' || e.reason === 'resume') {
       await resetAll($)
+      forget()
       await refreshStatus($, cfg)
-    } else if (e.reason !== 'resume') {
+    } else {
       stopFeedTimer?.()
       stopFeedTimer = undefined
       consultLock.stopped = true
@@ -864,6 +897,7 @@ export const register: Register = (on, options) => {
     }
     if (verb === 'reset') {
       await resetAll($)
+      forget()
       await refreshStatus($, cfg)
       return { text: 'Flightdeck reset.' }
     }
