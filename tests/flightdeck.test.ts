@@ -2754,7 +2754,10 @@ test('the jobs dir option is read leniently and the python fallback is python3, 
   expect(PYTHON_CANDIDATES).toEqual([['python3'], ['python'], ['py', '-3']])
   const argv = jobsProbe(['py', '-3'], '/j', { j1: '/c.db' })
   expect(argv.slice(0, 4)).toEqual(['py', '-3', '-c', JOBS_PY])
-  expect(argv.slice(4)).toEqual(['/j', '{"j1":"/c.db"}'])
+  expect(argv.slice(4)).toEqual(['/j', '{"j1":"/c.db"}', '', '[]'])
+  // The session id and the job ids this session named go last; the script keeps only those jobs.
+  expect(jobsProbe('python3', '/j', {}, 'sess-1', ['a-1', 'b-2']).slice(3)).toEqual(['/j', '{}', 'sess-1', '["a-1","b-2"]'])
+  expect(JOBS_PY).toContain('if sid and state.get("session") != sid and jobid not in known:')
   // The consult probe takes the same prefixes, and still a plain string for older callers.
   expect(consultProbe('python3', '/r')[0]).toBe('python3')
   expect(consultProbe('python3', '/r')[3]).toBe('/r')
@@ -3672,7 +3675,24 @@ test('the jobs probe polls every 3 s while a job is live and every 20 s otherwis
   await ui.unmount()
 })
 
-test('checkpoint probes run every 10 s for a card with a checkpoint, one at a time, silently', { options: { panels: 'main,work' } }, async ($, on) => {
+test("the jobs probe asks for this session's jobs only: it passes the session id and the job ids it issued",{ options: { panels: 'main,work' } }, async ($, on) => {
+  engine(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  const seen: string[][] = []
+  on('process.run', (_$, e) => {
+    if (e.argv[2] !== JOBS_PY) return { value: { exitCode: 1, stdout: '', stderr: '' } } as never
+    seen.push([...e.argv])
+    return { value: { exitCode: 0, stdout: '[]', stderr: '' } } as never
+  })
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  expect(seen.length).toBe(1)
+  expect(seen[0]!.slice(-2)).toEqual(['sess-1', '[]'])
+})
+
+test('checkpoint probes run every 10 s for a card with a checkpoint, one at a time, silently',{ options: { panels: 'main,work' } }, async ($, on) => {
   const clock = engine(on)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))

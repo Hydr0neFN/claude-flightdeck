@@ -1599,6 +1599,14 @@ try:
   cache = loaded
 except Exception:
  cache = {}
+sid = sys.argv[3] if len(sys.argv) > 3 else ""
+known = set()
+try:
+ loaded = json.loads(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else []
+ if isinstance(loaded, list):
+  known = set(x for x in loaded if isinstance(x, str))
+except Exception:
+ known = set()
 now = time.time()
 LIVE = ("running", "parked", "need_tool")
 CUTOFF = 30 * 60
@@ -1636,6 +1644,9 @@ def main():
     state = data
   except Exception:
    state = {}
+  # With a session id, only this session's jobs: state.json names the session, or this session issued the job id.
+  if sid and state.get("session") != sid and jobid not in known:
+   continue
   status = str(state.get("status") or "")
   live = status in LIVE
   if not live and now - mt > CUTOFF:
@@ -1686,13 +1697,24 @@ except Exception:
  * first, at most 8: live jobs, and ended ones whose `state.json` changed in the last 30 minutes. A live job
  * whose pid is gone (or reused after `state.json` was written) is `stale` and dropped past 30 minutes.
  * `cache` maps a jobid to the agy conversation db already matched to it.
+ * With `sessionId`, only this session's jobs show: a `state.json` whose `session` field matches, or a job id in
+ * `known` (the ids this session's own calls named). A job of another session, or one with neither, never shows;
+ * with '' every job shows, as before.
  */
-export const jobsProbe = (python: string | readonly string[], root: string, cache: Record<string, string> = {}): string[] => [
+export const jobsProbe = (
+  python: string | readonly string[],
+  root: string,
+  cache: Record<string, string> = {},
+  sessionId = '',
+  known: readonly string[] = [],
+): string[] => [
   ...(typeof python === 'string' ? [python] : python),
   '-c',
   JOBS_PY,
   root,
   JSON.stringify(cache),
+  sessionId,
+  JSON.stringify(known),
 ]
 
 export const AGY_PY = String.raw`import json, os, re, sqlite3, sys, time

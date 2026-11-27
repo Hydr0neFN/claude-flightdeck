@@ -538,9 +538,13 @@ async function pollJobs($: EngineInterface, root: string, lock: JobsLock) {
     const now = await $.clock.now()
     const list = await getIssued($)
     const agy = list.filter(i => i.kind === 'agy' && (i.endedAt === null || now - i.endedAt < AGY_SHOW_MS))
+    // Only this session's jobs: another session in the same folder (or anywhere) shares the jobs dir.
+    const rawSid = await $.session.id().catch(() => '')
+    const sid = typeof rawSid === 'string' ? rawSid : ''
+    const known = [...new Set(list.filter(i => i.jobid).map(i => i.jobid))]
     let stdout = ''
     for (const py of lock.python.length > 0 ? [lock.python] : PYTHON_CANDIDATES) {
-      const res = await $.process.run(jobsProbe(py, root, lock.dbCache), { timeoutMs: JOBS_TIMEOUT_MS }).catch(() => null)
+      const res = await $.process.run(jobsProbe(py, root, lock.dbCache, sid, known), { timeoutMs: JOBS_TIMEOUT_MS }).catch(() => null)
       if (res && res.exitCode === 0) {
         lock.python = py
         stdout = res.stdout
